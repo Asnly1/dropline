@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dropline"
+version = "0.1.0"
+description = "An auditable, self-hosted pipeline for AI characters that correspond with you over real email."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Asnly1" }]
+keywords = ["llm", "email", "ai-character", "imap", "smtp", "pen-pal"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Communications :: Email",
+]
+dependencies = [
+  "anthropic",
+  "dashscope",
+  "PyYAML>=6.0",
+  "google-genai>=1.0.0",
+  "openai>=1.30.0",
+  "prompt_toolkit>=3.0.0",
+]
+
+[project.scripts]
+dropline = "dropline.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Asnly1/dropline"
+Repository = "https://github.com/Asnly1/dropline"
+
+[project.optional-dependencies]
+test = [
+  "pytest",
+]
+dev = [
+  "pytest",
+  "ruff",
+]
+
+[tool.setuptools]
+packages = ["dropline"]

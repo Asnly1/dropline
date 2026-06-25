@@ -1,0 +1,23 @@
+archive
+runtime
+runtime_logs
+state.db
+pipeline.lock
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+# Runtime session state lives under profiles/; the example character prompts stay tracked.
+profiles/_inactive/
+profiles/characters/*/sessions/
+.DS_Store
+.claude/
+.env
+.env.*
+config.yaml
+launchd/*.plist

@@ -1,0 +1,83 @@
+project:
+  name: "dropline"
+  timezone: "America/Los_Angeles"
+
+schedule:
+  enabled: true
+  window_start: "20:00"
+  window_end: "23:59"
+  daily_target_pick_time: "00:05"
+  check_every_minutes: 30
+
+mail:
+  allowlist_senders:
+    - "user@example.com"
+  primary_user_recipient: "user@example.com"
+  character_mailbox:
+    address: "character@example.com"
+    imap:
+      host: "REPLACE_ME_IMAP_HOST"
+      port: 993
+      ssl: true
+      username: "character@example.com"
+      password: "REPLACE_ME_IMAP_PASSWORD"
+      folder: "INBOX"
+    smtp:
+      host: "REPLACE_ME_SMTP_HOST"
+      port: 465
+      security: "ssl"
+      username: "character@example.com"
+      password: "REPLACE_ME_SMTP_PASSWORD"
+
+storage:
+  sqlite_path: "./state.db"
+
+llm:
+  language: "简体中文"
+  stage1:
+    provider: "openai"
+  stage2:
+    provider: "openai"
+  image:
+    enabled: true
+    provider: "openai"
+
+openai:
+  api_key: "REPLACE_ME_OPENAI_API_KEY"
+  text_model: "gpt-5.5"
+  image_model: "gpt-image-2-2026-04-21"
+
+gemini:
+  api_key: "REPLACE_ME_GEMINI_API_KEY"
+  text_model: "gemini-3.1-pro-preview"
+  image_model: "gemini-3-pro-image-preview"
+
+anthropic:
+  api_key: "REPLACE_ME_ANTHROPIC_API_KEY"
+  text_model: "claude-opus-4-8"
+
+grok:
+  api_key: "REPLACE_ME_GROK_API_KEY"
+  text_model: "grok-4.20-0309-non-reasoning"
+  image_model: "grok-imagine-image-pro"
+
+qwen:
+  api_key: "REPLACE_ME_QWEN_API_KEY"
+  text_model: "qwen3-max-2026-01-23"
+  image_model: "qwen-image-2.0-pro"
+
+deepseek:
+  api_key: "REPLACE_ME_DEEPSEEK_API_KEY"
+  text_model: "deepseek-v4-pro"
+
+glm:
+  api_key: "REPLACE_ME_GLM_API_KEY"
+  text_model: "GLM-5.2"
+
+doubao:
+  api_key: "REPLACE_ME_DOUBAO_API_KEY"
+  text_model: "doubao-seed-2-0-pro-260215"
+  image_model: "doubao-seedream-5-0-260128"
+
+logging:
+  level: "INFO"

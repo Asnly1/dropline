@@ -1,0 +1,115 @@
+from __future__ import annotations
+
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from dropline.memory import MemoryManager
+from dropline.reset_dev_state import reset_dev_state
+from dropline.storage import StateStore
+
+from tests.helpers import create_test_repo, load_test_settings
+
+
+class ResetDevStateTests(unittest.TestCase):
+    def test_reset_dev_state_refuses_sqlite_path_outside_repo_before_deleting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            root = base / "repo"
+            create_test_repo(root)
+            outside_sqlite = base / "outside-state.db"
+            outside_sqlite.write_text("external state", encoding="utf-8")
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8").replace(
+                    'sqlite_path: "./state.db"',
+                    f'sqlite_path: "{outside_sqlite}"',
+                ),
+                encoding="utf-8",
+            )
+            settings = load_test_settings(root)
+
+            archive_file = settings.documents.session_archive_dir / "2026-04-05" / "run-1" / "stage1.json"
+            archive_file.parent.mkdir(parents=True, exist_ok=True)
+            archive_file.write_text("{}", encoding="utf-8")
+            runtime_logs_dir = root / "runtime_logs"
+            runtime_logs_dir.mkdir(parents=True, exist_ok=True)
+            runtime_log = runtime_logs_dir / "agent.err.log"
+            runtime_log.write_text("log", encoding="utf-8")
+            pipeline_lock = root / "pipeline.lock"
+            pipeline_lock.write_text("", encoding="utf-8")
+
+            with patch("dropline.reset_dev_state.uninstall_scheduler", return_value=(True, True)) as uninstall_scheduler:
+                with self.assertRaisesRegex(RuntimeError, "Refusing to delete path outside managed roots"):
+                    reset_dev_state(settings, task_name="com.example.dropline")
+
+            uninstall_scheduler.assert_not_called()
+            self.assertTrue(outside_sqlite.exists())
+            self.assertEqual(outside_sqlite.read_text(encoding="utf-8"), "external state")
+            self.assertTrue(archive_file.exists())
+            self.assertTrue(runtime_log.exists())
+            self.assertTrue(pipeline_lock.exists())
+
+    def test_reset_dev_state_clears_runtime_and_reinitializes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+
+            archive_file = settings.documents.session_archive_dir / "2026-04-05" / "run-1" / "stage1.json"
+            archive_file.parent.mkdir(parents=True, exist_ok=True)
+            archive_file.write_text("{}", encoding="utf-8")
+
+            runtime_logs_dir = root / "runtime_logs"
+            runtime_logs_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_logs_dir / "agent.err.log").write_text("log", encoding="utf-8")
+
+            (settings.documents.user_episode_dir / "2026-04-05.json").write_text("[]", encoding="utf-8")
+            settings.documents.active_arc.write_text("dirty", encoding="utf-8")
+            (root / "pipeline.lock").write_text("", encoding="utf-8")
+
+            store = StateStore(settings)
+            store.initialize()
+            store.set_kv("scheduled_for_date", "2026-04-05")
+
+            pycache_dir = root / "dropline" / "__pycache__"
+            pycache_dir.mkdir(parents=True, exist_ok=True)
+            (pycache_dir / "x.pyc").write_bytes(b"cache")
+
+            with patch("dropline.reset_dev_state.uninstall_scheduler", return_value=(True, True)) as uninstall_scheduler:
+                result = reset_dev_state(settings, task_name="com.example.dropline")
+
+            self.assertTrue(result["scheduler_unload_attempted"])
+            self.assertTrue(result["scheduler_definition_removed"])
+            self.assertFalse(archive_file.exists())
+            self.assertFalse(runtime_logs_dir.exists())
+            self.assertFalse((root / "pipeline.lock").exists())
+            self.assertFalse(pycache_dir.exists())
+            self.assertTrue(settings.storage.sqlite_path.exists())
+            self.assertTrue((root / "profiles" / "characters" / "keqing" / "sessions").exists())
+            self.assertTrue(settings.documents.user_episode_dir.exists())
+            self.assertTrue(settings.documents.character_episode_dir.exists())
+            self.assertEqual(list(settings.documents.user_episode_dir.glob("*.json")), [])
+
+            active_arc_text = settings.documents.active_arc.read_text(encoding="utf-8")
+            self.assertEqual(active_arc_text, "[]\n")
+
+            conn = sqlite3.connect(settings.storage.sqlite_path)
+            row = conn.execute("SELECT value FROM kv_state WHERE key = 'scheduled_for_date'").fetchone()
+            conn.close()
+            self.assertIsNone(row)
+            uninstall_scheduler.assert_called_once_with(settings.repo_root, "com.example.dropline")
+
+    def test_reset_dev_state_skips_missing_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            MemoryManager(settings).bootstrap()
+
+            with patch("dropline.reset_dev_state.uninstall_scheduler", return_value=(False, False)):
+                result = reset_dev_state(settings, task_name="com.example.dropline")
+
+            self.assertIn(str(settings.repo_root / "pipeline.lock"), result["skipped_paths"])
