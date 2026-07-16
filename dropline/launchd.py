@@ -7,10 +7,12 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .scheduler_support import DEFAULT_SCHEDULER_TASK_NAME, build_scheduler_paths, normalize_scheduler_task_name
-
-
-DEFAULT_LAUNCHD_LABEL = DEFAULT_SCHEDULER_TASK_NAME
+from .scheduler_support import (
+    build_scheduler_paths,
+    normalize_scheduler_task_name,
+    remove_file_if_exists,
+    run_best_effort_uninstall_command,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,10 +111,14 @@ def install_launchd_job(
     subprocess.run(
         ["launchctl", "bootstrap", user_domain, str(paths.install_plist_path)],
         check=True,
+        capture_output=True,
+        text=True,
     )
     subprocess.run(
         ["launchctl", "kickstart", "-k", f"{user_domain}/{safe_label}"],
         check=True,
+        capture_output=True,
+        text=True,
     )
     return paths
 
@@ -120,21 +126,8 @@ def install_launchd_job(
 def uninstall_launchd_job(repo_root: Path, label: str) -> tuple[bool, bool]:
     paths = build_launchd_paths(repo_root, label)
     user_domain = f"gui/{os.getuid()}"
-    try:
-        subprocess.run(
-            ["launchctl", "bootout", user_domain, str(paths.install_plist_path)],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        unload_attempted = False
-    else:
-        unload_attempted = True
-
-    if paths.install_plist_path.exists():
-        paths.install_plist_path.unlink()
-        definition_removed = True
-    else:
-        definition_removed = False
+    unload_attempted, _ = run_best_effort_uninstall_command(
+        ["launchctl", "bootout", user_domain, str(paths.install_plist_path)]
+    )
+    definition_removed = remove_file_if_exists(paths.install_plist_path)
     return unload_attempted, definition_removed

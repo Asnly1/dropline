@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import io
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from dropline.config import load_settings
 from dropline.memory import MemoryManager
-from dropline.reset_dev_state import reset_dev_state
-from dropline.storage import StateStore
+from dropline.reset_dev_state import reset_dev_state, reset_dev_state_command
+from dropline.storage import SessionScope, StateStore
 
 from tests.helpers import create_test_repo, load_test_settings
 
@@ -83,6 +86,7 @@ class ResetDevStateTests(unittest.TestCase):
 
             self.assertTrue(result["scheduler_unload_attempted"])
             self.assertTrue(result["scheduler_definition_removed"])
+            self.assertTrue(result["reinitialized"])
             self.assertFalse(archive_file.exists())
             self.assertFalse(runtime_logs_dir.exists())
             self.assertFalse((root / "pipeline.lock").exists())
@@ -113,3 +117,51 @@ class ResetDevStateTests(unittest.TestCase):
                 result = reset_dev_state(settings, task_name="com.example.dropline")
 
             self.assertIn(str(settings.repo_root / "pipeline.lock"), result["skipped_paths"])
+
+    def test_reset_dev_state_does_not_reinitialize_without_active_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            (root / "profiles" / "active.json").unlink()
+            settings = load_settings(root / "config.yaml", require_active_profile=False)
+            StateStore(
+                settings,
+                scope=SessionScope(character_slug="keqing", relationship_slug="childhood-friends"),
+            ).initialize()
+            self.assertTrue(settings.storage.sqlite_path.exists())
+
+            with patch("dropline.reset_dev_state.uninstall_scheduler", return_value=(False, False)):
+                result = reset_dev_state(settings, task_name="com.example.dropline")
+
+            self.assertFalse(result["reinitialized"])
+            self.assertFalse(settings.storage.sqlite_path.exists())
+
+    def test_reset_dev_state_command_reports_reinitialized_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+
+            with patch("dropline.reset_dev_state.uninstall_scheduler", return_value=(False, False)):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    exit_code = reset_dev_state_command(str(root / "config.yaml"))
+
+            self.assertEqual(exit_code, 0)
+            rendered = output.getvalue()
+            self.assertIn("Reset complete. State reinitialized at", rendered)
+
+    def test_reset_dev_state_command_reports_no_active_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            (root / "profiles" / "active.json").unlink()
+
+            with patch("dropline.reset_dev_state.uninstall_scheduler", return_value=(False, False)):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    exit_code = reset_dev_state_command(str(root / "config.yaml"))
+
+            self.assertEqual(exit_code, 0)
+            rendered = output.getvalue()
+            self.assertIn("Reset complete. No active profile; state not reinitialized.", rendered)
+            self.assertNotIn("State reinitialized at", rendered)

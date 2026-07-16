@@ -344,6 +344,28 @@ class InteractiveCLITests(unittest.TestCase):
                     "dropline.cli.reset_dev_state.reset_dev_state_command",
                     ["reset-dev-state", "--config", config_path, "--yes"],
                 ),
+                (
+                    "dropline.cli.install_scheduler.install_scheduler_command",
+                    [
+                        "install-scheduler",
+                        "--config",
+                        config_path,
+                        "--task-name",
+                        "com.example.scheduler",
+                        "--yes",
+                    ],
+                ),
+                (
+                    "dropline.cli.uninstall_scheduler.uninstall_scheduler_command",
+                    [
+                        "uninstall-scheduler",
+                        "--config",
+                        config_path,
+                        "--task-name",
+                        "com.example.scheduler",
+                        "--yes",
+                    ],
+                ),
             )
 
             for patch_target, argv in cases:

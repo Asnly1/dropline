@@ -4,7 +4,12 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .scheduler_support import build_scheduler_paths, normalize_scheduler_task_name
+from .scheduler_support import (
+    build_scheduler_paths,
+    normalize_scheduler_task_name,
+    remove_file_if_exists,
+    run_best_effort_uninstall_command,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +33,10 @@ def build_windows_task_paths(repo_root: Path, task_name: str) -> WindowsTaskPath
     )
 
 
+def _escape_cmd_percent(value: object) -> str:
+    return str(value).replace("%", "%%")
+
+
 def render_windows_wrapper_script(
     *,
     repo_root: Path,
@@ -36,14 +45,19 @@ def render_windows_wrapper_script(
     stdout_log_path: Path,
     stderr_log_path: Path,
 ) -> str:
+    safe_repo_root = _escape_cmd_percent(repo_root)
+    safe_python_executable = _escape_cmd_percent(Path(python_executable).resolve())
+    safe_config_path = _escape_cmd_percent(config_path)
+    safe_stdout_log_path = _escape_cmd_percent(stdout_log_path)
+    safe_stderr_log_path = _escape_cmd_percent(stderr_log_path)
     return "\n".join(
         [
             "@echo off",
-            f'cd /d "{repo_root}"',
+            f'cd /d "{safe_repo_root}"',
             "if errorlevel 1 exit /b %errorlevel%",
             (
-                f'"{Path(python_executable).resolve()}" -m dropline scheduler-tick --config "{config_path}" '
-                f'>> "{stdout_log_path}" 2>> "{stderr_log_path}"'
+                f'"{safe_python_executable}" -m dropline scheduler-tick --config "{safe_config_path}" '
+                f'>> "{safe_stdout_log_path}" 2>> "{safe_stderr_log_path}"'
             ),
             "exit /b %errorlevel%",
             "",
@@ -109,30 +123,20 @@ def install_windows_task(
             interval_minutes=interval_minutes,
         ),
         check=True,
+        capture_output=True,
+        text=True,
     )
     return paths
 
 
 def uninstall_windows_task(repo_root: Path, task_name: str) -> tuple[bool, bool]:
     paths = build_windows_task_paths(repo_root, task_name)
-    try:
-        result = subprocess.run(
-            build_schtasks_delete_command(task_name=paths.task_name),
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        unload_attempted = False
-    else:
-        unload_attempted = True
-
-    wrapper_removed = False
-    if paths.wrapper_script_path.exists():
-        paths.wrapper_script_path.unlink()
-        wrapper_removed = True
+    unload_attempted, result = run_best_effort_uninstall_command(
+        build_schtasks_delete_command(task_name=paths.task_name)
+    )
+    wrapper_removed = remove_file_if_exists(paths.wrapper_script_path)
 
     definition_removed = wrapper_removed
-    if unload_attempted and result.returncode == 0:
+    if unload_attempted and result is not None and result.returncode == 0:
         definition_removed = True
     return unload_attempted, definition_removed

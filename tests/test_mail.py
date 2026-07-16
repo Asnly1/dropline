@@ -40,6 +40,20 @@ Content-Type: text/html; charset="utf-8"
 """.encode("utf-8")
 
 
+RAW_EMAIL_UNKNOWN_CHARSET = """From: User <user@example.com>
+To: keqing@example.com
+Subject: weird charset
+Message-ID: <weird-charset@example.com>
+Content-Type: multipart/alternative; boundary="BOUNDARY"
+
+--BOUNDARY
+Content-Type: text/plain; charset="x-user-defined"
+
+hello world
+--BOUNDARY--
+""".encode("utf-8")
+
+
 class MailNormalizationTests(unittest.TestCase):
     def test_normalize_inbound_message_prefers_plain_text_and_strips_quotes(self) -> None:
         normalized = normalize_inbound_message(RawInboundMessage(imap_uid=1, raw_bytes=RAW_EMAIL))
@@ -63,6 +77,14 @@ Content-Type: text/plain; charset="utf-8"
         normalized = normalize_inbound_message(RawInboundMessage(imap_uid=2, raw_bytes=raw_email))
 
         self.assertEqual(normalized.received_at, "")
+
+    def test_normalize_inbound_message_handles_unrecognized_charset_without_raising(self) -> None:
+        normalized = normalize_inbound_message(
+            RawInboundMessage(imap_uid=3, raw_bytes=RAW_EMAIL_UNKNOWN_CHARSET)
+        )
+
+        self.assertEqual(normalized.message_id, "<weird-charset@example.com>")
+        self.assertIn("hello world", normalized.body_text)
 
     def test_plain_text_to_html_does_not_render_markdown(self) -> None:
         rendered = mail_module.plain_text_to_html("第一段 **不渲染**\n下一行\n\n<script>x</script>")
@@ -339,6 +361,20 @@ Content-Type: text/plain; charset="utf-8"
         self.assertEqual(message_id, "<fixed@example.com>")
         self.assertEqual(fake_client.sent_message_ids, ["<fixed@example.com>"])
 
+    def test_smtp_send_succeeds_when_quit_fails_after_message_already_sent(self) -> None:
+        fake_client = _FakeSMTPClient(quit_exception=smtplib.SMTPResponseException(421, b"maintenance"))
+        mailbox = _mailbox_with_smtp_security("ssl")
+        message = _outbound_message()
+
+        with patch("dropline.mail.smtplib.SMTP_SSL", return_value=fake_client), patch(
+            "dropline.mail.smtplib.SMTP",
+        ):
+            message_id = SMTPOutboundClient(mailbox).send(message)
+
+        self.assertEqual(message_id, "<fixed@example.com>")
+        self.assertEqual(fake_client.sent_message_ids, ["<fixed@example.com>"])
+        self.assertEqual(fake_client.quit_calls, 1)
+
     def test_smtp_security_ssl_uses_smtp_ssl_without_starttls(self) -> None:
         fake_client = _FakeSMTPClient()
         mailbox = _mailbox_with_smtp_security("ssl")
@@ -429,15 +465,12 @@ class _FakeIMAPClient:
 
 
 class _FakeSMTPClient:
-    def __init__(self) -> None:
+    def __init__(self, *, quit_exception: Exception | None = None) -> None:
         self.sent_message_ids: list[str] = []
         self.starttls_calls = 0
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, exc_tb) -> None:
-        return None
+        self.quit_calls = 0
+        self.close_calls = 0
+        self._quit_exception = quit_exception
 
     def login(self, username: str, password: str) -> None:
         return None
@@ -447,6 +480,14 @@ class _FakeSMTPClient:
 
     def send_message(self, message: EmailMessage) -> None:
         self.sent_message_ids.append(message["Message-ID"])
+
+    def quit(self) -> None:
+        self.quit_calls += 1
+        if self._quit_exception is not None:
+            raise self._quit_exception
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 def _smtp_endpoint(*, host: str, port: int, security: str, username: str, password: str):

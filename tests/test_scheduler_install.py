@@ -173,6 +173,19 @@ class SchedulerInstallTests(unittest.TestCase):
         self.assertIn('>> "', rendered)
         self.assertIn('2>> "', rendered)
 
+    def test_render_windows_wrapper_script_escapes_percent_in_paths(self) -> None:
+        rendered = render_windows_wrapper_script(
+            repo_root=Path("C:/repo%1"),
+            python_executable="C:/Python312%2/python.exe",
+            config_path=Path("C:/repo/config%3.yaml"),
+            stdout_log_path=Path("C:/repo/runtime_logs/task.out.log"),
+            stderr_log_path=Path("C:/repo/runtime_logs/task.err.log"),
+        )
+
+        self.assertIn("repo%%1", rendered)
+        self.assertIn("Python312%%2", rendered)
+        self.assertIn("config%%3.yaml", rendered)
+
     def test_build_schtasks_commands_include_expected_arguments(self) -> None:
         create_command = build_schtasks_create_command(
             task_name="com.example.dropline",

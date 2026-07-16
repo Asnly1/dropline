@@ -4,11 +4,12 @@ import logging
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import Settings, load_settings, resolve_repo_root_from_config
-from .documents import read_text
+from .documents import read_optional_text
 from .llm import build_profile_generation_client
+from .llm_contracts import CHINESE_OUTPUT_LANGUAGE, ENGLISH_OUTPUT_LANGUAGE
 from .memory import MemoryManager
 from .models import CharacterProfileDraft, RelationshipProfileDraft
 from .provider_registry import get_provider_text_model
@@ -43,9 +44,6 @@ from .utils import resolve_path_within_roots
 
 
 LOGGER = logging.getLogger(__name__)
-
-CHINESE_OUTPUT_LANGUAGE = "简体中文"
-ENGLISH_OUTPUT_LANGUAGE = "English"
 
 PROFILE_RENDER_TEXT = {
     CHINESE_OUTPUT_LANGUAGE: {
@@ -224,11 +222,11 @@ def _log_profile_step(profile_label: str, step: int, total: int, message: str, *
 def _load_character_prompt_docs(repo_root: Path, character_slug: str) -> dict[str, str]:
     prompt_root = character_prompt_dir(repo_root, character_slug)
     return {
-        "persona": read_text(prompt_root / "persona.md"),
-        "world_state": read_text(prompt_root / "world_state.md"),
-        "cast_relations": read_text(prompt_root / "cast_relations.md"),
-        "cast_pool": read_text(prompt_root / "cast_pool.md"),
-        "translation_layer": read_text(prompt_root / "translation_layer.md"),
+        "persona": read_optional_text(prompt_root / "persona.md"),
+        "world_state": read_optional_text(prompt_root / "world_state.md"),
+        "cast_relations": read_optional_text(prompt_root / "cast_relations.md"),
+        "cast_pool": read_optional_text(prompt_root / "cast_pool.md"),
+        "translation_layer": read_optional_text(prompt_root / "translation_layer.md"),
     }
 
 
@@ -292,7 +290,19 @@ def _render_persona_markdown(
     *,
     language: str = CHINESE_OUTPUT_LANGUAGE,
 ) -> str:
-    sections = _render_text(language, "persona_sections")
+    sections = list(
+        zip(
+            _render_text(language, "persona_sections"),
+            (
+                draft.persona.identity_and_role,
+                draft.persona.core_values,
+                draft.persona.personality_traits,
+                draft.persona.language_style,
+                draft.persona.repeatable_life_details,
+                draft.persona.ooc_boundaries,
+            ),
+        )
+    )
     return _render_markdown_document(
         frontmatter=[
             ("version", "0.1"),
@@ -301,12 +311,7 @@ def _render_persona_markdown(
         ],
         title="persona.md",
         blocks=[
-            _render_numbered_section(1, sections[0], draft.persona.identity_and_role),
-            _render_numbered_section(2, sections[1], draft.persona.core_values),
-            _render_numbered_section(3, sections[2], draft.persona.personality_traits),
-            _render_numbered_section(4, sections[3], draft.persona.language_style),
-            _render_numbered_section(5, sections[4], draft.persona.repeatable_life_details),
-            _render_numbered_section(6, sections[5], draft.persona.ooc_boundaries),
+            _render_numbered_section(number, title, items) for number, (title, items) in enumerate(sections, start=1)
         ],
     )
 
@@ -317,7 +322,21 @@ def _render_world_state_markdown(
     *,
     language: str = CHINESE_OUTPUT_LANGUAGE,
 ) -> str:
-    sections = _render_text(language, "world_state_sections")
+    sections = list(
+        zip(
+            _render_text(language, "world_state_sections"),
+            (
+                draft.world_state.worldview_type,
+                draft.world_state.time_anchor,
+                draft.world_state.overall_atmosphere,
+                draft.world_state.character_work_domain,
+                draft.world_state.sustainable_storylines,
+                draft.world_state.appearance_boundaries,
+                draft.world_state.letter_scale,
+                draft.world_state.image_principles,
+            ),
+        )
+    )
     anchor = meta.work_title or str(_render_text(language, "public_anchor"))
     return _render_markdown_document(
         frontmatter=[
@@ -327,14 +346,7 @@ def _render_world_state_markdown(
         ],
         title="world_state.md",
         blocks=[
-            _render_numbered_section(1, sections[0], draft.world_state.worldview_type),
-            _render_numbered_section(2, sections[1], draft.world_state.time_anchor),
-            _render_numbered_section(3, sections[2], draft.world_state.overall_atmosphere),
-            _render_numbered_section(4, sections[3], draft.world_state.character_work_domain),
-            _render_numbered_section(5, sections[4], draft.world_state.sustainable_storylines),
-            _render_numbered_section(6, sections[5], draft.world_state.appearance_boundaries),
-            _render_numbered_section(7, sections[6], draft.world_state.letter_scale),
-            _render_numbered_section(8, sections[7], draft.world_state.image_principles),
+            _render_numbered_section(number, title, items) for number, (title, items) in enumerate(sections, start=1)
         ],
     )
 
@@ -497,7 +509,22 @@ def _render_relationship_markdown(
     *,
     language: str = CHINESE_OUTPUT_LANGUAGE,
 ) -> str:
-    sections = _render_text(language, "relationship_sections")
+    sections = list(
+        zip(
+            _render_text(language, "relationship_sections"),
+            (
+                draft.setup_statement,
+                draft.relationship_definition,
+                draft.shared_past,
+                draft.relationship_tone,
+                draft.attitude_toward_user,
+                draft.how_it_affects_letters,
+                draft.intimacy_threshold,
+                draft.explicit_boundaries,
+                draft.warming_up_path,
+            ),
+        )
+    )
     return _render_markdown_document(
         frontmatter=[
             ("version", "0.1"),
@@ -507,15 +534,7 @@ def _render_relationship_markdown(
         ],
         title="relationship.md",
         blocks=[
-            _render_numbered_section(1, sections[0], draft.setup_statement),
-            _render_numbered_section(2, sections[1], draft.relationship_definition),
-            _render_numbered_section(3, sections[2], draft.shared_past),
-            _render_numbered_section(4, sections[3], draft.relationship_tone),
-            _render_numbered_section(5, sections[4], draft.attitude_toward_user),
-            _render_numbered_section(6, sections[5], draft.how_it_affects_letters),
-            _render_numbered_section(7, sections[6], draft.intimacy_threshold),
-            _render_numbered_section(8, sections[7], draft.explicit_boundaries),
-            _render_numbered_section(9, sections[8], draft.warming_up_path),
+            _render_numbered_section(number, title, items) for number, (title, items) in enumerate(sections, start=1)
         ],
     )
 
@@ -577,6 +596,25 @@ def _build_scoped_store(config_path: str, *, character_slug: str, relationship_s
         settings,
         scope=SessionScope(character_slug=character_slug, relationship_slug=relationship_slug),
     )
+
+
+def _resolve_scoped_store(
+    config_path: str,
+    *,
+    character_slug_value: str | None = None,
+    relationship_slug_value: str | None = None,
+) -> tuple[CharacterProfileMeta, RelationshipProfileMeta, SessionProfileMeta | None, StateStore]:
+    character, relationship, session = _resolve_session_target(
+        config_path,
+        character_slug_value=character_slug_value,
+        relationship_slug_value=relationship_slug_value,
+    )
+    store = _build_scoped_store(
+        config_path,
+        character_slug=character.slug,
+        relationship_slug=relationship.slug,
+    )
+    return character, relationship, session, store
 
 
 def _confirm_destructive_action(prompt: str, *, yes: bool) -> bool:
@@ -871,15 +909,10 @@ def show_inbox(
     relationship_slug_value: str | None = None,
     limit: int = 5,
 ) -> int:
-    character, relationship, session = _resolve_session_target(
+    character, relationship, session, store = _resolve_scoped_store(
         config_path,
         character_slug_value=character_slug_value,
         relationship_slug_value=relationship_slug_value,
-    )
-    store = _build_scoped_store(
-        config_path,
-        character_slug=character.slug,
-        relationship_slug=relationship.slug,
     )
     messages = store.list_unconsumed_inbound(limit=limit)
     print(f"Session: {_session_label(character, relationship)} ({'ready' if session is not None else 'missing'})")
@@ -903,15 +936,10 @@ def show_outbox(
     relationship_slug_value: str | None = None,
     limit: int = 5,
 ) -> int:
-    character, relationship, session = _resolve_session_target(
+    character, relationship, session, store = _resolve_scoped_store(
         config_path,
         character_slug_value=character_slug_value,
         relationship_slug_value=relationship_slug_value,
-    )
-    store = _build_scoped_store(
-        config_path,
-        character_slug=character.slug,
-        relationship_slug=relationship.slug,
     )
     outbound_messages = store.list_recent_outbound_messages(limit=limit)
     if not outbound_messages:
@@ -930,7 +958,7 @@ def delete_session(
     yes: bool = False,
 ) -> int:
     repo_root = _repo_root_from_config(config_path)
-    character, relationship, _session = _resolve_session_target(
+    character, relationship, _session, store = _resolve_scoped_store(
         config_path,
         character_slug_value=character_slug_value,
         relationship_slug_value=relationship_slug_value,
@@ -941,11 +969,6 @@ def delete_session(
     ):
         print("Cancelled.")
         return 1
-    store = _build_scoped_store(
-        config_path,
-        character_slug=character.slug,
-        relationship_slug=relationship.slug,
-    )
     summary = store.delete_session_records()
     session_root = session_profile_dir(repo_root, character.slug, relationship.slug)
     session_root = resolve_path_within_roots(
@@ -974,6 +997,49 @@ def delete_session(
     return 0
 
 
+def _delete_scoped_messages(
+    config_path: str,
+    *,
+    character_slug_value: str,
+    relationship_slug_value: str,
+    target: object | None,
+    delete_all: bool,
+    yes: bool,
+    kind: str,
+    field_name: str,
+    delete_one: Callable[[StateStore, object], bool],
+    delete_all_fn: Callable[[StateStore], int],
+) -> int:
+    if (target is None) == (not delete_all):
+        raise ValueError(f"Use exactly one of --{field_name.replace('_', '-')} or --all.")
+    character, relationship, _session, store = _resolve_scoped_store(
+        config_path,
+        character_slug_value=character_slug_value,
+        relationship_slug_value=relationship_slug_value,
+    )
+    target_label = f"all {kind} messages" if delete_all else f"{kind} {field_name}={target}"
+    if not _confirm_destructive_action(
+        f"Delete {target_label} for {_session_label(character, relationship)}?",
+        yes=yes,
+    ):
+        print("Cancelled.")
+        return 1
+    if delete_all:
+        deleted_count = delete_all_fn(store)
+        print(f"Deleted {kind} message(s): {deleted_count}")
+        print(f"Session: {_session_label(character, relationship)}")
+        print("Scope: all")
+        return 0
+    deleted = delete_one(store, target)
+    if not deleted:
+        print(f"{kind.capitalize()} message not found in {_session_label(character, relationship)}: {field_name}={target}")
+        return 1
+    print(f"Deleted {kind} message(s): 1")
+    print(f"Session: {_session_label(character, relationship)}")
+    print(f"Target: {field_name}={target}")
+    return 0
+
+
 def delete_inbound(
     config_path: str,
     *,
@@ -983,39 +1049,18 @@ def delete_inbound(
     delete_all: bool = False,
     yes: bool = False,
 ) -> int:
-    if (imap_uid is None) == (not delete_all):
-        raise ValueError("Use exactly one of --uid or --all.")
-    character, relationship, _session = _resolve_session_target(
+    return _delete_scoped_messages(
         config_path,
         character_slug_value=character_slug_value,
         relationship_slug_value=relationship_slug_value,
-    )
-    target_label = "all inbound messages" if delete_all else f"inbound uid={imap_uid}"
-    if not _confirm_destructive_action(
-        f"Delete {target_label} for {_session_label(character, relationship)}?",
+        target=imap_uid,
+        delete_all=delete_all,
         yes=yes,
-    ):
-        print("Cancelled.")
-        return 1
-    store = _build_scoped_store(
-        config_path,
-        character_slug=character.slug,
-        relationship_slug=relationship.slug,
+        kind="inbound",
+        field_name="uid",
+        delete_one=lambda store, value: store.delete_inbound_message(value),
+        delete_all_fn=lambda store: store.delete_all_inbound_messages(),
     )
-    if delete_all:
-        deleted_count = store.delete_all_inbound_messages()
-        print(f"Deleted inbound message(s): {deleted_count}")
-        print(f"Session: {_session_label(character, relationship)}")
-        print("Scope: all")
-        return 0
-    deleted = store.delete_inbound_message(imap_uid)
-    if not deleted:
-        print(f"Inbound message not found in {_session_label(character, relationship)}: uid={imap_uid}")
-        return 1
-    print("Deleted inbound message(s): 1")
-    print(f"Session: {_session_label(character, relationship)}")
-    print(f"Target: uid={imap_uid}")
-    return 0
 
 
 def delete_outbound(
@@ -1027,36 +1072,15 @@ def delete_outbound(
     delete_all: bool = False,
     yes: bool = False,
 ) -> int:
-    if (message_id is None) == (not delete_all):
-        raise ValueError("Use exactly one of --message-id or --all.")
-    character, relationship, _session = _resolve_session_target(
+    return _delete_scoped_messages(
         config_path,
         character_slug_value=character_slug_value,
         relationship_slug_value=relationship_slug_value,
-    )
-    target_label = "all outbound messages" if delete_all else f"outbound message_id={message_id}"
-    if not _confirm_destructive_action(
-        f"Delete {target_label} for {_session_label(character, relationship)}?",
+        target=message_id,
+        delete_all=delete_all,
         yes=yes,
-    ):
-        print("Cancelled.")
-        return 1
-    store = _build_scoped_store(
-        config_path,
-        character_slug=character.slug,
-        relationship_slug=relationship.slug,
+        kind="outbound",
+        field_name="message_id",
+        delete_one=lambda store, value: store.delete_outbound_message(value),
+        delete_all_fn=lambda store: store.delete_all_outbound_messages(),
     )
-    if delete_all:
-        deleted_count = store.delete_all_outbound_messages()
-        print(f"Deleted outbound message(s): {deleted_count}")
-        print(f"Session: {_session_label(character, relationship)}")
-        print("Scope: all")
-        return 0
-    deleted = store.delete_outbound_message(message_id)
-    if not deleted:
-        print(f"Outbound message not found in {_session_label(character, relationship)}: message_id={message_id}")
-        return 1
-    print("Deleted outbound message(s): 1")
-    print(f"Session: {_session_label(character, relationship)}")
-    print(f"Target: message_id={message_id}")
-    return 0

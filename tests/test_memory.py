@@ -8,7 +8,16 @@ from zoneinfo import ZoneInfo
 
 from dropline.documents import load_entries, load_json_file, write_json_file
 from dropline.memory import MemoryManager
-from dropline.models import ActiveArcUpdateSuggestion, CandidateMemory, CharacterEpisode, Stage1Result, Stage2Result, UserDigest
+from dropline.models import (
+    ActiveArcUpdateSuggestion,
+    CandidateMemory,
+    CharacterEpisode,
+    ConflictNote,
+    Stage1Result,
+    Stage2Result,
+    UserDigest,
+)
+from dropline.utils import hash_text
 
 from tests.helpers import create_test_repo, load_test_settings
 
@@ -260,6 +269,80 @@ class MemoryManagerTests(unittest.TestCase):
             entries_after_archive = load_entries(settings.documents.active_arc)
             self.assertEqual(entries_after_archive, [])
 
+    def test_active_arc_trim_uses_actual_chronological_order_across_dst(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+
+            # "2026-11-01T01:30:00-07:00" (08:30 UTC) is lexically larger than
+            # "2026-11-01T01:15:00-08:00" (09:15 UTC) but is actually the earlier instant
+            # (US DST fall-back repeats the 1am hour). arc-z (09:05 UTC) is actually more
+            # recent than arc-y (08:30 UTC) despite sorting lower as a plain string.
+            write_json_file(
+                settings.documents.active_arc,
+                [
+                    {
+                        "key": "arc-x",
+                        "content": "用户在推进考试复习(X)",
+                        "memory_type": "active_arc",
+                        "confidence": 0.8,
+                        "durability": "short",
+                        "evidence": ["evidence-x"],
+                        "source_dates": ["2026-11-01"],
+                        "source_message_ids": ["batch-x"],
+                        "created_at": "2026-11-01T01:15:00-08:00",
+                        "updated_at": "2026-11-01T01:15:00-08:00",
+                        "why_it_matters": "",
+                    },
+                    {
+                        "key": "arc-y",
+                        "content": "用户在推进考试复习(Y)",
+                        "memory_type": "active_arc",
+                        "confidence": 0.8,
+                        "durability": "short",
+                        "evidence": ["evidence-y"],
+                        "source_dates": ["2026-11-01"],
+                        "source_message_ids": ["batch-y"],
+                        "created_at": "2026-11-01T01:30:00-07:00",
+                        "updated_at": "2026-11-01T01:30:00-07:00",
+                        "why_it_matters": "",
+                    },
+                    {
+                        "key": "arc-z",
+                        "content": "用户在推进考试复习(Z)",
+                        "memory_type": "active_arc",
+                        "confidence": 0.8,
+                        "durability": "short",
+                        "evidence": ["evidence-z"],
+                        "source_dates": ["2026-11-01"],
+                        "source_message_ids": ["batch-z"],
+                        "created_at": "2026-11-01T01:05:00-08:00",
+                        "updated_at": "2026-11-01T01:05:00-08:00",
+                        "why_it_matters": "",
+                    },
+                ],
+            )
+
+            manager.write_character_side(
+                stage2_result=self._stage2_with_arc_suggestion(
+                    action="update",
+                    content="用户开始新的连续主线(NEW)",
+                ),
+                batch_id="batch-new",
+                now=datetime(2026, 11, 2, 12, 0, tzinfo=ZoneInfo("UTC")),
+            )
+
+            entries = load_entries(settings.documents.active_arc)
+            keys = {item["key"] for item in entries}
+            self.assertEqual(len(entries), 2)
+            # arc-x (09:15 UTC) is the actual second-most-recent entry and must survive;
+            # arc-y (08:30 UTC) is actually the oldest of the three and must be evicted,
+            # even though its timestamp string sorts highest lexically.
+            self.assertIn("arc-x", keys)
+            self.assertNotIn("arc-y", keys)
+
     def test_conflict_detection_does_not_treat_broad_bu_as_negation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -382,6 +465,204 @@ class MemoryManagerTests(unittest.TestCase):
             self.assertEqual(conflict_entries[0]["existing_content"], "用户喜欢夜跑")
             self.assertEqual(conflict_entries[0]["new_content"], "用户不再喜欢夜跑")
             self.assertEqual(conflict_entries[0]["source_message_ids"], ["<msg-new@example.com>"])
+
+    def _negated_night_run_stage1(self, source_date: str) -> Stage1Result:
+        return Stage1Result(
+            user_digest=UserDigest(main_event="用户更新夜跑偏好。", state="平稳", possible_needs=[]),
+            candidate_memories=[
+                CandidateMemory(
+                    content="用户不再喜欢夜跑",
+                    type="user_profile",
+                    confidence=0.95,
+                    durability="stable",
+                    evidence="记住，我不再喜欢夜跑。",
+                    why_it_matters="后续可参考运动习惯。",
+                    source_date=source_date,
+                )
+            ],
+            emotional_priority="comfort",
+            open_loops=[],
+        )
+
+    def test_conflict_note_same_day_repeat_does_not_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            now = datetime(2026, 3, 31, 22, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+            existing = Stage1Result(
+                user_digest=UserDigest(main_event="用户提到夜跑。", state="平稳", possible_needs=[]),
+                candidate_memories=[
+                    CandidateMemory(
+                        content="用户喜欢夜跑",
+                        type="user_profile",
+                        confidence=0.95,
+                        durability="stable",
+                        evidence="记住，我喜欢夜跑。",
+                        why_it_matters="后续可参考运动习惯。",
+                        source_date="2026-03-31",
+                    )
+                ],
+                emotional_priority="comfort",
+                open_loops=[],
+            )
+            manager.write_user_side(
+                stage1_result=existing,
+                batch_id="batch-old",
+                now=now,
+                source_message_ids=["<msg-old@example.com>"],
+                source_dates=["2026-03-31"],
+            )
+
+            # Fires the conflict once on 2026-04-01.
+            manager.write_user_side(
+                stage1_result=self._negated_night_run_stage1("2026-04-01"),
+                batch_id="batch-day1",
+                now=now,
+                source_message_ids=["<msg-day1@example.com>"],
+                source_dates=["2026-04-01"],
+            )
+            # Repeats on the SAME date -> must not count as a second distinct occurrence.
+            manager.write_user_side(
+                stage1_result=self._negated_night_run_stage1("2026-04-01"),
+                batch_id="batch-day1-dup",
+                now=now,
+                source_message_ids=["<msg-day1-dup@example.com>"],
+                source_dates=["2026-04-01"],
+            )
+
+            profile_entries = load_entries(settings.documents.user_profile)
+            conflict_entries = load_entries(settings.documents.conflict_notes)
+            self.assertEqual([item["content"] for item in profile_entries], ["用户喜欢夜跑"])
+            self.assertEqual(len(conflict_entries), 1)
+            self.assertEqual(conflict_entries[0]["occurrence_dates"], ["2026-04-01"])
+
+    def test_conflict_note_overwrites_after_two_distinct_occurrence_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            now = datetime(2026, 3, 31, 22, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+            existing = Stage1Result(
+                user_digest=UserDigest(main_event="用户提到夜跑。", state="平稳", possible_needs=[]),
+                candidate_memories=[
+                    CandidateMemory(
+                        content="用户喜欢夜跑",
+                        type="user_profile",
+                        confidence=0.95,
+                        durability="stable",
+                        evidence="记住，我喜欢夜跑。",
+                        why_it_matters="后续可参考运动习惯。",
+                        source_date="2026-03-31",
+                    )
+                ],
+                emotional_priority="comfort",
+                open_loops=[],
+            )
+            manager.write_user_side(
+                stage1_result=existing,
+                batch_id="batch-old",
+                now=now,
+                source_message_ids=["<msg-old@example.com>"],
+                source_dates=["2026-03-31"],
+            )
+
+            manager.write_user_side(
+                stage1_result=self._negated_night_run_stage1("2026-04-01"),
+                batch_id="batch-day1",
+                now=now,
+                source_message_ids=["<msg-day1@example.com>"],
+                source_dates=["2026-04-01"],
+            )
+            profile_after_day1 = load_entries(settings.documents.user_profile)
+            self.assertEqual([item["content"] for item in profile_after_day1], ["用户喜欢夜跑"])
+
+            # Second DISTINCT date -> the repeated-occurrence override path fires.
+            manager.write_user_side(
+                stage1_result=self._negated_night_run_stage1("2026-04-02"),
+                batch_id="batch-day2",
+                now=now,
+                source_message_ids=["<msg-day2@example.com>"],
+                source_dates=["2026-04-02"],
+            )
+
+            profile_after_override = load_entries(settings.documents.user_profile)
+            conflict_entries_after_override = load_entries(settings.documents.conflict_notes)
+            self.assertEqual([item["content"] for item in profile_after_override], ["用户不再喜欢夜跑"])
+            self.assertEqual(conflict_entries_after_override, [])
+
+    def test_legacy_conflict_note_without_occurrence_dates_loads_and_still_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            now = datetime(2026, 4, 2, 22, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+            write_json_file(
+                settings.documents.user_profile,
+                [
+                    {
+                        "key": "user-profile-existing",
+                        "content": "用户喜欢夜跑",
+                        "memory_type": "user_profile",
+                        "confidence": 0.95,
+                        "durability": "stable",
+                        "evidence": ["记住，我喜欢夜跑。"],
+                        "source_dates": ["2026-03-31"],
+                        "source_message_ids": ["batch-old"],
+                        "created_at": "2026-03-31T22:00:00-07:00",
+                        "updated_at": "2026-03-31T22:00:00-07:00",
+                        "why_it_matters": "",
+                    }
+                ],
+            )
+            legacy_key = hash_text("用户喜欢夜跑:用户不再喜欢夜跑", prefix="conflict-")
+            # Old-format conflict note: no "occurrence_dates" field at all.
+            write_json_file(
+                settings.documents.conflict_notes,
+                [
+                    {
+                        "key": legacy_key,
+                        "memory_type": "user_profile",
+                        "existing_content": "用户喜欢夜跑",
+                        "new_content": "用户不再喜欢夜跑",
+                        "reason": "Detected negation-style conflict between existing and new long-term memory.",
+                        "source_date": "2026-04-01",
+                        "source_message_ids": ["<msg-old@example.com>"],
+                        "created_at": "2026-04-01T22:00:00-07:00",
+                    }
+                ],
+            )
+
+            manager.write_user_side(
+                stage1_result=self._negated_night_run_stage1("2026-04-02"),
+                batch_id="batch-day2",
+                now=now,
+                source_message_ids=["<msg-day2@example.com>"],
+                source_dates=["2026-04-02"],
+            )
+
+            profile_entries = load_entries(settings.documents.user_profile)
+            conflict_entries = load_entries(settings.documents.conflict_notes)
+            self.assertEqual([item["content"] for item in profile_entries], ["用户不再喜欢夜跑"])
+            self.assertEqual(conflict_entries, [])
+
+    def test_conflict_note_from_dict_backfills_missing_occurrence_dates(self) -> None:
+        payload = {
+            "key": "conflict-legacy",
+            "memory_type": "user_profile",
+            "existing_content": "用户喜欢夜跑",
+            "new_content": "用户不再喜欢夜跑",
+            "reason": "Detected negation-style conflict between existing and new long-term memory.",
+            "source_date": "2026-04-01",
+            "source_message_ids": ["<msg@example.com>"],
+            "created_at": "2026-04-01T22:00:00-07:00",
+        }
+        note = ConflictNote.from_dict(payload)
+        self.assertEqual(note.occurrence_dates, ["2026-04-01"])
 
 
 if __name__ == "__main__":

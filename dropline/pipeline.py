@@ -11,6 +11,7 @@ from typing import Sequence
 from .config import Settings, load_settings, validate_live_settings
 from .documents import load_json_file, read_optional_text, read_required_text
 from .llm import AIClient, build_ai_client
+from .llm_contracts import ENGLISH_OUTPUT_LANGUAGE
 from .mail import (
     IMAPInboundClient,
     InboundMailClient,
@@ -30,7 +31,6 @@ LOGGER = logging.getLogger(__name__)
 
 RECENT_EPISODE_LOOKBACK_DAYS = 7
 RECENT_SCENE_CARD_LIMIT = 7
-ENGLISH_OUTPUT_LANGUAGE = "English"
 
 
 @dataclass(slots=True)
@@ -64,7 +64,18 @@ class PipelineService:
         self.dependencies = dependencies or self._default_dependencies(settings)
 
     def run_once(self) -> RunOutcome:
-        context = self._prepare_run()
+        try:
+            context = self._prepare_run()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Pipeline run failed during preparation")
+            return RunOutcome(
+                success=False,
+                run_id="",
+                mode="pending",
+                batch_id="",
+                error_stage="prepare",
+                message=str(exc),
+            )
         try:
             self._log_step(context.run_id, 1, 8, "Waiting for run lock.")
             with self.dependencies.state_store.acquire_lock():
@@ -239,8 +250,6 @@ class PipelineService:
         if not self.settings.llm.image.enabled:
             self._log_step(context.run_id, 6, 8, "Image generation disabled by config; sending text-only email.")
             return
-        if stage2_result.scene_card is None:
-            raise ModelValidationError("Stage 2 scene card is required when image generation is enabled.")
         context.current_stage = "image"
         self._log_step(context.run_id, 6, 8, "Generating image from scene card.")
         generated_image = self.dependencies.ai_client.generate_image(stage2_result.scene_card)

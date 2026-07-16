@@ -622,6 +622,7 @@ COMMAND_SPECS = (
                 default=False,
                 action="store_true",
             ),
+            YES_OPTION,
         ),
         confirm_message="Install or reload the scheduler task?",
     ),
@@ -638,6 +639,7 @@ COMMAND_SPECS = (
                 default=DEFAULT_SCHEDULER_TASK_NAME,
                 metavar="NAME",
             ),
+            YES_OPTION,
         ),
         confirm_message="Uninstall the scheduler task?",
     ),
@@ -678,10 +680,6 @@ def _build_parser(spec: CommandSpec) -> CommandParser:
             kwargs["action"] = option.action
         parser.add_argument(*option.flags, **kwargs)
     return parser
-
-
-def _canonical_command_name(name: str) -> str:
-    return name
 
 
 def _is_blank(value: object) -> bool:
@@ -792,8 +790,7 @@ def _print_root_help(output: TextIO) -> None:
 
 
 def _print_command_help(command_name: str, *, output: TextIO) -> int:
-    canonical_name = _canonical_command_name(command_name)
-    spec = COMMANDS.get(canonical_name)
+    spec = COMMANDS.get(command_name)
     if spec is None:
         print(f"Unknown command: {command_name}", file=output)
         return 1
@@ -813,7 +810,7 @@ def execute_command(
         _print_root_help(output)
         return 0
 
-    command_name = _canonical_command_name(argv[0])
+    command_name = argv[0]
     spec = COMMANDS.get(command_name)
     if spec is None:
         print(f"Unknown command: {argv[0]}", file=output)

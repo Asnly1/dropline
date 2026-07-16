@@ -25,6 +25,7 @@ from dropline.models import (
     TranslationReplyPatternDraft,
     WorldStateProfileDraft,
 )
+from dropline.profile_manager import list_character_profile_metas
 from dropline.profiles import (
     delete_inbound,
     delete_outbound,
@@ -326,6 +327,52 @@ class ProfileCLITests(unittest.TestCase):
             self.assertNotIn("xiao-zhan:", rendered)
             self.assertNotIn("肖战 / ", rendered)
             self.assertNotIn("sessions:", rendered)
+
+    def test_list_character_profile_metas_skips_corrupted_meta_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            broken_root = root / "profiles" / "characters" / "broken"
+            _write_json(
+                broken_root / "meta.json",
+                {
+                    "slug": "",
+                    "character_name": "损坏角色",
+                    "work_title": "",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            )
+
+            with self.assertLogs("dropline.profile_manager", level="WARNING") as captured_logs:
+                metas = list_character_profile_metas(root)
+
+            self.assertEqual([meta.slug for meta in metas], ["keqing"])
+            self.assertTrue(any("broken" in message for message in captured_logs.output))
+
+    def test_list_profiles_command_skips_corrupted_meta_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            broken_root = root / "profiles" / "characters" / "broken"
+            _write_json(
+                broken_root / "meta.json",
+                {
+                    "slug": "",
+                    "character_name": "损坏角色",
+                    "work_title": "",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            )
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                with self.assertLogs("dropline.profile_manager", level="WARNING"):
+                    exit_code = list_profiles(str(root / "config.yaml"))
+
+            self.assertEqual(exit_code, 0)
+            rendered = output.getvalue()
+            self.assertIn("刻晴", rendered)
+            self.assertNotIn("损坏角色", rendered)
 
     def test_list_profiles_handles_missing_active_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

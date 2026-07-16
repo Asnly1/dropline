@@ -93,6 +93,7 @@ Examples:
   - The user explicitly corrects it.
   - The new information appears repeatedly on at least 2 different dates.
   - The new information is clearly more specific, and the old value has not been reconfirmed for a long time.
+- Current implementation: only the "repeated on at least 2 different dates" path is automated. Once the same `conflict_note` has accumulated 2 distinct occurrence dates, the new value overwrites the old entry and the conflict note is cleared. The "explicit user correction" and "more specific" paths are not yet automated.
 
 ## 7. Quantity Limits
 

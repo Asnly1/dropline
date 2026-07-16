@@ -3,12 +3,15 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import hashlib
+import logging
 import re
 from pathlib import Path
 from typing import Callable, Iterable, TypeVar
 
 from .documents import load_json_file, write_json_file
 
+
+LOGGER = logging.getLogger(__name__)
 
 CHARACTERS_DIR = "characters"
 RELATIONSHIPS_DIR = "relationships"
@@ -201,14 +204,6 @@ def session_profile_dir(repo_root: Path, character_slug: str, relationship_slug:
     return sessions_root(repo_root, character_slug) / relationship_slug
 
 
-def session_memory_dir(repo_root: Path, character_slug: str, relationship_slug: str) -> Path:
-    return session_profile_dir(repo_root, character_slug, relationship_slug) / MEMORY_DIR
-
-
-def session_episode_dir(repo_root: Path, character_slug: str, relationship_slug: str, side: str) -> Path:
-    return session_profile_dir(repo_root, character_slug, relationship_slug) / EPISODES_DIR / side
-
-
 def session_archive_dir(repo_root: Path, character_slug: str, relationship_slug: str) -> Path:
     return session_profile_dir(repo_root, character_slug, relationship_slug) / ARCHIVE_DIR
 
@@ -301,26 +296,25 @@ def _load_meta(
     path: Path,
     *,
     parse: Callable[[dict[str, object]], _MetaT],
-    is_valid: Callable[[_MetaT], bool],
 ) -> _MetaT | None:
     payload = load_json_file(path, default=None)
     if not isinstance(payload, dict):
         return None
-    meta = parse(payload)
-    if not is_valid(meta):
+    try:
+        return parse(payload)
+    except ValueError as exc:
+        LOGGER.warning("Skipping invalid profile meta at %s: %s", path, exc)
         return None
-    return meta
 
 
 def _list_metas(
     meta_paths: Iterable[Path],
     *,
     parse: Callable[[dict[str, object]], _MetaT],
-    is_valid: Callable[[_MetaT], bool],
 ) -> list[_MetaT]:
     metas: list[_MetaT] = []
     for meta_path in meta_paths:
-        meta = _load_meta(meta_path, parse=parse, is_valid=is_valid)
+        meta = _load_meta(meta_path, parse=parse)
         if meta is not None:
             metas.append(meta)
     return metas
@@ -330,7 +324,6 @@ def load_character_profile_meta(repo_root: Path, character_slug: str) -> Charact
     return _load_meta(
         character_profile_dir(repo_root, character_slug) / META_FILENAME,
         parse=CharacterProfileMeta.from_dict,
-        is_valid=lambda meta: bool(meta.slug),
     )
 
 
@@ -342,7 +335,6 @@ def load_relationship_profile_meta(
     return _load_meta(
         relationship_profile_dir(repo_root, character_slug, relationship_slug) / META_FILENAME,
         parse=RelationshipProfileMeta.from_dict,
-        is_valid=lambda meta: bool(meta.slug),
     )
 
 
@@ -350,7 +342,6 @@ def load_session_profile_meta(repo_root: Path, character_slug: str, relationship
     return _load_meta(
         session_profile_dir(repo_root, character_slug, relationship_slug) / META_FILENAME,
         parse=SessionProfileMeta.from_dict,
-        is_valid=lambda meta: bool(meta.slug),
     )
 
 
@@ -358,7 +349,6 @@ def list_character_profile_metas(repo_root: Path) -> list[CharacterProfileMeta]:
     return _list_metas(
         sorted(characters_root(repo_root).glob(f"*/{META_FILENAME}")),
         parse=CharacterProfileMeta.from_dict,
-        is_valid=lambda meta: bool(meta.slug),
     )
 
 
@@ -370,7 +360,6 @@ def list_relationship_profile_metas(repo_root: Path, character_slug: str | None 
     return _list_metas(
         meta_paths,
         parse=RelationshipProfileMeta.from_dict,
-        is_valid=lambda meta: bool(meta.slug and meta.character_slug),
     )
 
 
@@ -429,18 +418,6 @@ def resolve_relationship_profile_meta(
             + ", ".join(sorted(_relationship_disambiguation_label(relationship) for relationship in name_matches))
         )
     return None
-
-
-def list_session_profile_metas(repo_root: Path, character_slug: str | None = None) -> list[SessionProfileMeta]:
-    if character_slug is not None:
-        meta_paths = sorted(sessions_root(repo_root, character_slug).glob(f"*/{META_FILENAME}"))
-    else:
-        meta_paths = sorted(characters_root(repo_root).glob(f"*/{SESSIONS_DIR}/*/{META_FILENAME}"))
-    return _list_metas(
-        meta_paths,
-        parse=SessionProfileMeta.from_dict,
-        is_valid=lambda meta: bool(meta.slug),
-    )
 
 
 def create_session_profile(
@@ -508,22 +485,6 @@ def load_selected_profile_context(repo_root: Path) -> SelectedProfileContext | N
         character=character,
         relationship=relationship,
         session=session,
-    )
-
-
-def load_active_profile_context(repo_root: Path) -> ActiveProfileContext | None:
-    selected = load_selected_profile_context(repo_root)
-    if selected is None:
-        return None
-    if selected.session is None:
-        raise ValueError(
-            f"Active session profile not found for '{selected.selection.character_slug}': {selected.selection.relationship_slug}"
-        )
-    return ActiveProfileContext(
-        selection=selected.selection,
-        character=selected.character,
-        relationship=selected.relationship,
-        session=selected.session,
     )
 
 

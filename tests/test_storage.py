@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 from dropline.models import NormalizedInboundMessage
@@ -652,6 +653,198 @@ class StateStoreTests(unittest.TestCase):
 
             self.assertEqual([item.subject for item in store_a.list_unconsumed_inbound()], ["session-a"])
             self.assertEqual([item.subject for item in store_b.list_unconsumed_inbound()], ["session-b-updated"])
+
+    def test_connect_closes_connection_after_context_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+
+            with store._connect() as conn:
+                self.assertEqual(conn.execute("SELECT 1").fetchone()[0], 1)
+
+            with self.assertRaises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
+
+    def test_delete_paths_continues_after_individual_unlink_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+
+            good_path = settings.documents.session_archive_dir / "good.txt"
+            good_path.parent.mkdir(parents=True, exist_ok=True)
+            good_path.write_text("good", encoding="utf-8")
+            bad_path = settings.documents.session_archive_dir / "bad.txt"
+            bad_path.write_text("bad", encoding="utf-8")
+
+            original_unlink = Path.unlink
+
+            def fake_unlink(self_path: Path, *args: object, **kwargs: object) -> None:
+                if self_path == bad_path:
+                    raise OSError("simulated unlink failure")
+                return original_unlink(self_path, *args, **kwargs)
+
+            with mock.patch.object(Path, "unlink", fake_unlink):
+                store._delete_paths([bad_path, good_path])
+
+            self.assertTrue(bad_path.exists())
+            self.assertFalse(good_path.exists())
+
+    def test_get_first_outbound_sent_at_uses_actual_chronological_order_across_dst(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+
+            # "2026-11-01T01:30:00-07:00" (08:30 UTC) is lexically LARGER than
+            # "2026-11-01T01:15:00-08:00" (09:15 UTC) but is actually the EARLIER instant
+            # (US DST fall-back repeats the 1am hour). A plain string ORDER BY gets this
+            # backwards.
+            store.record_outbound_message(
+                message_id="<pdt@example.com>",
+                sent_at="2026-11-01T01:30:00-07:00",
+                to_email="user@example.com",
+                subject="pdt",
+                raw_path=root / "pdt.eml",
+                image_path=None,
+                run_id="run-pdt",
+                batch_id="batch-pdt",
+            )
+            store.record_outbound_message(
+                message_id="<pst@example.com>",
+                sent_at="2026-11-01T01:15:00-08:00",
+                to_email="user@example.com",
+                subject="pst",
+                raw_path=root / "pst.eml",
+                image_path=None,
+                run_id="run-pst",
+                batch_id="batch-pst",
+            )
+
+            first_sent_at = store.get_first_outbound_sent_at()
+            self.assertEqual(first_sent_at, datetime.fromisoformat("2026-11-01T01:30:00-07:00"))
+
+    def test_get_outbound_message_for_batch_uses_actual_chronological_order_across_dst(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+
+            store.record_outbound_message(
+                message_id="<batch-dst-pdt@example.com>",
+                sent_at="2026-11-01T01:30:00-07:00",
+                to_email="user@example.com",
+                subject="pdt",
+                raw_path=root / "pdt.eml",
+                image_path=None,
+                run_id="run-pdt",
+                batch_id="batch-dst",
+            )
+            store.record_outbound_message(
+                message_id="<batch-dst-pst@example.com>",
+                sent_at="2026-11-01T01:15:00-08:00",
+                to_email="user@example.com",
+                subject="pst",
+                raw_path=root / "pst.eml",
+                image_path=None,
+                run_id="run-pst",
+                batch_id="batch-dst",
+            )
+
+            latest = store.get_outbound_message_for_batch("batch-dst")
+            self.assertIsNotNone(latest)
+            self.assertEqual(latest.message_id, "<batch-dst-pst@example.com>")
+
+    def test_list_recent_runs_uses_actual_chronological_order_across_dst(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+
+            store.start_run("run-pdt", "2026-11-01T01:30:00-07:00")
+            store.start_run("run-pst", "2026-11-01T01:15:00-08:00")
+
+            recent = store.list_recent_runs(limit=1)
+            self.assertEqual([run.run_id for run in recent], ["run-pst"])
+
+    def test_list_recent_outbound_messages_uses_actual_chronological_order_across_dst(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+
+            store.record_outbound_message(
+                message_id="<recent-pdt@example.com>",
+                sent_at="2026-11-01T01:30:00-07:00",
+                to_email="user@example.com",
+                subject="pdt",
+                raw_path=root / "recent-pdt.eml",
+                image_path=None,
+                run_id="run-pdt",
+                batch_id="batch-recent-pdt",
+            )
+            store.record_outbound_message(
+                message_id="<recent-pst@example.com>",
+                sent_at="2026-11-01T01:15:00-08:00",
+                to_email="user@example.com",
+                subject="pst",
+                raw_path=root / "recent-pst.eml",
+                image_path=None,
+                run_id="run-pst",
+                batch_id="batch-recent-pst",
+            )
+
+            recent = store.list_recent_outbound_messages(limit=1)
+            self.assertEqual([item.message_id for item in recent], ["<recent-pst@example.com>"])
+
+    def test_list_recent_assets_uses_actual_chronological_order_across_dst(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+
+            store.record_asset(
+                asset_id="asset-pdt",
+                run_id="run-pdt",
+                image_path=root / "asset-pdt.png",
+                scene_card={"location": "PDT"},
+                prompt_text="prompt-pdt",
+                created_at="2026-11-01T01:30:00-07:00",
+            )
+            store.record_asset(
+                asset_id="asset-pst",
+                run_id="run-pst",
+                image_path=root / "asset-pst.png",
+                scene_card={"location": "PST"},
+                prompt_text="prompt-pst",
+                created_at="2026-11-01T01:15:00-08:00",
+            )
+
+            recent = store.list_recent_assets(limit=1)
+            self.assertEqual([item.asset_id for item in recent], ["asset-pst"])
+
 
 if __name__ == "__main__":
     unittest.main()

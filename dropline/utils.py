@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import imaplib
 import logging
-import re
 import smtplib
 import time
 import uuid
@@ -19,7 +18,6 @@ except ImportError:  # pragma: no cover - optional dependency at import time
     httpx = None
 
 
-NON_FILENAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 TRANSIENT_ERROR_FRAGMENTS = (
     "server disconnected without sending a response",
     "incomplete chunked read",
@@ -49,11 +47,6 @@ def hash_text(value: str, prefix: str = "") -> str:
     return f"{prefix}{digest}" if prefix else digest
 
 
-def safe_filename(value: str, fallback: str) -> str:
-    cleaned = NON_FILENAME_RE.sub("-", value).strip("-")
-    return cleaned or fallback
-
-
 def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -67,9 +60,11 @@ def resolve_path_within_roots(path_value: str | Path, allowed_roots: Iterable[st
 
 
 def is_transient_network_error(exc: BaseException) -> bool:
+    if isinstance(exc, smtplib.SMTPException) and not isinstance(
+        exc, (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError)
+    ):
+        return False
     if isinstance(exc, (TimeoutError, ConnectionError, OSError, imaplib.IMAP4.abort)):
-        return True
-    if isinstance(exc, (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError)):
         return True
     if httpx is not None and isinstance(
         exc,
@@ -114,5 +109,3 @@ def retry_call(
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
             delay_seconds *= backoff_multiplier
-
-    raise RuntimeError(f"{operation_name} exhausted retries unexpectedly.")

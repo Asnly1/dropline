@@ -138,6 +138,11 @@ class FailingOutboundRecordStore(StateStore):
         return super().mark_outbound_message_sent(**kwargs)
 
 
+class FailingInitializeStateStore(StateStore):
+    def initialize(self) -> None:
+        raise RuntimeError("initialize failed")
+
+
 RAW_EMAIL = """From: User <user@example.com>
 To: keqing@example.com
 Subject: =?utf-8?b?5LuK5aSp5pyJ54K557Sv?=
@@ -1144,6 +1149,62 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(outbound_client.sent_messages), 0)
             self.assertIsNone(store.get_outbound_message_for_batch(outcome.batch_id))
             self.assertEqual(len(store.list_unconsumed_inbound()), 1)
+
+    def test_prepare_run_failure_returns_failed_outcome_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = FailingInitializeStateStore(settings)
+            memory_manager = MemoryManager(settings)
+            stage1 = Stage1Result.from_dict(
+                {
+                    "user_digest": {"main_event": "", "state": "", "possible_needs": []},
+                    "candidate_memories": [],
+                    "emotional_priority": "comfort",
+                    "open_loops": [],
+                }
+            )
+            stage2 = Stage2Result.from_dict(
+                {
+                    "subject": "今夜先缓一缓",
+                    "body": LONG_BODY,
+                    "character_episode": {
+                        "summary": "夜里仍记挂着你的近况。",
+                        "continuity_value": "记得你这阵子的疲惫。",
+                    },
+                    "active_arc_update_suggestion": {
+                        "action": "none",
+                        "content": "",
+                    },
+                    "scene_card": {
+                        "visual_style": "二次元插画",
+                        "location": "璃月港临水长阶",
+                        "action": "夜里整理文书",
+                        "key_object": "折起的公文",
+                        "time": "入夜后",
+                        "mood": "克制而安静的挂念",
+                        "camera_distance": "medium",
+                    },
+                }
+            )
+            pipeline = PipelineService(
+                settings,
+                dependencies=PipelineDependencies(
+                    inbound_client=FakeInboundClient([]),
+                    outbound_client=FakeOutboundClient(),
+                    ai_client=FakeAIClient(stage1=stage1, stage2=stage2),
+                    state_store=store,
+                    memory_manager=memory_manager,
+                ),
+            )
+
+            outcome = pipeline.run_once()
+
+            self.assertFalse(outcome.success)
+            self.assertEqual(outcome.error_stage, "prepare")
+            self.assertIn("initialize failed", outcome.message)
+            self.assertEqual(pipeline.dependencies.ai_client.stage1_calls, 0)
 
 
 if __name__ == "__main__":

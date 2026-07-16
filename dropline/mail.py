@@ -177,14 +177,24 @@ class SMTPOutboundClient:
     def _send_once(self, message: EmailMessage) -> str:
         endpoint = self.mailbox.smtp
         message_id = message.get("Message-ID")
-        if not message_id:
-            raise RuntimeError("Email Message-ID must be assigned before SMTP send.")
         smtp_cls = smtplib.SMTP_SSL if endpoint.security == "ssl" else smtplib.SMTP
-        with smtp_cls(endpoint.host, endpoint.port) as client:
+        client = smtp_cls(endpoint.host, endpoint.port)
+        try:
             if endpoint.security == "starttls":
                 client.starttls()
             client.login(endpoint.username, endpoint.password)
             client.send_message(message)
+        except Exception:
+            client.close()
+            raise
+        try:
+            client.quit()
+        except Exception as exc:
+            LOGGER.warning(
+                "SMTP QUIT failed after message was already sent successfully; treating send as successful: %s",
+                exc,
+            )
+            client.close()
         return message_id
 
 
@@ -290,11 +300,11 @@ def _extract_body(message: EmailMessage) -> tuple[str, str]:
                 continue
             content_type = part.get_content_type()
             if content_type == "text/plain":
-                plain_parts.append(part.get_content())
+                plain_parts.append(_get_part_text(part))
             elif content_type == "text/html":
-                html_parts.append(_html_to_text(part.get_content()))
+                html_parts.append(_html_to_text(_get_part_text(part)))
     else:
-        payload = message.get_content()
+        payload = _get_part_text(message)
         if message.get_content_type() == "text/html":
             html_parts.append(_html_to_text(payload))
         else:
@@ -302,6 +312,16 @@ def _extract_body(message: EmailMessage) -> tuple[str, str]:
     return "\n".join(item.strip() for item in plain_parts if item).strip(), "\n".join(
         item.strip() for item in html_parts if item
     ).strip()
+
+
+def _get_part_text(part: EmailMessage) -> str:
+    try:
+        return part.get_content()
+    except LookupError:
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            return ""
+        return payload.decode("utf-8", errors="replace")
 
 
 def _extract_attachments(message: EmailMessage) -> list[AttachmentMeta]:

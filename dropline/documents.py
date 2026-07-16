@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
-
-
-def read_text(path: Path) -> str:
-    return read_optional_text(path)
 
 
 def read_optional_text(path: Path) -> str:
@@ -30,7 +28,18 @@ def load_json_file(path: Path, default: Any) -> Any:
 
 def write_json_file(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    data = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(data)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def list_json_files(path: Path) -> list[Path]:

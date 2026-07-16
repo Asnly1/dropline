@@ -196,7 +196,16 @@ class MemoryManager:
                 write_json_file(path, [item.to_dict() for item in entries])
                 return
             if self._is_conflict(entry.content, candidate.content):
-                self._append_conflict(entry=entry, candidate=candidate, source_message_ids=source_message_ids, now=now)
+                resolved = self._append_conflict(
+                    entry=entry, candidate=candidate, source_message_ids=source_message_ids, now=now
+                )
+                if resolved:
+                    entry.content = candidate.content
+                    entry.source_message_ids = _merged_unique(entry.source_message_ids, source_message_ids)
+                    entry.source_dates = _merged_unique(entry.source_dates, source_dates)
+                    entry.evidence = _merged_unique(entry.evidence, [candidate.evidence])
+                    entry.updated_at = now.isoformat()
+                    write_json_file(path, [item.to_dict() for item in entries])
                 return
         entries.append(
             ManagedMemoryEntry(
@@ -302,7 +311,7 @@ class MemoryManager:
                     why_it_matters="Stage 2 continuity suggestion.",
                 )
             )
-        entries = sorted(entries, key=lambda item: item.updated_at, reverse=True)[:2]
+        entries = sorted(entries, key=lambda item: datetime.fromisoformat(item.updated_at), reverse=True)[:2]
         write_json_file(self.settings.documents.active_arc, [item.to_dict() for item in entries])
 
     def _append_conflict(
@@ -312,25 +321,38 @@ class MemoryManager:
         candidate: CandidateMemory,
         source_message_ids: list[str],
         now: datetime,
-    ) -> None:
+    ) -> bool:
         raw_entries = load_entries(self.settings.documents.conflict_notes)
         notes = [ConflictNote.from_dict(item) for item in raw_entries]
         key = hash_text(f"{entry.content}:{candidate.content}", prefix="conflict-")
-        if any(note.key == key for note in notes):
-            return
-        notes.append(
-            ConflictNote(
-                key=key,
-                memory_type=entry.memory_type,
-                existing_content=entry.content,
-                new_content=candidate.content,
-                reason="Detected negation-style conflict between existing and new long-term memory.",
-                source_date=candidate.source_date or now.date().isoformat(),
-                source_message_ids=source_message_ids,
-                created_at=now.isoformat(),
+        occurrence_date = candidate.source_date or now.date().isoformat()
+        existing_note = next((note for note in notes if note.key == key), None)
+        if existing_note is None:
+            notes.append(
+                ConflictNote(
+                    key=key,
+                    memory_type=entry.memory_type,
+                    existing_content=entry.content,
+                    new_content=candidate.content,
+                    reason="Detected negation-style conflict between existing and new long-term memory.",
+                    source_date=candidate.source_date or now.date().isoformat(),
+                    source_message_ids=source_message_ids,
+                    created_at=now.isoformat(),
+                    occurrence_dates=[occurrence_date],
+                )
             )
-        )
+            write_json_file(self.settings.documents.conflict_notes, [note.to_dict() for note in notes])
+            return False
+
+        if occurrence_date not in existing_note.occurrence_dates:
+            existing_note.occurrence_dates.append(occurrence_date)
+        existing_note.source_message_ids = _merged_unique(existing_note.source_message_ids, source_message_ids)
+
+        resolved = len(existing_note.occurrence_dates) >= 2
+        if resolved:
+            notes = [note for note in notes if note.key != key]
         write_json_file(self.settings.documents.conflict_notes, [note.to_dict() for note in notes])
+        return resolved
 
     def _recent_episode_payloads(self, directory: Path, *, days: int, now: datetime) -> list[dict]:
         payloads: list[dict] = []

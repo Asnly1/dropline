@@ -7,7 +7,7 @@ from pathlib import Path
 from .config import Settings
 from .launchd import install_launchd_job, uninstall_launchd_job
 from .scheduler_support import DEFAULT_SCHEDULER_TASK_NAME, build_scheduler_paths, normalize_scheduler_task_name
-from .windows_task import build_windows_task_paths, install_windows_task, uninstall_windows_task
+from .windows_task import install_windows_task, uninstall_windows_task
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +90,3 @@ def uninstall_scheduler(repo_root: Path, task_name: str = DEFAULT_SCHEDULER_TASK
 
 def build_scheduler_runtime_paths(repo_root: Path, task_name: str = DEFAULT_SCHEDULER_TASK_NAME):
     return build_scheduler_paths(repo_root, task_name)
-
-
-def build_scheduler_helper_path(repo_root: Path, task_name: str = DEFAULT_SCHEDULER_TASK_NAME) -> Path:
-    return build_windows_task_paths(repo_root, task_name).wrapper_script_path

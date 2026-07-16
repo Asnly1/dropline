@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -82,7 +82,6 @@ class NormalizedInboundMessage:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["from"] = payload.pop("from_email")
-        payload["attachments"] = [item.to_dict() for item in self.attachments]
         return payload
 
 
@@ -632,18 +631,26 @@ class ConflictNote:
     source_date: str
     source_message_ids: list[str]
     created_at: str
+    occurrence_dates: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ConflictNote":
+        source_date = _expect_string(payload, "source_date")
+        occurrence_dates_raw = payload.get("occurrence_dates")
+        if isinstance(occurrence_dates_raw, list) and occurrence_dates_raw:
+            occurrence_dates = [str(item) for item in occurrence_dates_raw]
+        else:
+            occurrence_dates = [source_date] if source_date else []
         return cls(
             key=_expect_string(payload, "key"),
             memory_type=_expect_string(payload, "memory_type"),
             existing_content=_expect_string(payload, "existing_content"),
             new_content=_expect_string(payload, "new_content"),
             reason=_expect_string(payload, "reason"),
-            source_date=_expect_string(payload, "source_date"),
+            source_date=source_date,
             source_message_ids=[str(item) for item in payload.get("source_message_ids", [])],
             created_at=_expect_string(payload, "created_at"),
+            occurrence_dates=occurrence_dates,
         )
 
     def to_dict(self) -> dict[str, Any]:

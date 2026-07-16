@@ -72,7 +72,8 @@ def reset_dev_state(settings: Settings, *, task_name: str = DEFAULT_SCHEDULER_TA
         else:
             skipped_paths.append(str(target))
 
-    if settings.active_profile is not None:
+    reinitialized = settings.active_profile is not None
+    if reinitialized:
         store = StateStore(settings)
         store.initialize()
         MemoryManager(settings).bootstrap()
@@ -83,6 +84,7 @@ def reset_dev_state(settings: Settings, *, task_name: str = DEFAULT_SCHEDULER_TA
         "removed_paths": removed_paths,
         "skipped_paths": skipped_paths,
         "sqlite_path": str(settings.storage.sqlite_path),
+        "reinitialized": reinitialized,
     }
 
 
@@ -97,7 +99,10 @@ def reset_dev_state_command(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     result = reset_dev_state(settings, task_name=task_name)
-    print(f"Reset complete. State reinitialized at {result['sqlite_path']}")
+    if result["reinitialized"]:
+        print(f"Reset complete. State reinitialized at {result['sqlite_path']}")
+    else:
+        print("Reset complete. No active profile; state not reinitialized.")
     print(f"scheduler unload attempted: {result['scheduler_unload_attempted']}")
     print(f"scheduler definition removed: {result['scheduler_definition_removed']}")
     if result["removed_paths"]:

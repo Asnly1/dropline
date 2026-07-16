@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +41,33 @@ def normalize_scheduler_task_name(task_name: str) -> str:
     if not TASK_NAME_RE.fullmatch(safe_task_name):
         raise ValueError("scheduler task name may only contain letters, numbers, dot, underscore, and hyphen")
     return safe_task_name
+
+
+def run_best_effort_uninstall_command(command: list[str]) -> tuple[bool, subprocess.CompletedProcess | None]:
+    """Run an uninstall subprocess command, tolerating a missing executable.
+
+    Returns (attempted, result): `attempted` is False if the command's
+    executable could not be found on this platform, in which case `result`
+    is None. Non-zero exit codes from the command itself are not treated as
+    failures here; the caller inspects `result.returncode` if it cares.
+    """
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return False, None
+    return True, result
+
+
+def remove_file_if_exists(path: Path) -> bool:
+    if path.exists():
+        path.unlink()
+        return True
+    return False
 
 
 def resolve_python_executable(python_executable: str) -> str:

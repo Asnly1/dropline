@@ -412,6 +412,16 @@ class LLMTests(unittest.TestCase):
             {"persona", "world_state", "cast_relations", "cast_pool", "translation_layer"},
         )
 
+    def test_chinese_field_violation_uses_symmetric_character_ratio(self) -> None:
+        self.assertTrue(
+            llm._chinese_field_violates_requirement(
+                "I will continue supporting you through this 加油"
+            )
+        )
+        self.assertFalse(llm._chinese_field_violates_requirement("我今天用 Photoshop 修了图"))
+        self.assertFalse(llm._chinese_field_violates_requirement("见字如晤，今夜风很静，一切都好。"))
+        self.assertFalse(llm._chinese_field_violates_requirement(""))
+
     def _load_settings(
         self,
         root: Path,

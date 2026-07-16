@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
+from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +28,8 @@ from .utils import ensure_parent, resolve_path_within_roots
 
 OUTBOUND_PENDING = "pending"
 OUTBOUND_SENT = "sent"
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -175,19 +180,17 @@ class StateStore:
             if not self._table_exists(conn, "outbound_messages"):
                 return None
             scope = self._require_scope()
-            row = conn.execute(
+            rows = conn.execute(
                 """
                 SELECT sent_at
                 FROM outbound_messages
                 WHERE character_slug = ? AND relationship_slug = ?
-                ORDER BY sent_at ASC
-                LIMIT 1
                 """,
                 (scope.character_slug, scope.relationship_slug),
-            ).fetchone()
-            if not row:
-                return None
-            return datetime.fromisoformat(str(row["sent_at"]))
+            ).fetchall()
+        if not rows:
+            return None
+        return min(datetime.fromisoformat(str(row["sent_at"])) for row in rows)
 
     def start_run(self, run_id: str, started_at: str) -> None:
         scope = self._require_scope()
@@ -547,18 +550,19 @@ class StateStore:
             if not self._table_exists(conn, "outbound_messages"):
                 return None
             scope = self._require_scope()
-            row = conn.execute(
+            rows = conn.execute(
                 """
                 SELECT message_id, sent_at, to_email, subject, raw_path, image_path, run_id, batch_id,
                        character_slug, relationship_slug, delivery_status
                 FROM outbound_messages
                 WHERE character_slug = ? AND relationship_slug = ? AND batch_id = ?
-                ORDER BY sent_at DESC
-                LIMIT 1
                 """,
                 (scope.character_slug, scope.relationship_slug, batch_id),
-            ).fetchone()
-        return self._build_stored_outbound_message(row) if row else None
+            ).fetchall()
+        if not rows:
+            return None
+        latest_row = max(rows, key=lambda row: datetime.fromisoformat(str(row["sent_at"])))
+        return self._build_stored_outbound_message(latest_row)
 
     def delete_outbound_message(self, message_id: str) -> bool:
         scope = self._require_scope()
@@ -655,11 +659,10 @@ class StateStore:
                        character_slug, relationship_slug
                 FROM runs
                 WHERE character_slug = ? AND relationship_slug = ?
-                ORDER BY started_at DESC
-                LIMIT ?
                 """,
-                (scope.character_slug, scope.relationship_slug, limit),
+                (scope.character_slug, scope.relationship_slug),
             ).fetchall()
+        rows = sorted(rows, key=lambda row: datetime.fromisoformat(str(row["started_at"])), reverse=True)[:limit]
         return [self._build_stored_run(row) for row in rows]
 
     def get_run(self, run_id: str) -> StoredRun | None:
@@ -690,11 +693,10 @@ class StateStore:
                        character_slug, relationship_slug, delivery_status
                 FROM outbound_messages
                 WHERE character_slug = ? AND relationship_slug = ?
-                ORDER BY sent_at DESC
-                LIMIT ?
                 """,
-                (scope.character_slug, scope.relationship_slug, limit),
+                (scope.character_slug, scope.relationship_slug),
             ).fetchall()
+        rows = sorted(rows, key=lambda row: datetime.fromisoformat(str(row["sent_at"])), reverse=True)[:limit]
         return [self._build_stored_outbound_message(row) for row in rows]
 
     def list_recent_assets(self, *, limit: int = 5) -> list[StoredAsset]:
@@ -708,11 +710,10 @@ class StateStore:
                        character_slug, relationship_slug
                 FROM assets
                 WHERE character_slug = ? AND relationship_slug = ?
-                ORDER BY created_at DESC
-                LIMIT ?
                 """,
-                (scope.character_slug, scope.relationship_slug, limit),
+                (scope.character_slug, scope.relationship_slug),
             ).fetchall()
+        rows = sorted(rows, key=lambda row: datetime.fromisoformat(str(row["created_at"])), reverse=True)[:limit]
         return [self._build_stored_asset(row) for row in rows]
 
     def list_recent_scene_cards(self, *, limit: int = 7) -> list[dict[str, Any]]:
@@ -1020,12 +1021,15 @@ class StateStore:
 
     def _delete_paths(self, paths: list[Path]) -> None:
         for path in paths:
-            if not path.exists():
-                continue
-            if path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
+            try:
+                if not path.exists():
+                    continue
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            except OSError as exc:
+                LOGGER.warning("Failed to delete path %s: %s", path, exc)
 
     def _build_stored_inbound_message(self, row: sqlite3.Row) -> StoredInboundMessage:
         return StoredInboundMessage(
@@ -1085,11 +1089,16 @@ class StateStore:
             relationship_slug=str(row["relationship_slug"]),
         )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         ensure_parent(self.settings.storage.sqlite_path)
-        connection = sqlite3.connect(self.settings.storage.sqlite_path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        conn = sqlite3.connect(self.settings.storage.sqlite_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
 
 def _parse_run_started_at(value: str, cutoff: datetime) -> datetime:

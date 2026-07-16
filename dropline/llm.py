@@ -11,6 +11,7 @@ from .config import Settings, current_character_name
 from .llm_contracts import (
     CHARACTER_PROFILE_TASK,
     CHINESE_OUTPUT_LANGUAGE,
+    ENGLISH_OUTPUT_LANGUAGE,
     RELATIONSHIP_PROFILE_TASK,
     STAGE1_TASK,
     StructuredTaskSpec,
@@ -41,7 +42,6 @@ LOGGER = logging.getLogger(__name__)
 
 
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
-ENGLISH_OUTPUT_LANGUAGE = "English"
 
 IMAGE_INSTRUCTIONS = "你只生成一张与用户提示一致的图片。不要输出额外解释。"
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -238,10 +238,14 @@ def _english_field_violates_requirement(value: str) -> bool:
 
 def _chinese_field_violates_requirement(value: str) -> bool:
     stripped = value.strip()
-    if not stripped or CJK_PATTERN.search(stripped):
+    if not stripped:
         return False
-    english_words = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", stripped)
-    return len(english_words) >= 4
+    cjk_chars = CJK_PATTERN.findall(stripped)
+    if not cjk_chars:
+        english_words = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", stripped)
+        return len(english_words) >= 4
+    latin_letters = [char for char in stripped if char.isascii() and char.isalpha()]
+    return len(latin_letters) > len(cjk_chars) * 2
 
 
 def _language_mismatches(
@@ -753,7 +757,6 @@ class AnthropicBackedClient(StructuredJSONClient):
 
 
 class PromptedOpenAICompatibleTextClient(StructuredJSONClient):
-    provider_name = "provider"
     provider_label = "Provider"
     base_url = ""
 
@@ -808,7 +811,6 @@ class PromptedOpenAICompatibleTextClient(StructuredJSONClient):
 
 
 class QwenBackedClient(PromptedOpenAICompatibleTextClient):
-    provider_name = "qwen"
     provider_label = "Qwen"
     base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
@@ -854,7 +856,6 @@ class QwenBackedClient(PromptedOpenAICompatibleTextClient):
 
 
 class DeepSeekBackedClient(PromptedOpenAICompatibleTextClient):
-    provider_name = "deepseek"
     provider_label = "DeepSeek"
     base_url = "https://api.deepseek.com"
 
@@ -866,7 +867,6 @@ class DeepSeekBackedClient(PromptedOpenAICompatibleTextClient):
 
 
 class GLMBackedClient(PromptedOpenAICompatibleTextClient):
-    provider_name = "glm"
     provider_label = "GLM"
     base_url = "https://open.bigmodel.cn/api/paas/v4"
 
@@ -875,7 +875,6 @@ class GLMBackedClient(PromptedOpenAICompatibleTextClient):
 
 
 class DoubaoBackedClient(PromptedOpenAICompatibleTextClient):
-    provider_name = "doubao"
     provider_label = "Doubao"
     base_url = "https://ark.cn-beijing.volces.com/api/v3"
 
