@@ -19,7 +19,11 @@ from dropline.mail import (
 from dropline.models import RawInboundMessage, Stage2Result
 from tests.helpers import create_test_repo, load_test_settings
 
-RAW_EMAIL = """From: User <user@example.com>
+# RFC 3676 signature delimiter: the trailing space is significant. It is kept out of the fixture
+# literal so that an editor stripping trailing whitespace cannot silently change the fixture.
+SIGNATURE_DELIMITER = "-- "
+
+RAW_EMAIL = f"""From: User <user@example.com>
 To: keqing@example.com
 Subject: =?utf-8?b?5LuK5aSp5pyJ54K557Sv?=
 Date: Tue, 31 Mar 2026 21:42:10 +0800
@@ -32,7 +36,7 @@ Content-Type: text/plain; charset="utf-8"
 今天写了一天作业，有点累。
 On Mon, someone wrote:
 > old quote
--- 
+{SIGNATURE_DELIMITER}
 signature
 
 --BOUNDARY
@@ -40,7 +44,7 @@ Content-Type: text/html; charset="utf-8"
 
 <p>今天写了一天作业，有点累。</p>
 --BOUNDARY--
-""".encode()  # noqa: W291  # "-- " (with the trailing space) is the RFC 3676 signature delimiter
+""".encode()
 
 
 RAW_EMAIL_UNKNOWN_CHARSET = b"""From: User <user@example.com>
