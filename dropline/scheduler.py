@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from .config import Settings
 from .models import RunOutcome
-from .pipeline import PipelineService
+from .pipeline import LOCK_ERROR_STAGE, PipelineService
 from .utils import now_in_timezone
 
 
@@ -216,6 +216,7 @@ def _run_scheduled_pipeline(
     if guard is not None:
         return guard
     store = pipeline.dependencies.state_store
+    previous_catch_up_marker = store.get_kv(CATCH_UP_ATTEMPTED_FOR_KEY) or ""
     if catch_up:
         store.set_kv(CATCH_UP_ATTEMPTED_FOR_KEY, state.scheduled_for_date.isoformat())
     runs_today = store.increment_runs_today(now.date())
@@ -225,6 +226,20 @@ def _run_scheduled_pipeline(
         _mark_schedule_sent(pipeline, state, now)
         LOGGER.info("Scheduled %s succeeded: %s (runs_today=%s)", label, outcome.run_id, runs_today)
         return TickResult(event=EVENT_CATCH_UP_SUCCEEDED if catch_up else EVENT_RUN_SUCCEEDED, outcome=outcome)
+    if outcome.error_stage == LOCK_ERROR_STAGE:
+        # Another run holds the lock (a manual run-once, an overlapping tick): nothing was attempted,
+        # so the tick neither uses up the daily run budget nor the single catch-up attempt.
+        runs_today = store.decrement_runs_today(now.date())
+        if catch_up:
+            store.set_kv(CATCH_UP_ATTEMPTED_FOR_KEY, previous_catch_up_marker)
+        LOGGER.warning(
+            "Scheduled %s skipped: %s (run %s not counted; runs_today=%s)",
+            label,
+            outcome.message,
+            outcome.run_id,
+            runs_today,
+        )
+        return TickResult(event=EVENT_CATCH_UP_FAILED if catch_up else EVENT_RUN_FAILED, outcome=outcome)
     LOGGER.error(
         "Scheduled %s failed at %s: %s (runs_today=%s, consecutive_failures=%s)",
         label,

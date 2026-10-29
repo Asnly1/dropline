@@ -177,9 +177,9 @@ mail:
 
 这几项没有配置开关,是拉信阶段的固定行为:
 
-- **UIDVALIDITY 变化**:每次拉信都会读取 IMAP 文件夹的 `UIDVALIDITY` 并记在 `state.db`。邮箱重建索引或迁移后 UID 会重新编号,此时 dropline 会打一条 ERROR 日志,把 `last_seen_imap_uid` 游标归零,并从首封出站邮件的日期起重新扫描收件箱。已入库的来信按 `Message-ID` 去重,不会被再回一次;同理,把一封信移出 INBOX 再移回来(UID 变了)也不会触发第二封回信。
-- **引用链剥离**:来信正文在送入 Stage 1 前会剥掉被引用的上一封信,只保留用户自己写的部分。纯文本识别 `>` 引用行、`On … wrote:`、`-----Original Message-----`、`From:`,以及 QQ 邮箱 / Foxmail 的 `------------------ 原始邮件 ------------------`、中文 Outlook / QQ 邮箱的 `发件人:`、163 / Apple Mail 的 `在 … 写道:`、中文 Gmail 的 `… 于 … 写道:`、Outlook 的 `________________` 分隔线;HTML 正文会先整块删掉 `<blockquote>`、`gmail_quote` 以及 id/class 含 `quote` 的元素。此外,来信中与角色最近两封信逐段相同的段落也会被删掉,避免角色自己写过的话被当成用户说的话写进记忆。
-- **附件**:只记录元数据(文件名、类型、大小、是否内嵌),内嵌图片也算在内;附件内容不会被读取、归档或发给模型,角色只知道"收到了一个什么文件"。
+- **UIDVALIDITY 变化**:每次拉信都会读取 IMAP 文件夹的 `UIDVALIDITY` 并记在 `state.db`。邮箱重建索引或迁移后 UID 会重新编号,此时 dropline 会打一条 ERROR 日志,把 `last_seen_imap_uid` 游标归零,并从首封出站邮件的日期起重新扫描收件箱。已入库的来信按 `Message-ID` 去重,不会被再回一次;同理,把一封信移出 INBOX 再移回来(UID 变了)也不会触发第二封回信。没有 `Message-ID` 头的来信会合成一个带 UIDVALIDITY 的 ID(`<imap-<uidvalidity>-<uid>@dropline.invalid>`),邮箱重建后在同一个 UID 上出现的另一封信仍会被回复。
+- **引用链剥离**:来信正文在送入 Stage 1 前会剥掉被引用的上一封信,只保留用户自己写的部分。纯文本识别 `>` 引用行、`On … wrote:`、`-----Original Message-----`、`From:`,以及 QQ 邮箱 / Foxmail 的 `------------------ 原始邮件 ------------------`、中文 Outlook / QQ 邮箱的 `发件人:`、163 / Apple Mail / Thunderbird 的 `在 … 写道:`(行内须含 HH:MM 时间或邮箱地址)、中文 Gmail 的 `… 于 … 写道:`(行内须含 `<地址>`)、Outlook 的 `________________` 分隔线(只有后面紧跟 `发件人:` / `From:` 之类的引用头才截断,用户自己画的分隔线只是被丢弃),因此像 `在 2026-03-31 写道：` 这样用户自己的叙述句会被保留;HTML 正文会先删掉注释,再整块删掉 `<blockquote>`、`gmail_quote` 以及 id/class 含 `quote` 的元素。此外,来信中与角色最近两封信逐段相同且长度不少于 20 字的段落也会被删掉,避免角色自己写过的话被当成用户说的话写进记忆;如果读不到角色的最近来信,拉信照常进行,只是跳过这一步并记一条警告。
+- **附件**:只记录元数据(文件名、类型、大小、是否内嵌)。所有图片部件无论 disposition 都算附件,带文件名的内嵌部件(例如以 inline 方式附上的 `.txt` / `.ics`)也算附件且不会并入正文;附件内容不会被读取、归档或发给模型,角色只知道"收到了一个什么文件"。
 
 如果你想统一控制模型输出的文本语言,可以在 `llm` 下增加 `language`:
 
@@ -388,9 +388,10 @@ schtasks /Delete /TN "dropline" /F
 
 ### 失败后怎么重试
 
-- **先退避,再重试**:一次 run 失败后,调度器至少等 `schedule.retry_after_minutes` 分钟才会再试(tick 日志事件 `skipped_backoff`);每天由调度器触发的 run 不超过 `schedule.max_runs_per_day` 次(`skipped_daily_limit`),手动 `run-once` 不受此限制;"昨日漏发补发"只会尝试 1 次(`catch_up_succeeded` / `catch_up_failed`)。成功一次后连续失败计数归零。
-- **重试复用归档产物**:同一批次(同一 `batch_id`)重试时,若上次失败的 run 已归档 `stage2.json`,直接跳过 Stage 1 / Stage 2 进入配图和发信;若只有 `stage1.json`,则只重跑 Stage 2,且不会重复写入用户侧 episode。日志会写明复用了哪个 run 的产物(`reused_run_id=...`)。
-- **来信隔离**:reply 模式的 run 在 stage1 / stage2 / validation / image 阶段失败时,本批来信的 `attempt_count` +1 并记录 `last_error`;达到 `schedule.max_batch_attempts` 次(Stage 2 校验失败只需 2 次)就被**隔离**(`quarantined_at`)。被隔离的来信不再进入批次,下一次 run 会恢复为主动来信模式,不会让一封坏信卡住整个角色。`show-inbox` 会标出 `QUARANTINED` 和 `last_error`;修好问题后用 `requeue-inbound --uid N` 放回队列,`delete-inbound --uid N` 也可以直接删掉它。
+- **先退避,再重试**:一次 run 失败后,调度器至少等 `schedule.retry_after_minutes` 分钟才会再试(tick 日志事件 `skipped_backoff`);每天由调度器触发的 run 不超过 `schedule.max_runs_per_day` 次(`skipped_daily_limit`),手动 `run-once` 不受此限制;"昨日漏发补发"只会尝试 1 次(`catch_up_succeeded` / `catch_up_failed`)。成功一次后连续失败计数归零。拿不到 run 锁的 run(例如手动 `run-once` 与 tick 撞上)只记为 `error_stage=lock`:不算失败(不退避、不告警),也不占用每日次数和那一次补发机会。
+- **重试复用归档产物**:同一批次(同一 `batch_id`)重试时,若上次失败的 run 已归档 `stage2.json` 且该 run 是 24 小时内开始的,直接跳过 Stage 1 / Stage 2 进入配图和发信;若只有 `stage1.json`,则只重跑 Stage 2,且不会重复写入用户侧 episode。更早的草稿会被丢弃,两个阶段重新执行。日志会写明复用了哪个 run 的产物(`reused_run_id=...`)。
+- **来信隔离**:reply 模式的 run 在 stage1 / stage2 / validation 阶段失败时(配图供应商故障不是来信的问题,不计入),本批来信的 `attempt_count` +1 并记录 `last_error`,按来信所在的 `(UIDVALIDITY, UID)` 行计数,旧 epoch 里同号的来信不会被一起计数;达到 `schedule.max_batch_attempts` 次(Stage 2 校验失败只需 2 次)就被**隔离**(`quarantined_at`)。被隔离的来信不再进入批次,下一次 run 会恢复为主动来信模式,不会让一封坏信卡住整个角色。`show-inbox` 会标出 `QUARANTINED` 和 `last_error`,并打印每行的 `uidvalidity`;修好问题后用 `requeue-inbound --uid N` 把已隔离的来信放回队列(已回复或仍在排队的 uid 会给出相应提示,不会被改动),`delete-inbound --uid N` 也可以直接删掉它。两条命令都只接受 uid:同号来信存在于多个 UIDVALIDITY epoch 时优先当前 epoch,否则取最新的 epoch,所以迁移前保留的旧行(epoch 0)仍然能被删掉。
+- **发出的信不会重发**:邮件已发出但 run 在收尾时失败(例如角色侧记忆写入失败),来信会先被标记为已回复,重试只补做收尾;这类失败记为 `pipeline` 阶段,不会被误记为 `imap`。
 - **配图降级**:`llm.image.on_failure` 默认 `abort`(保持"图片是硬门槛");设为 `text_only` 时图片生成失败只记 WARNING,并在归档目录写 `image_failure.json`,邮件改为纯文本发送。
 - **僵尸 run 自动收尾**:每次 `scheduler-tick` 开始时,`started_at` 早于 6 小时前且仍为 `running` 的 run 会被自动标为 `failed`(`error_stage=stale_running`);`mark-stale-runs-failed` 仍可手动处理更久远的记录。
 
@@ -400,17 +401,17 @@ schtasks /Delete /TN "dropline" /F
 python3 -m dropline status --config /绝对/路径/config.yaml
 ```
 
-输出当前 session 的最近一次成功 / 失败 run(run_id、阶段、错误信息)、连续失败次数、未消费与已隔离的来信数、pending 出站数、IMAP 游标(`last_seen_uid` / `last_consumed_uid`,以及 kv 里若存在的 `uidvalidity`)、今日调度状态(`scheduled_for_date` / `target_send_time` / `sent_time` / `runs_today`)和最近一次告警时间。
+输出当前 session 的最近一次成功 / 失败 run(run_id、阶段、错误信息)、连续失败次数、未消费与已隔离的来信数、pending 出站数、IMAP 游标(`last_seen_uid` / `last_consumed_uid`,以及 kv 里若存在的 `uidvalidity`)、今日调度状态(`scheduled_for_date` / `target_send_time` / `sent_time` / `runs_today`)和每类告警(`failures` / `quarantine`)最近一次的发送时间。
 
 ### 告警邮件
 
-连续失败次数达到 `mail.alerts.after_failures`,或有来信被隔离时,dropline 会用角色邮箱给 `mail.alerts.recipient` 发一封**纯文本系统通知**:发件人显示名固定为 `dropline`(不是角色名),主题以 `[dropline] ` 开头,正文写明这是系统通知而非角色来信,包含失败阶段、错误信息和建议的下一步(看 `runtime_logs/`、`dropline status`、`requeue-inbound`)。同一天最多发一封;告警本身发送失败只记日志,不影响主流程。
+连续失败次数达到 `mail.alerts.after_failures`,或有来信被隔离时,dropline 会用角色邮箱给 `mail.alerts.recipient` 发一封**纯文本系统通知**:发件人显示名固定为 `dropline`(不是角色名),主题以 `[dropline] ` 开头,正文写明这是系统通知而非角色来信,包含失败阶段、错误信息和建议的下一步(看 `runtime_logs/`、`dropline status`、`requeue-inbound`)。每类告警同一天最多发一封——`failures` 对应连续失败阈值,`quarantine` 对应来信被隔离——所以同一天早些时候发过的失败告警不会把隔离告警吞掉;告警本身发送失败只记日志,不影响主流程。
 
 相关配置项(都有默认值,可省略):
 
 ```yaml
 schedule:
-  retry_after_minutes: 120 # 失败后至少等多久再试
+  retry_after_minutes: 120 # 失败后至少等多久再试(必须小于 1440)
   max_runs_per_day: 3 # 调度器每天最多触发几次 run(run-once 不计)
   max_batch_attempts: 3 # 同一批来信最多尝试几次,之后隔离(validation 失败 2 次即隔离)
 

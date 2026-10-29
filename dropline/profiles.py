@@ -924,7 +924,7 @@ def show_inbox(
     print("Messages:")
     for message in messages:
         print(
-            f"  - uid={message.imap_uid} received_at={message.received_at} "
+            f"  - uid={message.imap_uid} uidvalidity={message.uidvalidity} received_at={message.received_at} "
             f"from={message.from_email} subject={message.subject}{_format_inbound_attempt_state(message)}"
         )
     return 0

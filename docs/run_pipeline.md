@@ -95,8 +95,9 @@ Stage 2 必须输出：
 
 ## 7. 失败处理
 
-- 失败的 run 在 `runs` 表记录 `error_stage` / `error_message`，并把 kv 里的 `consecutive_failures` 加一、更新 `last_failed_at`；任何一次成功后归零。
-- reply 模式下在 stage1 / stage2 / validation / image 阶段失败，本批来信的 `attempt_count` +1 并记录 `last_error` / `last_attempt_at`；达到 `schedule.max_batch_attempts`（validation 失败为 2）即写 `quarantined_at`，之后不再进入批次，run 回到 initiative 模式。`requeue-inbound --uid N` 清除隔离与计数。
-- 同一 `batch_id` 重试时复用上次失败 run 归档的产物：有 `stage2.json` 则跳过 Stage 1 / Stage 2；只有 `stage1.json` 则只重跑 Stage 2，且不重复写用户侧 episode。
-- 调度器：失败后退避 `schedule.retry_after_minutes` 分钟，每天最多 `schedule.max_runs_per_day` 次调度 run，昨日补发只尝试 1 次；每次 tick 开始时把超过 6 小时仍为 `running` 的 run 标为 `failed`。
-- 连续失败达到 `mail.alerts.after_failures` 或有来信被隔离时，向 `mail.alerts.recipient` 发送主题以 `[dropline] ` 开头的纯文本系统告警（每天最多一封）。
+- 失败的 run 在 `runs` 表记录 `error_stage` / `error_message`，并把 kv 里的 `consecutive_failures` 加一、更新 `last_failed_at`；任何一次成功后归零。拿不到 run 锁的 run 记为 `error_stage=lock`，只写 `runs` 表，不做任何失败簿记（不计连续失败、不退避、不告警），调度器也不为它计 `runs_today`、不消耗昨日补发的那一次尝试。
+- IMAP 拉信结束后 `current_stage` 归位为 `pipeline`；邮件已发出但收尾失败（如角色侧记忆写入失败）记为 `pipeline` 阶段，且来信在收尾前就标记为已消费，重试只补做收尾。
+- reply 模式下在 stage1 / stage2 / validation 阶段失败（image 阶段失败不计入），本批来信的 `attempt_count` +1 并记录 `last_error` / `last_attempt_at`，按 `(uidvalidity, imap_uid)` 行定位，不波及其他 epoch 的同号来信；达到 `schedule.max_batch_attempts`（validation 失败为 2）即写 `quarantined_at`，之后不再进入批次，run 回到 initiative 模式。`requeue-inbound --uid N` 只清除已隔离行的隔离与计数（已消费 / 未隔离的 uid 给出相应提示）；uid 存在于多个 epoch 时优先当前 epoch，否则取最新 epoch。
+- 同一 `batch_id` 重试时复用上次失败 run 归档的产物（仅限 `started_at` 在 24 小时内的失败 run）：有 `stage2.json` 则跳过 Stage 1 / Stage 2；只有 `stage1.json` 则只重跑 Stage 2，且不重复写用户侧 episode。
+- 调度器：失败后退避 `schedule.retry_after_minutes` 分钟（必须小于 1440），每天最多 `schedule.max_runs_per_day` 次调度 run，昨日补发只尝试 1 次；每次 tick 开始时把超过 6 小时仍为 `running` 的 run 标为 `failed`。
+- 连续失败达到 `mail.alerts.after_failures` 或有来信被隔离时，向 `mail.alerts.recipient` 发送主题以 `[dropline] ` 开头的纯文本系统告警（按种类分别节流：`failures` / `quarantine` 各自每天最多一封，kv 键为 `last_alert_at:<kind>`）。

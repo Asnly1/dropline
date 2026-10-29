@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 
+from .alerts import ALERT_KINDS, last_alert_at_key
 from .config import load_settings
 from .scheduler import SCHEDULED_FOR_DATE_KEY, SENT_TIME_KEY, TARGET_SEND_TIME_KEY
-from .storage import LAST_ALERT_AT_KEY, StateStore
+from .storage import StateStore
 from .utils import now_in_timezone
 
 IMAP_UIDVALIDITY_KEY = "imap_uidvalidity"
@@ -75,7 +76,8 @@ def status_command(config_path: str = "config.yaml") -> int:
         f"sent_time={store.get_kv(SENT_TIME_KEY) or '-'} "
         f"runs_today={store.get_runs_today(now.date())}"
     )
-    print(f"Last alert: {store.get_kv(LAST_ALERT_AT_KEY) or 'none'}")
+    last_alerts = " ".join(f"{kind}={store.get_kv(last_alert_at_key(kind)) or 'none'}" for kind in ALERT_KINDS)
+    print(f"Last alert: {last_alerts}")
     return 0
 
 
@@ -87,11 +89,24 @@ def requeue_inbound_command(config_path: str = "config.yaml", *, imap_uid: int) 
     )
     store = StateStore(settings)
     store.initialize()
-    if not store.requeue_inbound_message(imap_uid):
-        print(f"Inbound message not found: uid={imap_uid}")
+    requeued = store.requeue_inbound_message(imap_uid)
+    if requeued is not None:
+        print(f"Requeued inbound message: uid={imap_uid} uidvalidity={requeued.uidvalidity}")
         print(f"Session: {_session_label(store)}")
-        return 1
-    print(f"Requeued inbound message: uid={imap_uid}")
+        print("Quarantine cleared and attempt count reset; the next run will pick it up again.")
+        return 0
+    existing = store.get_inbound_message(imap_uid)
+    if existing is None:
+        print(f"Inbound message not found: uid={imap_uid}")
+    elif existing.consumed_batch_id:
+        print(
+            f"Inbound message is not quarantined: uid={imap_uid} uidvalidity={existing.uidvalidity} "
+            f"was already answered (batch {existing.consumed_batch_id}); nothing to requeue."
+        )
+    else:
+        print(
+            f"Inbound message is not quarantined: uid={imap_uid} uidvalidity={existing.uidvalidity} "
+            f"is still waiting in the queue (attempts={existing.attempt_count}); nothing to requeue."
+        )
     print(f"Session: {_session_label(store)}")
-    print("Quarantine cleared and attempt count reset; the next run will pick it up again.")
-    return 0
+    return 1

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
@@ -27,7 +27,7 @@ from .mail import (
 from .memory import MemoryManager
 from .models import ModelValidationError, NormalizedInboundMessage, RawInboundMessage, RunOutcome, Stage1Result, Stage2Result
 from .models import StoredInboundMessage, StoredOutboundMessage, StoredRun
-from .storage import OUTBOUND_PENDING, StateStore
+from .storage import OUTBOUND_PENDING, RunLockError, StateStore
 from .utils import hash_text, new_run_id, now_in_timezone
 
 
@@ -35,11 +35,17 @@ LOGGER = logging.getLogger(__name__)
 
 RECENT_EPISODE_LOOKBACK_DAYS = 7
 RECENT_SCENE_CARD_LIMIT = 7
-# Failures in these stages count against the inbound batch that was being processed.
-INBOUND_FAILURE_STAGES = ("stage1", "stage2", "validation", "image")
+# Failures in these stages count against the inbound batch that was being processed. Image generation
+# is deliberately not one of them: an image provider outage says nothing about the letter itself.
+INBOUND_FAILURE_STAGES = ("stage1", "stage2", "validation")
 # A batch that keeps failing Stage 2 validation is quarantined sooner than other failures.
 VALIDATION_MAX_BATCH_ATTEMPTS = 2
 RECENT_OUTBOUND_QUOTE_LIMIT = 2
+# Archived Stage 1 / Stage 2 output of a failed run is only reused this soon after that run started;
+# a draft written days earlier would otherwise go out unchanged when the batch is requeued much later.
+REUSABLE_ARTIFACT_MAX_AGE_HOURS = 24
+# A run that could not take the run lock is recorded under this stage and skips all failure bookkeeping.
+LOCK_ERROR_STAGE = "lock"
 
 
 @dataclass(slots=True)
@@ -93,6 +99,7 @@ class PipelineService:
                 self._log_step(context.run_id, 1, 8, "Run lock acquired.")
                 self._pull_inbound_for_run(context)
                 self._resolve_run_mode(context)
+                context.current_stage = "pipeline"
                 self._validate_inbound_batch(context)
                 existing_outbound = self.dependencies.state_store.get_outbound_message_for_batch(context.batch_id)
                 if existing_outbound is not None:
@@ -108,6 +115,8 @@ class PipelineService:
                 self._maybe_generate_image(context, stage2_result)
                 self._send_outbound(context, stage2_result)
                 return self._finish_successful_run(context, stage2_result)
+        except RunLockError as exc:
+            return self._finish_locked_run(context, exc)
         except Exception as exc:  # noqa: BLE001
             return self._finish_failed_run(context, exc)
 
@@ -168,13 +177,15 @@ class PipelineService:
             "Recorded outbound message already exists for batch; finalizing stored delivery.",
             outbound_message_id=existing_outbound.message_id,
         )
+        context.current_stage = "pipeline"
+        # The letter already left the mailbox, so the batch is answered whatever happens below.
+        self._mark_inbound_consumed(context)
         stage2_result = self._load_stage2_for_existing_outbound(existing_outbound)
         self.dependencies.memory_manager.write_character_side(
             stage2_result=stage2_result,
             batch_id=context.batch_id,
             now=context.now,
         )
-        self._mark_inbound_consumed(context)
         self.dependencies.state_store.finish_run(
             context.run_id,
             status="success",
@@ -408,6 +419,29 @@ class PipelineService:
             image_generated=context.image_generated,
         )
 
+    def _finish_locked_run(self, context: RunContext, exc: RunLockError) -> RunOutcome:
+        """Close a run that lost the race for the run lock, without any failure bookkeeping.
+
+        Another run is doing the work, so nothing failed: the run is still recorded (as ``lock``)
+        but it counts neither as a consecutive failure nor as an attempt on the inbound batch.
+        """
+        LOGGER.warning("[%s] Run skipped: %s", context.run_id, exc)
+        self.dependencies.state_store.finish_run(
+            context.run_id,
+            status="failed",
+            finished_at=now_in_timezone(self.settings.project.timezone).isoformat(),
+            error_stage=LOCK_ERROR_STAGE,
+            error_message=str(exc),
+        )
+        return RunOutcome(
+            success=False,
+            run_id=context.run_id,
+            mode=context.mode,
+            batch_id=context.batch_id,
+            error_stage=LOCK_ERROR_STAGE,
+            message=str(exc),
+        )
+
     def _record_failure_bookkeeping(
         self,
         context: RunContext,
@@ -460,29 +494,29 @@ class PipelineService:
         max_attempts = self.settings.schedule.max_batch_attempts
         if error_stage == "validation":
             max_attempts = min(max_attempts, VALIDATION_MAX_BATCH_ATTEMPTS)
-        imap_uids = [item.imap_uid for item in context.inbound_messages]
-        quarantined_uids = self.dependencies.state_store.record_inbound_attempt_failure(
-            imap_uids,
+        message_keys = [(item.uidvalidity, item.imap_uid) for item in context.inbound_messages]
+        quarantined_keys = self.dependencies.state_store.record_inbound_attempt_failure(
+            message_keys,
             error_stage=error_stage,
             message=message,
             attempted_at=failed_at.isoformat(),
             max_attempts=max_attempts,
         )
         LOGGER.warning(
-            "[%s] Recorded failed attempt at stage %s for inbound uid(s) %s (max_attempts=%s).",
+            "[%s] Recorded failed attempt at stage %s for inbound (uidvalidity, uid) %s (max_attempts=%s).",
             context.run_id,
             error_stage,
-            imap_uids,
+            message_keys,
             max_attempts,
         )
-        if quarantined_uids:
+        if quarantined_keys:
             LOGGER.warning(
-                "[%s] Quarantined inbound uid(s) %s after repeated failures; "
+                "[%s] Quarantined inbound (uidvalidity, uid) %s after repeated failures; "
                 "they stay out of future batches until `requeue-inbound` is run.",
                 context.run_id,
-                quarantined_uids,
+                quarantined_keys,
             )
-        return quarantined_uids
+        return list(dict.fromkeys(imap_uid for _, imap_uid in quarantined_keys))
 
     def _mark_inbound_consumed(self, context: RunContext) -> None:
         consumed_keys = [(item.uidvalidity, item.imap_uid) for item in context.inbound_messages]
@@ -604,10 +638,22 @@ class PipelineService:
         return changed
 
     def _recent_outbound_paragraph_keys(self, run_id: str) -> set[str]:
-        """Paragraph keys of the character's latest letters, used to strip unmarked quotes from replies."""
+        """Paragraph keys of the character's latest letters, used to strip unmarked quotes from replies.
+
+        Quote stripping is best effort: when the letters cannot be collected the pull goes on unstripped.
+        """
         keys: set[str] = set()
-        for outbound in self.dependencies.state_store.list_recent_outbound_messages(limit=RECENT_OUTBOUND_QUOTE_LIMIT):
-            keys.update(paragraph_keys(self._load_outbound_body(run_id, outbound)))
+        try:
+            for outbound in self.dependencies.state_store.list_recent_outbound_messages(limit=RECENT_OUTBOUND_QUOTE_LIMIT):
+                keys.update(paragraph_keys(self._load_outbound_body(run_id, outbound)))
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "[%s] Could not collect the character's recent letters for quote stripping; "
+                "inbound mail is stored without stripping unmarked quotes: %s",
+                run_id,
+                exc,
+            )
+            return set()
         return keys
 
     def _load_outbound_body(self, run_id: str, outbound: StoredOutboundMessage) -> str:
@@ -615,7 +661,13 @@ class PipelineService:
         if stored_run is not None and stored_run.stage2_path:
             try:
                 payload = load_json_file(Path(stored_run.stage2_path), default=None)
-            except ValueError:
+            except (OSError, ValueError) as exc:
+                LOGGER.warning(
+                    "[%s] Could not read archived %s for quote stripping; falling back to the archived email: %s",
+                    run_id,
+                    stored_run.stage2_path,
+                    exc,
+                )
                 payload = None
             if isinstance(payload, dict) and isinstance(payload.get("body"), str):
                 return payload["body"]
@@ -679,6 +731,17 @@ class PipelineService:
         """
         failed_run = self.dependencies.state_store.get_latest_failed_run_for_batch(context.batch_id)
         if failed_run is None:
+            return None, None
+        if not _is_recent_failed_run(failed_run, context.now):
+            self._log_step(
+                context.run_id,
+                4,
+                8,
+                "Archived output of the latest failed run is too old to reuse; running both stages again.",
+                failed_run_id=failed_run.run_id,
+                failed_run_started_at=failed_run.started_at,
+                max_age_hours=REUSABLE_ARTIFACT_MAX_AGE_HOURS,
+            )
             return None, None
         stage2_result = self._load_archived_stage2(failed_run)
         if stage2_result is not None:
@@ -905,6 +968,19 @@ def _stored_inbound_to_normalized(item: StoredInboundMessage) -> NormalizedInbou
         thread_message_id=item.thread_message_id,
         uidvalidity=item.uidvalidity,
     )
+
+
+def _is_recent_failed_run(failed_run: StoredRun, now: datetime) -> bool:
+    """True when the failed run started within ``REUSABLE_ARTIFACT_MAX_AGE_HOURS`` of ``now``."""
+    try:
+        started_at = datetime.fromisoformat(failed_run.started_at)
+    except ValueError:
+        return False
+    if started_at.tzinfo is None and now.tzinfo is not None:
+        started_at = started_at.replace(tzinfo=now.tzinfo)
+    elif started_at.tzinfo is not None and now.tzinfo is None:
+        started_at = started_at.replace(tzinfo=None)
+    return now - started_at <= timedelta(hours=REUSABLE_ARTIFACT_MAX_AGE_HOURS)
 
 
 def _is_at_or_before_cutoff(received_at: str, cutoff: datetime | None) -> bool:

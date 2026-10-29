@@ -35,6 +35,9 @@ IMAGE_ON_FAILURE_TEXT_ONLY = "text_only"
 SUPPORTED_IMAGE_ON_FAILURE = (IMAGE_ON_FAILURE_ABORT, IMAGE_ON_FAILURE_TEXT_ONLY)
 DEFAULT_IMAGE_ON_FAILURE = IMAGE_ON_FAILURE_ABORT
 DEFAULT_RETRY_AFTER_MINUTES = 120
+# A back-off of a whole day or more would also block the "catch up yesterday's missed send" path,
+# so no scheduled run could ever happen again after a single failure.
+MAX_RETRY_AFTER_MINUTES = 24 * 60
 DEFAULT_MAX_RUNS_PER_DAY = 3
 DEFAULT_MAX_BATCH_ATTEMPTS = 3
 DEFAULT_ALERT_AFTER_FAILURES = 2
@@ -336,6 +339,16 @@ def _require_hhmm(payload: dict[str, Any], key: str, path: str) -> str:
 def _load_schedule_config(payload: dict[str, Any]) -> ScheduleConfig:
     window_start = _require_hhmm(payload, "window_start", "schedule.window_start")
     window_end = _require_hhmm(payload, "window_end", "schedule.window_end")
+    retry_after_minutes = _optional_positive_int(
+        payload,
+        "retry_after_minutes",
+        "schedule.retry_after_minutes",
+        default=DEFAULT_RETRY_AFTER_MINUTES,
+    )
+    if retry_after_minutes >= MAX_RETRY_AFTER_MINUTES:
+        raise ValueError(
+            f"Invalid integer config for 'schedule.retry_after_minutes': expected < {MAX_RETRY_AFTER_MINUTES}"
+        )
     return ScheduleConfig(
         enabled=_require_bool(payload, "enabled", "schedule.enabled"),
         window_start=window_start,
@@ -350,12 +363,7 @@ def _load_schedule_config(payload: dict[str, Any]) -> ScheduleConfig:
             "check_every_minutes",
             "schedule.check_every_minutes",
         ),
-        retry_after_minutes=_optional_positive_int(
-            payload,
-            "retry_after_minutes",
-            "schedule.retry_after_minutes",
-            default=DEFAULT_RETRY_AFTER_MINUTES,
-        ),
+        retry_after_minutes=retry_after_minutes,
         max_runs_per_day=_optional_positive_int(
             payload,
             "max_runs_per_day",

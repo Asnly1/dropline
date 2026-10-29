@@ -57,6 +57,7 @@ INBOUND_MESSAGES_COLUMNS_SQL = """
                 PRIMARY KEY(character_slug, relationship_slug, uidvalidity, imap_uid)
 """
 
+IMAP_UIDVALIDITY_KEY = "imap_uidvalidity"
 CONSECUTIVE_FAILURES_KEY = "consecutive_failures"
 LAST_FAILED_AT_KEY = "last_failed_at"
 RUNS_TODAY_KEY = "runs_today"
@@ -74,6 +75,10 @@ RUN_MIGRATION_COLUMNS = {
 }
 
 LOGGER = logging.getLogger(__name__)
+
+
+class RunLockError(RuntimeError):
+    """Another pipeline run already holds the run lock."""
 
 
 @dataclass(slots=True)
@@ -94,7 +99,7 @@ class RunLock(AbstractContextManager["RunLock"]):
         except (BlockingIOError, OSError) as exc:
             self._handle.close()
             self._handle = None
-            raise RuntimeError("Another pipeline run is already in progress.") from exc
+            raise RunLockError("Another pipeline run is already in progress.") from exc
         return self
 
     def __exit__(self, exc_type, exc, exc_tb) -> None:
@@ -166,16 +171,19 @@ class StateStore:
         with self._connect() as conn:
             if not self._table_exists(conn, "kv_state"):
                 return None
-            scope = self._require_scope()
-            row = conn.execute(
-                """
-                SELECT value
-                FROM kv_state
-                WHERE character_slug = ? AND relationship_slug = ? AND key = ?
-                """,
-                (scope.character_slug, scope.relationship_slug, key),
-            ).fetchone()
-            return str(row["value"]) if row else None
+            return self._read_kv(conn, key)
+
+    def _read_kv(self, conn: sqlite3.Connection, key: str) -> str | None:
+        scope = self._require_scope()
+        row = conn.execute(
+            """
+            SELECT value
+            FROM kv_state
+            WHERE character_slug = ? AND relationship_slug = ? AND key = ?
+            """,
+            (scope.character_slug, scope.relationship_slug, key),
+        ).fetchone()
+        return str(row["value"]) if row else None
 
     def set_kv(self, key: str, value: str) -> None:
         scope = self._require_scope()
@@ -204,11 +212,11 @@ class StateStore:
         self.set_kv("last_seen_imap_uid", str(imap_uid))
 
     def get_imap_uidvalidity(self) -> int:
-        value = self.get_kv("imap_uidvalidity")
+        value = self.get_kv(IMAP_UIDVALIDITY_KEY)
         return int(value) if value else 0
 
     def set_imap_uidvalidity(self, uidvalidity: int) -> None:
-        self.set_kv("imap_uidvalidity", str(uidvalidity))
+        self.set_kv(IMAP_UIDVALIDITY_KEY, str(uidvalidity))
 
     def has_outbound_messages(self) -> bool:
         with self._connect() as conn:
@@ -371,6 +379,12 @@ class StateStore:
         self.set_kv(RUNS_TODAY_KEY, f"{today.isoformat()}:{runs_today}")
         return runs_today
 
+    def decrement_runs_today(self, today: dt_date) -> int:
+        """Undo one ``increment_runs_today`` for a run that must not count against the daily limit."""
+        runs_today = max(self.get_runs_today(today) - 1, 0)
+        self.set_kv(RUNS_TODAY_KEY, f"{today.isoformat()}:{runs_today}")
+        return runs_today
+
     def upsert_inbound_message(
         self,
         message: NormalizedInboundMessage,
@@ -453,7 +467,13 @@ class StateStore:
     def list_quarantined_inbound(self, *, limit: int | None = None) -> list[StoredInboundMessage]:
         return self._list_inbound_where("quarantined_at IS NOT NULL", limit=limit)
 
-    def _list_inbound_where(self, condition: str, *, limit: int | None = None) -> list[StoredInboundMessage]:
+    def _list_inbound_where(
+        self,
+        condition: str,
+        *,
+        params: Sequence[object] = (),
+        limit: int | None = None,
+    ) -> list[StoredInboundMessage]:
         with self._connect() as conn:
             if not self._table_exists(conn, "inbound_messages"):
                 return []
@@ -467,11 +487,11 @@ class StateStore:
                 f"WHERE character_slug = ? AND relationship_slug = ? AND {condition} "
                 "ORDER BY uidvalidity ASC, imap_uid ASC"
             )
-            params: list[object] = [scope.character_slug, scope.relationship_slug]
+            query_params: list[object] = [scope.character_slug, scope.relationship_slug, *params]
             if limit is not None:
                 query += " LIMIT ?"
-                params.append(limit)
-            rows = conn.execute(query, params).fetchall()
+                query_params.append(limit)
+            rows = conn.execute(query, query_params).fetchall()
         return [self._build_stored_inbound_message(row) for row in rows]
 
     def count_unconsumed_inbound(self) -> int:
@@ -494,68 +514,140 @@ class StateStore:
             ).fetchone()
             return int(row["count"]) if row else 0
 
+    def _resolve_inbound_key(
+        self,
+        conn: sqlite3.Connection,
+        imap_uid: int,
+        uidvalidity: int | None,
+        *,
+        condition: str = "1 = 1",
+    ) -> tuple[int, int] | None:
+        """Turn a UID into the ``(uidvalidity, imap_uid)`` key of one stored row, or ``None``.
+
+        With an explicit ``uidvalidity`` only that epoch is checked. Otherwise every epoch is searched
+        (rows kept from before the UIDVALIDITY migration have epoch 0): a single match wins outright;
+        among several, the current mailbox epoch is preferred and the newest epoch is the fallback.
+        """
+        scope = self._require_scope()
+        if uidvalidity is not None:
+            row = conn.execute(
+                (
+                    "SELECT 1 FROM inbound_messages "
+                    "WHERE character_slug = ? AND relationship_slug = ? AND uidvalidity = ? AND imap_uid = ? "
+                    f"AND {condition}"
+                ),
+                (scope.character_slug, scope.relationship_slug, uidvalidity, imap_uid),
+            ).fetchone()
+            return (uidvalidity, imap_uid) if row else None
+        rows = conn.execute(
+            (
+                "SELECT uidvalidity FROM inbound_messages "
+                f"WHERE character_slug = ? AND relationship_slug = ? AND imap_uid = ? AND {condition} "
+                "ORDER BY uidvalidity DESC"
+            ),
+            (scope.character_slug, scope.relationship_slug, imap_uid),
+        ).fetchall()
+        epochs = [int(row["uidvalidity"]) for row in rows]
+        if not epochs:
+            return None
+        if len(epochs) > 1:
+            current_epoch = int(self._read_kv(conn, IMAP_UIDVALIDITY_KEY) or 0)
+            if current_epoch in epochs:
+                return (current_epoch, imap_uid)
+        return (epochs[0], imap_uid)
+
+    def get_inbound_message(self, imap_uid: int, *, uidvalidity: int | None = None) -> StoredInboundMessage | None:
+        """Look up one inbound row by UID; ``_resolve_inbound_key`` decides the epoch when none is given."""
+        with self._connect() as conn:
+            if not self._table_exists(conn, "inbound_messages"):
+                return None
+            key = self._resolve_inbound_key(conn, imap_uid, uidvalidity)
+        if key is None:
+            return None
+        rows = self._list_inbound_where("uidvalidity = ? AND imap_uid = ?", params=key)
+        return rows[0] if rows else None
+
     def record_inbound_attempt_failure(
         self,
-        imap_uids: list[int],
+        message_keys: Sequence[tuple[int, int]],
         *,
         error_stage: str,
         message: str,
         attempted_at: str,
         max_attempts: int,
-    ) -> list[int]:
+    ) -> list[tuple[int, int]]:
         """Count one failed processing attempt for a batch; quarantine messages that reached ``max_attempts``.
 
-        Returns the UIDs that were newly quarantined by this call.
+        Each key is ``(uidvalidity, imap_uid)`` as stored on the message, so a row that shares the UID
+        in another UIDVALIDITY epoch is never counted or quarantined along with it.
+        Returns the keys that were newly quarantined by this call.
         """
-        if not imap_uids:
+        if not message_keys:
             return []
         scope = self._require_scope()
-        placeholders = ",".join("?" for _ in imap_uids)
+        key_condition = " OR ".join("(uidvalidity = ? AND imap_uid = ?)" for _ in message_keys)
+        key_params = [value for key in message_keys for value in key]
         last_error = f"{error_stage}: {message}"[:INBOUND_LAST_ERROR_MAX_CHARS]
         with self._connect() as conn:
             conn.execute(
                 (
                     "UPDATE inbound_messages "
                     "SET attempt_count = attempt_count + 1, last_error = ?, last_attempt_at = ? "
-                    f"WHERE character_slug = ? AND relationship_slug = ? AND imap_uid IN ({placeholders})"
+                    f"WHERE character_slug = ? AND relationship_slug = ? AND ({key_condition})"
                 ),
-                (last_error, attempted_at, scope.character_slug, scope.relationship_slug, *imap_uids),
+                (last_error, attempted_at, scope.character_slug, scope.relationship_slug, *key_params),
             )
             rows = conn.execute(
                 (
-                    "SELECT imap_uid FROM inbound_messages "
-                    f"WHERE character_slug = ? AND relationship_slug = ? AND imap_uid IN ({placeholders}) "
-                    "AND quarantined_at IS NULL AND attempt_count >= ? ORDER BY imap_uid ASC"
+                    "SELECT uidvalidity, imap_uid FROM inbound_messages "
+                    f"WHERE character_slug = ? AND relationship_slug = ? AND ({key_condition}) "
+                    "AND quarantined_at IS NULL AND attempt_count >= ? ORDER BY uidvalidity ASC, imap_uid ASC"
                 ),
-                (scope.character_slug, scope.relationship_slug, *imap_uids, max_attempts),
+                (scope.character_slug, scope.relationship_slug, *key_params, max_attempts),
             ).fetchall()
-            quarantined_uids = [int(row["imap_uid"]) for row in rows]
-            if quarantined_uids:
-                quarantine_placeholders = ",".join("?" for _ in quarantined_uids)
-                conn.execute(
-                    (
-                        "UPDATE inbound_messages SET quarantined_at = ? "
-                        f"WHERE character_slug = ? AND relationship_slug = ? AND imap_uid IN ({quarantine_placeholders})"
-                    ),
-                    (attempted_at, scope.character_slug, scope.relationship_slug, *quarantined_uids),
+            quarantined_keys = [(int(row["uidvalidity"]), int(row["imap_uid"])) for row in rows]
+            if quarantined_keys:
+                conn.executemany(
+                    """
+                    UPDATE inbound_messages SET quarantined_at = ?
+                    WHERE character_slug = ? AND relationship_slug = ? AND uidvalidity = ? AND imap_uid = ?
+                    """,
+                    [
+                        (attempted_at, scope.character_slug, scope.relationship_slug, uidvalidity, imap_uid)
+                        for uidvalidity, imap_uid in quarantined_keys
+                    ],
                 )
-        return quarantined_uids
+        return quarantined_keys
 
-    def requeue_inbound_message(self, imap_uid: int) -> bool:
-        """Clear quarantine and attempt bookkeeping so the message is processed again."""
+    def requeue_inbound_message(
+        self,
+        imap_uid: int,
+        *,
+        uidvalidity: int | None = None,
+    ) -> StoredInboundMessage | None:
+        """Clear quarantine and attempt bookkeeping of one quarantined message so it is processed again.
+
+        Only quarantined rows are candidates (``_resolve_inbound_key`` picks the epoch when none is given):
+        a row with that UID that was already answered or is still queued is left untouched and ``None``
+        is returned; ``get_inbound_message`` tells those two cases apart. Returns the requeued row.
+        """
         scope = self._require_scope()
         with self._connect() as conn:
             if not self._table_exists(conn, "inbound_messages"):
-                return False
-            updated = conn.execute(
+                return None
+            key = self._resolve_inbound_key(conn, imap_uid, uidvalidity, condition="quarantined_at IS NOT NULL")
+            if key is None:
+                return None
+            conn.execute(
                 """
                 UPDATE inbound_messages
                 SET attempt_count = 0, last_error = NULL, last_attempt_at = NULL, quarantined_at = NULL
-                WHERE character_slug = ? AND relationship_slug = ? AND imap_uid = ?
+                WHERE character_slug = ? AND relationship_slug = ? AND uidvalidity = ? AND imap_uid = ?
                 """,
-                (scope.character_slug, scope.relationship_slug, imap_uid),
-            ).rowcount
-        return updated > 0
+                (scope.character_slug, scope.relationship_slug, *key),
+            )
+        rows = self._list_inbound_where("uidvalidity = ? AND imap_uid = ?", params=key)
+        return rows[0] if rows else None
 
     def mark_inbound_consumed(self, message_keys: Sequence[tuple[int, int]], batch_id: str) -> None:
         """Mark inbound rows consumed; each key is ``(uidvalidity, imap_uid)`` as stored on the message."""
@@ -575,12 +667,13 @@ class StateStore:
             )
 
     def delete_inbound_message(self, imap_uid: int, *, uidvalidity: int | None = None) -> bool:
-        """Delete one inbound row by UID within a UIDVALIDITY epoch (the current mailbox epoch by default)."""
+        """Delete one inbound row by UID; ``_resolve_inbound_key`` decides the epoch when none is given."""
         scope = self._require_scope()
-        if uidvalidity is None:
-            uidvalidity = self.get_imap_uidvalidity()
         with self._connect() as conn:
             if not self._table_exists(conn, "inbound_messages"):
+                return False
+            key = self._resolve_inbound_key(conn, imap_uid, uidvalidity)
+            if key is None:
                 return False
             row = conn.execute(
                 """
@@ -588,10 +681,8 @@ class StateStore:
                 FROM inbound_messages
                 WHERE character_slug = ? AND relationship_slug = ? AND uidvalidity = ? AND imap_uid = ?
                 """,
-                (scope.character_slug, scope.relationship_slug, uidvalidity, imap_uid),
+                (scope.character_slug, scope.relationship_slug, *key),
             ).fetchone()
-            if row is None:
-                return False
             paths = self._resolve_deletable_paths(
                 [
                     str(row["raw_path"]),
@@ -603,9 +694,10 @@ class StateStore:
                 DELETE FROM inbound_messages
                 WHERE character_slug = ? AND relationship_slug = ? AND uidvalidity = ? AND imap_uid = ?
                 """,
-                (scope.character_slug, scope.relationship_slug, uidvalidity, imap_uid),
+                (scope.character_slug, scope.relationship_slug, *key),
             )
         self._delete_paths(paths)
+        LOGGER.info("Deleted inbound message uid=%s uidvalidity=%s", key[1], key[0])
         return True
 
     def delete_all_inbound_messages(self) -> int:
