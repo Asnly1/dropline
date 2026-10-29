@@ -14,10 +14,14 @@ from email.utils import formataddr, make_msgid, parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import Protocol
 
-from .config import CharacterMailboxConfig, MailEndpointConfig, Settings, current_character_name
+from .config import (
+    CharacterMailboxConfig,
+    MailEndpointConfig,
+    Settings,
+    current_character_name,
+)
 from .models import AttachmentMeta, NormalizedInboundMessage, RawInboundMessage
 from .utils import retry_call
-
 
 LOGGER = logging.getLogger(__name__)
 FROM_HEADER_SECTION = "(BODY.PEEK[HEADER.FIELDS (FROM)])"
@@ -189,7 +193,7 @@ class SMTPOutboundClient:
             raise
         try:
             client.quit()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - QUIT is best-effort once the message has been accepted
             LOGGER.warning(
                 "SMTP QUIT failed after message was already sent successfully; treating send as successful: %s",
                 exc,

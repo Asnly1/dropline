@@ -8,13 +8,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
-from .provider_registry import (
-    IMAGE_CAPABILITY,
-    PROVIDER_SPECS,
-    TEXT_CAPABILITY,
-    ensure_provider_support,
-    get_provider_spec,
-)
 from .profile_manager import (
     ActiveProfileContext,
     character_prompt_dir,
@@ -24,7 +17,13 @@ from .profile_manager import (
     relationship_prompt_dir,
     session_profile_dir,
 )
-
+from .provider_registry import (
+    IMAGE_CAPABILITY,
+    PROVIDER_SPECS,
+    TEXT_CAPABILITY,
+    ensure_provider_support,
+    get_provider_spec,
+)
 
 PLACEHOLDER_VALUE_PATTERN = re.compile(r"^(?:REPLACE_ME(?:_[A-Z0-9_]+)?|YOUR_[A-Z0-9_]+|<[^>]+>)$", re.IGNORECASE)
 HHMM_PATTERN = re.compile(r"^\d{2}:\d{2}$")
@@ -453,7 +452,7 @@ def _load_provider_settings_for_llm(payload: dict[str, Any], llm: LLMConfig) -> 
             require_image_model="image_model" in spec.required_paths(capability),
         )
 
-    for provider_name, spec in PROVIDER_SPECS.items():
+    for provider_name in PROVIDER_SPECS:
         if provider_name in providers:
             continue
         provider_payload = payload.get(provider_name)

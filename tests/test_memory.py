@@ -18,7 +18,6 @@ from dropline.models import (
     UserDigest,
 )
 from dropline.utils import hash_text
-
 from tests.helpers import create_test_repo, load_test_settings
 
 

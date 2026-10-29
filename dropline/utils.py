@@ -7,9 +7,8 @@ import smtplib
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeVar
 from zoneinfo import ZoneInfo
 
 try:
@@ -30,7 +29,6 @@ TRANSIENT_ERROR_FRAGMENTS = (
     "nodename nor servname provided, or not known",
     "timed out",
 )
-T = TypeVar("T")
 
 
 def now_in_timezone(timezone_name: str) -> datetime:
@@ -38,7 +36,7 @@ def now_in_timezone(timezone_name: str) -> datetime:
 
 
 def new_run_id(now: datetime | None = None) -> str:
-    now = now or datetime.utcnow()
+    now = now or datetime.now(UTC)
     return f"run-{now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
 
@@ -81,7 +79,7 @@ def is_transient_network_error(exc: BaseException) -> bool:
     return any(fragment in message for fragment in TRANSIENT_ERROR_FRAGMENTS)
 
 
-def retry_call(
+def retry_call[T](
     operation: Callable[[], T],
     *,
     operation_name: str,
@@ -95,7 +93,7 @@ def retry_call(
     for attempt in range(1, max(attempts, 1) + 1):
         try:
             return operation()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             if attempt >= attempts or not should_retry(exc):
                 raise
             logger.warning(

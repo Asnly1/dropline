@@ -6,7 +6,6 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-
 DEFAULT_SCHEDULER_TASK_NAME = "dropline"
 TASK_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from .config import Settings
-from .models import CharacterProfileDraft, RelationshipProfileDraft, Stage1Result, Stage2Result
+from .models import (
+    CharacterProfileDraft,
+    RelationshipProfileDraft,
+    Stage1Result,
+    Stage2Result,
+)
 from .provider_registry import get_provider_text_model
-
 
 CHINESE_OUTPUT_LANGUAGE = "简体中文"
 ENGLISH_OUTPUT_LANGUAGE = "English"

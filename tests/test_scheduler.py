@@ -21,7 +21,6 @@ from dropline.scheduler import (
 )
 from dropline.scheduler_tick import scheduler_tick_command
 from dropline.storage import StateStore
-
 from tests.helpers import create_test_repo, load_test_settings
 
 

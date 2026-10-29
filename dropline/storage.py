@@ -25,7 +25,6 @@ from .models import (
 from .profile_manager import session_archive_dir, session_profile_dir
 from .utils import ensure_parent, resolve_path_within_roots
 
-
 OUTBOUND_PENDING = "pending"
 OUTBOUND_SENT = "sent"
 
@@ -37,7 +36,7 @@ class RunLock(AbstractContextManager["RunLock"]):
     lock_path: Path
     _handle: Any | None = None
 
-    def __enter__(self) -> "RunLock":
+    def __enter__(self) -> RunLock:
         ensure_parent(self.lock_path)
         self._handle = self.lock_path.open("a+b")
         self._handle.seek(0, os.SEEK_END)

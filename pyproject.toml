@@ -44,8 +44,35 @@ test = [
 ]
 dev = [
   "pytest",
-  "ruff",
+  # Pinned so CI and local runs lint with the same rule implementation; bump deliberately.
+  "ruff==0.17.3",
 ]
 
 [tool.setuptools]
 packages = ["dropline"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# Rule selection is explicit so lint results do not drift with ruff's default rule set
+# (ruff 0.16.0 replaced the historical `E4, E7, E9, F` default with a 400+ rule set).
+select = [
+  "E4", "E7", "E9", # pycodestyle errors (ruff's historical default)
+  "W",              # pycodestyle warnings
+  "F",              # pyflakes
+  "I",              # isort
+  "UP",             # pyupgrade
+  "B",              # flake8-bugbear
+  "BLE",            # flake8-blind-except: every bare `except Exception` needs an explicit noqa
+  "C4",             # flake8-comprehensions
+  "SIM",            # flake8-simplify
+  "PLE",            # pylint errors
+  "RUF",            # ruff-specific rules
+  "DTZ003",         # datetime.utcnow() is deprecated since Python 3.12
+  "DTZ004",         # datetime.utcfromtimestamp() is deprecated since Python 3.12
+]
+ignore = [
+  "RUF001", "RUF002", "RUF003", # ambiguous-unicode: prompts and tests legitimately use CJK text and fullwidth punctuation
+  "SIM117",                     # nested `with` blocks in tests keep `patch(...)` and `assertRaises(...)` visually separate
+]

@@ -37,7 +37,6 @@ from .provider_registry import (
 )
 from .utils import retry_call
 
-
 LOGGER = logging.getLogger(__name__)
 
 

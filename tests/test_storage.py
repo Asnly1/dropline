@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 
 from dropline.models import NormalizedInboundMessage
 from dropline.storage import SessionScope, StateStore
-
 from tests.helpers import create_test_repo, load_test_settings
 
 

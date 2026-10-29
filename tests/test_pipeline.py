@@ -3,21 +3,25 @@ from __future__ import annotations
 import base64
 import tempfile
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta
 from email.message import EmailMessage
-from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from dropline.documents import load_entries, load_json_file
 from dropline.memory import MemoryManager
-from dropline.models import GeneratedImage, ModelValidationError, NormalizedInboundMessage, RawInboundMessage, Stage1Result, Stage2Result
+from dropline.models import (
+    GeneratedImage,
+    ModelValidationError,
+    NormalizedInboundMessage,
+    RawInboundMessage,
+    Stage1Result,
+    Stage2Result,
+)
 from dropline.pipeline import PipelineDependencies, PipelineService, RunContext
 from dropline.storage import StateStore
-
 from tests.helpers import create_test_repo, load_test_settings
-
 
 PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9lJawAAAAASUVORK5CYII="
@@ -151,7 +155,7 @@ Message-ID: <msg-1@example.com>
 Content-Type: text/plain; charset="utf-8"
 
 今天写了一天作业，有点累。
-""".encode("utf-8")
+""".encode()
 
 
 def build_raw_email(
@@ -169,7 +173,7 @@ Message-ID: <{message_id}>
 Content-Type: text/plain; charset="utf-8"
 
 测试邮件 {uid}
-""".encode("utf-8")
+""".encode()
     return RawInboundMessage(imap_uid=uid, raw_bytes=raw)
 
 

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
-from typing import Sequence
 
 from .config import Settings, load_settings, validate_live_settings
 from .documents import load_json_file, read_optional_text, read_required_text
@@ -21,11 +21,16 @@ from .mail import (
     normalize_inbound_message,
 )
 from .memory import MemoryManager
-from .models import ModelValidationError, NormalizedInboundMessage, RunOutcome, Stage1Result, Stage2Result
-from .models import StoredOutboundMessage
+from .models import (
+    ModelValidationError,
+    NormalizedInboundMessage,
+    RunOutcome,
+    Stage1Result,
+    Stage2Result,
+    StoredOutboundMessage,
+)
 from .storage import OUTBOUND_PENDING, StateStore
 from .utils import hash_text, new_run_id, now_in_timezone
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -66,7 +71,7 @@ class PipelineService:
     def run_once(self) -> RunOutcome:
         try:
             context = self._prepare_run()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             LOGGER.exception("Pipeline run failed during preparation")
             return RunOutcome(
                 success=False,

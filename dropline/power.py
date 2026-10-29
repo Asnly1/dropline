@@ -5,7 +5,6 @@ import re
 import subprocess
 from dataclasses import dataclass
 
-
 LOGGER = logging.getLogger(__name__)
 IOREG_VALUE_RE = re.compile(r'"([^"]+)"\s*=\s*(?:"([^"]*)"|(Yes|No))')
 
@@ -20,14 +19,12 @@ class PowerContext:
     def is_darkwake(self) -> bool:
         if self.clamshell_closed is True and self.user_is_active is False:
             return True
-        if (
+        return bool(
             self.user_is_active is False
             and self.user_triggered_full_wake is False
             and self.wake_type
             and self.wake_type != "UserActivity Assertion"
-        ):
-            return True
-        return False
+        )
 
     def to_log_string(self) -> str:
         return (

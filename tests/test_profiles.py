@@ -39,7 +39,6 @@ from dropline.profiles import (
     show_outbox,
 )
 from dropline.storage import StateStore
-
 from tests.helpers import create_test_repo, load_test_settings
 
 

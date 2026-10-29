@@ -6,7 +6,11 @@ from pathlib import Path
 
 from .config import Settings
 from .launchd import install_launchd_job, uninstall_launchd_job
-from .scheduler_support import DEFAULT_SCHEDULER_TASK_NAME, build_scheduler_paths, normalize_scheduler_task_name
+from .scheduler_support import (
+    DEFAULT_SCHEDULER_TASK_NAME,
+    build_scheduler_paths,
+    normalize_scheduler_task_name,
+)
 from .windows_task import install_windows_task, uninstall_windows_task
 
 

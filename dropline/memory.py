@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable
 
 from .config import Settings
 from .documents import (
@@ -12,7 +12,13 @@ from .documents import (
     load_json_file,
     write_json_file,
 )
-from .models import CandidateMemory, ConflictNote, ManagedMemoryEntry, Stage1Result, Stage2Result
+from .models import (
+    CandidateMemory,
+    ConflictNote,
+    ManagedMemoryEntry,
+    Stage1Result,
+    Stage2Result,
+)
 from .utils import hash_text
 
 
@@ -399,9 +405,7 @@ class MemoryManager:
             return True
         if len(normalized_left) >= 8 and normalized_left in normalized_right:
             return True
-        if len(normalized_right) >= 8 and normalized_right in normalized_left:
-            return True
-        return False
+        return bool(len(normalized_right) >= 8 and normalized_right in normalized_left)
 
     def _is_conflict(self, existing_content: str, new_content: str) -> bool:
         existing_norm = _normalize_memory(_strip_negation(existing_content))

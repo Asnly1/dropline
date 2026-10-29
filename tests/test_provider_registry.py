@@ -11,7 +11,6 @@ from dropline.provider_registry import (
     get_provider_api_key,
     get_provider_spec,
 )
-
 from tests.helpers import create_test_repo, load_test_settings
 
 

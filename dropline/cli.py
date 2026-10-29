@@ -2,17 +2,26 @@ from __future__ import annotations
 
 import argparse
 import logging
-import shutil
 import shlex
+import shutil
 import sys
 import textwrap
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence, TextIO
+from typing import TextIO
 
-from . import init_state, install_scheduler, profiles, reset_dev_state, run_once, scheduler_tick, stale_runs, uninstall_scheduler
+from . import (
+    init_state,
+    install_scheduler,
+    profiles,
+    reset_dev_state,
+    run_once,
+    scheduler_tick,
+    stale_runs,
+    uninstall_scheduler,
+)
 from .config import load_settings, resolve_repo_root_from_config
-from .scheduler_support import DEFAULT_SCHEDULER_TASK_NAME
 from .profile_manager import (
     character_display_name,
     list_character_profile_metas,
@@ -20,7 +29,7 @@ from .profile_manager import (
     resolve_character_profile_meta,
     resolve_relationship_profile_meta,
 )
-
+from .scheduler_support import DEFAULT_SCHEDULER_TASK_NAME
 
 PromptFn = Callable[[str], str]
 CommandHandler = Callable[[argparse.Namespace], int]
@@ -825,7 +834,7 @@ def execute_command(
         print(_build_parser(spec).format_usage().strip(), file=output)
         return 1
 
-    if getattr(args, "_help"):
+    if args._help:
         print(parser.format_help(), end="", file=output)
         return 0
 

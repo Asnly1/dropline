@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import shutil
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .config import Settings, load_settings, resolve_repo_root_from_config
 from .documents import read_optional_text
@@ -12,7 +13,6 @@ from .llm import build_profile_generation_client
 from .llm_contracts import CHINESE_OUTPUT_LANGUAGE, ENGLISH_OUTPUT_LANGUAGE
 from .memory import MemoryManager
 from .models import CharacterProfileDraft, RelationshipProfileDraft
-from .provider_registry import get_provider_text_model
 from .profile_manager import (
     CharacterProfileMeta,
     RelationshipProfileMeta,
@@ -26,8 +26,8 @@ from .profile_manager import (
     list_relationship_profile_metas,
     load_character_profile_meta,
     load_relationship_profile_meta,
-    load_session_profile_meta,
     load_selected_profile_context,
+    load_session_profile_meta,
     relationship_profile_dir,
     relationship_prompt_dir,
     resolve_character_profile_meta,
@@ -39,9 +39,9 @@ from .profile_manager import (
     sessions_root,
     slugify,
 )
+from .provider_registry import get_provider_text_model
 from .storage import SessionScope, StateStore
 from .utils import resolve_path_within_roots
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -301,6 +301,7 @@ def _render_persona_markdown(
                 draft.persona.repeatable_life_details,
                 draft.persona.ooc_boundaries,
             ),
+            strict=True,
         )
     )
     return _render_markdown_document(
@@ -335,6 +336,7 @@ def _render_world_state_markdown(
                 draft.world_state.letter_scale,
                 draft.world_state.image_principles,
             ),
+            strict=True,
         )
     )
     anchor = meta.work_title or str(_render_text(language, "public_anchor"))
@@ -523,6 +525,7 @@ def _render_relationship_markdown(
                 draft.explicit_boundaries,
                 draft.warming_up_path,
             ),
+            strict=True,
         )
     )
     return _render_markdown_document(
@@ -936,7 +939,7 @@ def show_outbox(
     relationship_slug_value: str | None = None,
     limit: int = 5,
 ) -> int:
-    character, relationship, session, store = _resolve_scoped_store(
+    _character, _relationship, _session, store = _resolve_scoped_store(
         config_path,
         character_slug_value=character_slug_value,
         relationship_slug_value=relationship_slug_value,

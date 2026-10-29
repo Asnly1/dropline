@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
 import hashlib
 import logging
 import re
+from collections.abc import Callable, Iterable
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Iterable, TypeVar
 
 from .documents import load_json_file, write_json_file
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,7 +31,6 @@ CHARACTER_PROMPT_FILENAMES = (
 RELATIONSHIP_PROMPT_FILENAMES = ("relationship.md",)
 SLUG_SANITIZE_RE = re.compile(r"[^\w-]+", re.UNICODE)
 MULTI_HYPHEN_RE = re.compile(r"-{2,}")
-_MetaT = TypeVar("_MetaT")
 
 
 def validate_profile_slug(value: str, field_name: str = "profile.slug") -> str:
@@ -56,7 +54,7 @@ class CharacterProfileMeta:
     created_at: str
 
     @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "CharacterProfileMeta":
+    def from_dict(cls, payload: dict[str, object]) -> CharacterProfileMeta:
         return cls(
             slug=validate_profile_slug(str(payload.get("slug", "")).strip(), "character.slug"),
             character_name=str(payload.get("character_name", "")).strip(),
@@ -77,7 +75,7 @@ class RelationshipProfileMeta:
     created_at: str
 
     @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "RelationshipProfileMeta":
+    def from_dict(cls, payload: dict[str, object]) -> RelationshipProfileMeta:
         return cls(
             slug=validate_profile_slug(str(payload.get("slug", "")).strip(), "relationship.slug"),
             character_slug=validate_profile_slug(
@@ -103,7 +101,7 @@ class SessionProfileMeta:
     created_at: str
 
     @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "SessionProfileMeta":
+    def from_dict(cls, payload: dict[str, object]) -> SessionProfileMeta:
         return cls(
             slug=validate_profile_slug(str(payload.get("slug", "")).strip(), "session.slug"),
             character_slug=validate_profile_slug(str(payload.get("character_slug", "")).strip(), "session.character_slug"),
@@ -126,7 +124,7 @@ class ActiveProfileSelection:
     relationship_slug: str
 
     @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "ActiveProfileSelection":
+    def from_dict(cls, payload: dict[str, object]) -> ActiveProfileSelection:
         return cls(
             character_slug=validate_profile_slug(str(payload.get("character_slug", "")).strip(), "active.character_slug"),
             relationship_slug=validate_profile_slug(
@@ -292,11 +290,11 @@ def save_session_profile_meta(repo_root: Path, meta: SessionProfileMeta) -> Path
     return _write_meta(session_profile_dir(repo_root, meta.character_slug, meta.relationship_slug) / META_FILENAME, meta.to_dict())
 
 
-def _load_meta(
+def _load_meta[MetaT](
     path: Path,
     *,
-    parse: Callable[[dict[str, object]], _MetaT],
-) -> _MetaT | None:
+    parse: Callable[[dict[str, object]], MetaT],
+) -> MetaT | None:
     payload = load_json_file(path, default=None)
     if not isinstance(payload, dict):
         return None
@@ -307,12 +305,12 @@ def _load_meta(
         return None
 
 
-def _list_metas(
+def _list_metas[MetaT](
     meta_paths: Iterable[Path],
     *,
-    parse: Callable[[dict[str, object]], _MetaT],
-) -> list[_MetaT]:
-    metas: list[_MetaT] = []
+    parse: Callable[[dict[str, object]], MetaT],
+) -> list[MetaT]:
+    metas: list[MetaT] = []
     for meta_path in meta_paths:
         meta = _load_meta(meta_path, parse=parse)
         if meta is not None:

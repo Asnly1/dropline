@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from .config import load_settings
-from .scheduler_install import DEFAULT_SCHEDULER_TASK_NAME, get_scheduler_platform, uninstall_scheduler
+from .scheduler_install import (
+    DEFAULT_SCHEDULER_TASK_NAME,
+    get_scheduler_platform,
+    uninstall_scheduler,
+)
 
 
 def uninstall_scheduler_command(

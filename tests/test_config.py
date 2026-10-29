@@ -7,7 +7,6 @@ from pathlib import Path
 import yaml
 
 from dropline.config import load_settings, validate_live_settings
-
 from tests.helpers import create_test_repo, load_test_settings
 
 

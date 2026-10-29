@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-from datetime import date
-from email.message import EmailMessage
-from pathlib import Path
 import smtplib
 import tempfile
 import unittest
+from datetime import date
+from email.message import EmailMessage
+from pathlib import Path
 from unittest.mock import patch
 
-import dropline.mail as mail_module
 import dropline.config as config_module
+import dropline.mail as mail_module
 from dropline.config import CharacterMailboxConfig, MailEndpointConfig
-from dropline.mail import IMAPInboundClient, SMTPOutboundClient, normalize_inbound_message
+from dropline.mail import (
+    IMAPInboundClient,
+    SMTPOutboundClient,
+    normalize_inbound_message,
+)
 from dropline.models import RawInboundMessage, Stage2Result
 from tests.helpers import create_test_repo, load_test_settings
-
 
 RAW_EMAIL = """From: User <user@example.com>
 To: keqing@example.com
@@ -37,10 +40,10 @@ Content-Type: text/html; charset="utf-8"
 
 <p>今天写了一天作业，有点累。</p>
 --BOUNDARY--
-""".encode("utf-8")
+""".encode()  # noqa: W291  # "-- " (with the trailing space) is the RFC 3676 signature delimiter
 
 
-RAW_EMAIL_UNKNOWN_CHARSET = """From: User <user@example.com>
+RAW_EMAIL_UNKNOWN_CHARSET = b"""From: User <user@example.com>
 To: keqing@example.com
 Subject: weird charset
 Message-ID: <weird-charset@example.com>
@@ -51,7 +54,7 @@ Content-Type: text/plain; charset="x-user-defined"
 
 hello world
 --BOUNDARY--
-""".encode("utf-8")
+"""
 
 
 class MailNormalizationTests(unittest.TestCase):
@@ -72,7 +75,7 @@ Message-ID: <bad-date@example.com>
 Content-Type: text/plain; charset="utf-8"
 
 今天写了一天作业。
-""".encode("utf-8")
+""".encode()
 
         normalized = normalize_inbound_message(RawInboundMessage(imap_uid=2, raw_bytes=raw_email))
 

@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 from dropline.install_scheduler import install_scheduler_command
 from dropline.launchd import LaunchdPaths
-from dropline.scheduler_support import build_scheduler_paths
 from dropline.scheduler_install import install_scheduler, uninstall_scheduler
+from dropline.scheduler_support import build_scheduler_paths
 from dropline.windows_task import (
     build_schtasks_create_command,
     build_schtasks_delete_command,
@@ -20,7 +20,6 @@ from dropline.windows_task import (
     install_windows_task,
     render_windows_wrapper_script,
 )
-
 from tests.helpers import create_test_repo, load_test_settings
 
 

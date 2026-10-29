@@ -17,7 +17,6 @@ from .scheduler import (
 )
 from .utils import now_in_timezone
 
-
 LOGGER = logging.getLogger(__name__)
 SCHEDULE_STATE_KEYS = (
     SCHEDULED_FOR_DATE_KEY,
@@ -83,7 +82,7 @@ def scheduler_tick_command(config_path: str = "config.yaml") -> int:
     if power_context is not None and power_context.is_darkwake():
         finished_at = now_in_timezone(settings.project.timezone)
         duration_ms = int((time.perf_counter() - started_perf) * 1000)
-        unloaded_state = {key: "" for key in SCHEDULE_STATE_KEYS}
+        unloaded_state = dict.fromkeys(SCHEDULE_STATE_KEYS, "")
         LOGGER.info(
             "tick_finished tick_id=%s finished_at=%s duration_ms=%s event=skipped_darkwake power_state=%s state_after=%s",
             tick_id,

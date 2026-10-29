@@ -12,7 +12,6 @@ from dropline.config import load_settings
 from dropline.memory import MemoryManager
 from dropline.reset_dev_state import reset_dev_state, reset_dev_state_command
 from dropline.storage import SessionScope, StateStore
-
 from tests.helpers import create_test_repo, load_test_settings
 
 

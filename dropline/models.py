@@ -92,7 +92,7 @@ class UserDigest:
     possible_needs: list[str]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "UserDigest":
+    def from_dict(cls, payload: dict[str, Any]) -> UserDigest:
         payload = _expect_object(payload, "user_digest")
         return cls(
             main_event=_expect_string(payload, "main_event"),
@@ -115,7 +115,7 @@ class CandidateMemory:
     source_date: str = ""
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "CandidateMemory":
+    def from_dict(cls, payload: dict[str, Any]) -> CandidateMemory:
         payload = _expect_object(payload, "candidate_memories[]")
         confidence = payload.get("confidence")
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
@@ -150,7 +150,7 @@ class Stage1Result:
     open_loops: list[str]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "Stage1Result":
+    def from_dict(cls, payload: dict[str, Any]) -> Stage1Result:
         payload = _expect_object(payload, "stage1")
         return cls(
             user_digest=UserDigest.from_dict(_expect_dict(payload, "user_digest")),
@@ -174,7 +174,7 @@ class CharacterEpisode:
     continuity_value: str
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "CharacterEpisode":
+    def from_dict(cls, payload: dict[str, Any]) -> CharacterEpisode:
         payload = _expect_object(payload, "character_episode")
         return cls(
             summary=_expect_string(payload, "summary"),
@@ -191,7 +191,7 @@ class ActiveArcUpdateSuggestion:
     content: str
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ActiveArcUpdateSuggestion":
+    def from_dict(cls, payload: dict[str, Any]) -> ActiveArcUpdateSuggestion:
         payload = _expect_object(payload, "active_arc_update_suggestion")
         action = _expect_string(payload, "action")
         if action not in ACTIVE_ARC_ACTIONS:
@@ -213,7 +213,7 @@ class SceneCard:
     camera_distance: str
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "SceneCard":
+    def from_dict(cls, payload: dict[str, Any]) -> SceneCard:
         payload = _expect_object(payload, "scene_card")
         return cls(
             visual_style=_expect_string(payload, "visual_style"),
@@ -238,7 +238,7 @@ class Stage2Result:
     scene_card: SceneCard | None
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "Stage2Result":
+    def from_dict(cls, payload: dict[str, Any]) -> Stage2Result:
         payload = _expect_object(payload, "stage2")
         scene_card_payload = payload.get("scene_card")
         if scene_card_payload is None:
@@ -273,7 +273,7 @@ class PersonaProfileDraft:
     ooc_boundaries: list[str]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "PersonaProfileDraft":
+    def from_dict(cls, payload: dict[str, Any]) -> PersonaProfileDraft:
         return cls(
             identity_and_role=_expect_string_list(payload, "identity_and_role"),
             core_values=_expect_string_list(payload, "core_values"),
@@ -299,7 +299,7 @@ class WorldStateProfileDraft:
     image_principles: list[str]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "WorldStateProfileDraft":
+    def from_dict(cls, payload: dict[str, Any]) -> WorldStateProfileDraft:
         return cls(
             worldview_type=_expect_string_list(payload, "worldview_type"),
             time_anchor=_expect_string_list(payload, "time_anchor"),
@@ -323,7 +323,7 @@ class FocusRelationshipDraft:
     forbidden_patterns: list[str]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "FocusRelationshipDraft":
+    def from_dict(cls, payload: dict[str, Any]) -> FocusRelationshipDraft:
         return cls(
             name=_expect_string(payload, "name"),
             relationship_tone=_expect_string_list(payload, "relationship_tone"),
@@ -340,7 +340,7 @@ class CastRelationsProfileDraft:
     focus_relationships: list[FocusRelationshipDraft]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "CastRelationsProfileDraft":
+    def from_dict(cls, payload: dict[str, Any]) -> CastRelationsProfileDraft:
         return cls(
             focus_relationships=[
                 FocusRelationshipDraft.from_dict(item) for item in _expect_list(payload, "focus_relationships")
@@ -364,7 +364,7 @@ class CastPoolProfileDraft:
     frequency_rules: list[str]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "CastPoolProfileDraft":
+    def from_dict(cls, payload: dict[str, Any]) -> CastPoolProfileDraft:
         return cls(
             usage_principles=_expect_string_list(payload, "usage_principles"),
             tier_1_high_frequency=_expect_string_list(payload, "tier_1_high_frequency"),
@@ -386,7 +386,7 @@ class TranslationProcessingModeDraft:
     examples: list[str]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TranslationProcessingModeDraft":
+    def from_dict(cls, payload: dict[str, Any]) -> TranslationProcessingModeDraft:
         return cls(
             name=_expect_string(payload, "name"),
             guidance=_expect_string_list(payload, "guidance"),
@@ -403,7 +403,7 @@ class TranslationMappingGroupDraft:
     mappings: list[str]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TranslationMappingGroupDraft":
+    def from_dict(cls, payload: dict[str, Any]) -> TranslationMappingGroupDraft:
         return cls(
             category=_expect_string(payload, "category"),
             mappings=_expect_string_list(payload, "mappings"),
@@ -420,7 +420,7 @@ class TranslationReplyPatternDraft:
     avoid: list[str]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TranslationReplyPatternDraft":
+    def from_dict(cls, payload: dict[str, Any]) -> TranslationReplyPatternDraft:
         return cls(
             scenario=_expect_string(payload, "scenario"),
             preferred=_expect_string_list(payload, "preferred"),
@@ -442,7 +442,7 @@ class TranslationLayerProfileDraft:
     forbidden_patterns: list[str]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TranslationLayerProfileDraft":
+    def from_dict(cls, payload: dict[str, Any]) -> TranslationLayerProfileDraft:
         return cls(
             purpose=_expect_string_list(payload, "purpose"),
             general_principles=_expect_string_list(payload, "general_principles"),
@@ -480,7 +480,7 @@ class CharacterProfileDraft:
     translation_layer: TranslationLayerProfileDraft
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "CharacterProfileDraft":
+    def from_dict(cls, payload: dict[str, Any]) -> CharacterProfileDraft:
         return cls(
             persona=PersonaProfileDraft.from_dict(_expect_dict(payload, "persona")),
             world_state=WorldStateProfileDraft.from_dict(_expect_dict(payload, "world_state")),
@@ -512,7 +512,7 @@ class RelationshipProfileDraft:
     warming_up_path: list[str]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "RelationshipProfileDraft":
+    def from_dict(cls, payload: dict[str, Any]) -> RelationshipProfileDraft:
         return cls(
             setup_statement=_expect_string_list(payload, "setup_statement"),
             relationship_definition=_expect_string_list(payload, "relationship_definition"),
@@ -602,7 +602,7 @@ class ManagedMemoryEntry:
     why_it_matters: str = ""
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ManagedMemoryEntry":
+    def from_dict(cls, payload: dict[str, Any]) -> ManagedMemoryEntry:
         return cls(
             key=_expect_string(payload, "key"),
             content=_expect_string(payload, "content"),
@@ -634,7 +634,7 @@ class ConflictNote:
     occurrence_dates: list[str] = field(default_factory=list)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "ConflictNote":
+    def from_dict(cls, payload: dict[str, Any]) -> ConflictNote:
         source_date = _expect_string(payload, "source_date")
         occurrence_dates_raw = payload.get("occurrence_dates")
         if isinstance(occurrence_dates_raw, list) and occurrence_dates_raw:
@@ -667,7 +667,7 @@ class EpisodeRecord:
     payload: dict[str, Any]
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "EpisodeRecord":
+    def from_dict(cls, payload: dict[str, Any]) -> EpisodeRecord:
         return cls(
             entry_id=_expect_string(payload, "entry_id"),
             batch_id=_expect_string(payload, "batch_id"),

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-
 TEXT_CAPABILITY = "text"
 IMAGE_CAPABILITY = "image"
 

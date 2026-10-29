@@ -5,7 +5,6 @@ from pathlib import Path
 
 from dropline.config import load_settings
 
-
 MINIMAL_CONFIG = """\
 project:
   name: "mail-profile-test"

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 import shutil
+from pathlib import Path
 
 from .config import Settings, load_settings
 from .memory import MemoryManager
 from .profile_manager import list_session_root_dirs
-from .scheduler_install import DEFAULT_SCHEDULER_TASK_NAME, build_scheduler_runtime_paths, uninstall_scheduler
+from .scheduler_install import (
+    DEFAULT_SCHEDULER_TASK_NAME,
+    build_scheduler_runtime_paths,
+    uninstall_scheduler,
+)
 from .storage import StateStore
 from .utils import resolve_path_within_roots
-
 
 LOGGER = logging.getLogger(__name__)
 

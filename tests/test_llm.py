@@ -17,8 +17,8 @@ from dropline.llm import (
     AnthropicBackedClient,
     DeepSeekBackedClient,
     DoubaoBackedClient,
-    GLMBackedClient,
     GeminiBackedClient,
+    GLMBackedClient,
     GrokBackedClient,
     OpenAIBackedClient,
     QwenBackedClient,
@@ -32,8 +32,14 @@ from dropline.llm_contracts import (
     STAGE1_RESPONSE_SCHEMA,
     build_stage2_response_schema,
 )
-from dropline.models import CandidateMemory, ModelValidationError, RelationshipProfileDraft, SceneCard, Stage1Result, Stage2Result
-
+from dropline.models import (
+    CandidateMemory,
+    ModelValidationError,
+    RelationshipProfileDraft,
+    SceneCard,
+    Stage1Result,
+    Stage2Result,
+)
 from tests.helpers import create_test_repo
 
 
