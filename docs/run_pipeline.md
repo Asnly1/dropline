@@ -18,7 +18,7 @@ pipeline_mode: profile_first
 
 1. 静态 prompt 文档只读
 2. LLM 只提候选记忆，代码决定写入
-3. 图片失败会中断本次 run，但不会写坏 memory
+3. 图片失败会中断本次 run（`llm.image.on_failure=text_only` 时降级为纯文本发信），但不会写坏 memory
 4. 所有输入输出必须可归档、可追溯
 
 ## 2. 文档来源
@@ -92,3 +92,11 @@ Stage 2 必须输出：
 - `scene_card`（仅 `llm.image.enabled=true` 时要求；关闭图片时可省略）
 
 `character_episode` 只代表当前角色本次通信留下的短期连续性，不反向改写静态角色 prompt。
+
+## 7. 失败处理
+
+- 失败的 run 在 `runs` 表记录 `error_stage` / `error_message`，并把 kv 里的 `consecutive_failures` 加一、更新 `last_failed_at`；任何一次成功后归零。
+- reply 模式下在 stage1 / stage2 / validation / image 阶段失败，本批来信的 `attempt_count` +1 并记录 `last_error` / `last_attempt_at`；达到 `schedule.max_batch_attempts`（validation 失败为 2）即写 `quarantined_at`，之后不再进入批次，run 回到 initiative 模式。`requeue-inbound --uid N` 清除隔离与计数。
+- 同一 `batch_id` 重试时复用上次失败 run 归档的产物：有 `stage2.json` 则跳过 Stage 1 / Stage 2；只有 `stage1.json` 则只重跑 Stage 2，且不重复写用户侧 episode。
+- 调度器：失败后退避 `schedule.retry_after_minutes` 分钟，每天最多 `schedule.max_runs_per_day` 次调度 run，昨日补发只尝试 1 次；每次 tick 开始时把超过 6 小时仍为 `running` 的 run 标为 `failed`。
+- 连续失败达到 `mail.alerts.after_failures` 或有来信被隔离时，向 `mail.alerts.recipient` 发送主题以 `[dropline] ` 开头的纯文本系统告警（每天最多一封）。

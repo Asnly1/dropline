@@ -47,7 +47,7 @@ flowchart TD
 设计要点:
 
 - **LLM 提议,代码决策**:Stage 1 只输出候选记忆,真正写入哪个文件由本地代码按 [docs/memory_promotion_rules.md](docs/memory_promotion_rules.md) 决定
-- **图片是硬门槛**:若启用图片生成且失败,本轮运行中断,memory 不受污染
+- **图片是硬门槛**:若启用图片生成且失败,本轮运行中断,memory 不受污染(设 `llm.image.on_failure=text_only` 可改为降级成纯文本发信)
 - **归档留痕**:每次运行的输入、Stage 1/2 输出、生成的图片都保存在 `archive/YYYY-MM-DD/run-*/`
 
 > 📬 **看真实运行:** [**examples/conversation_keqing.cn.md**](examples/conversation_keqing.cn.md) 完整走一遍刻晴的 `init-once` 主动来信 + 第一轮一来一回——附每轮真实生成的配图,以及每封回信背后 Stage 1 记忆候选的可折叠「幕后」。([English](examples/conversation_keqing.en.md))
@@ -328,6 +328,51 @@ schtasks /Delete /TN "dropline" /F
 
 ---
 
+## 🛠️ 故障处理与告警
+
+无人值守运行时,dropline 会自己收住常见故障,并在需要人介入时发邮件告诉你。
+
+### 失败后怎么重试
+
+- **先退避,再重试**:一次 run 失败后,调度器至少等 `schedule.retry_after_minutes` 分钟才会再试(tick 日志事件 `skipped_backoff`);每天由调度器触发的 run 不超过 `schedule.max_runs_per_day` 次(`skipped_daily_limit`),手动 `run-once` 不受此限制;"昨日漏发补发"只会尝试 1 次(`catch_up_succeeded` / `catch_up_failed`)。成功一次后连续失败计数归零。
+- **重试复用归档产物**:同一批次(同一 `batch_id`)重试时,若上次失败的 run 已归档 `stage2.json`,直接跳过 Stage 1 / Stage 2 进入配图和发信;若只有 `stage1.json`,则只重跑 Stage 2,且不会重复写入用户侧 episode。日志会写明复用了哪个 run 的产物(`reused_run_id=...`)。
+- **来信隔离**:reply 模式的 run 在 stage1 / stage2 / validation / image 阶段失败时,本批来信的 `attempt_count` +1 并记录 `last_error`;达到 `schedule.max_batch_attempts` 次(Stage 2 校验失败只需 2 次)就被**隔离**(`quarantined_at`)。被隔离的来信不再进入批次,下一次 run 会恢复为主动来信模式,不会让一封坏信卡住整个角色。`show-inbox` 会标出 `QUARANTINED` 和 `last_error`;修好问题后用 `requeue-inbound --uid N` 放回队列,`delete-inbound --uid N` 也可以直接删掉它。
+- **配图降级**:`llm.image.on_failure` 默认 `abort`(保持"图片是硬门槛");设为 `text_only` 时图片生成失败只记 WARNING,并在归档目录写 `image_failure.json`,邮件改为纯文本发送。
+- **僵尸 run 自动收尾**:每次 `scheduler-tick` 开始时,`started_at` 早于 6 小时前且仍为 `running` 的 run 会被自动标为 `failed`(`error_stage=stale_running`);`mark-stale-runs-failed` 仍可手动处理更久远的记录。
+
+### 查看状态
+
+```bash
+python3 -m dropline status --config /绝对/路径/config.yaml
+```
+
+输出当前 session 的最近一次成功 / 失败 run(run_id、阶段、错误信息)、连续失败次数、未消费与已隔离的来信数、pending 出站数、IMAP 游标(`last_seen_uid` / `last_consumed_uid`,以及 kv 里若存在的 `uidvalidity`)、今日调度状态(`scheduled_for_date` / `target_send_time` / `sent_time` / `runs_today`)和最近一次告警时间。
+
+### 告警邮件
+
+连续失败次数达到 `mail.alerts.after_failures`,或有来信被隔离时,dropline 会用角色邮箱给 `mail.alerts.recipient` 发一封**纯文本系统通知**:发件人显示名固定为 `dropline`(不是角色名),主题以 `[dropline] ` 开头,正文写明这是系统通知而非角色来信,包含失败阶段、错误信息和建议的下一步(看 `runtime_logs/`、`dropline status`、`requeue-inbound`)。同一天最多发一封;告警本身发送失败只记日志,不影响主流程。
+
+相关配置项(都有默认值,可省略):
+
+```yaml
+schedule:
+  retry_after_minutes: 120 # 失败后至少等多久再试
+  max_runs_per_day: 3 # 调度器每天最多触发几次 run(run-once 不计)
+  max_batch_attempts: 3 # 同一批来信最多尝试几次,之后隔离(validation 失败 2 次即隔离)
+
+mail:
+  alerts:
+    enabled: true # 告警邮件总开关
+    recipient: "you@example.com" # 默认等于 primary_user_recipient
+    after_failures: 2 # 连续失败几次后告警
+
+llm:
+  image:
+    on_failure: "abort" # abort | text_only
+```
+
+---
+
 ## 🔌 支持的 LLM Provider
 
 | Provider        | 默认文本模型                   | 默认图片模型                 |
@@ -376,10 +421,12 @@ python3 -m dropline
 | `delete-session`                            | 删除目标 session 的 memory/episodes/archive;可用 `--yes` 跳过确认          |
 | `delete-inbound`                            | 删除单条 inbound(`--uid`)或整箱清空(`--all`);可用 `--yes` 跳过确认         |
 | `delete-outbound`                           | 删除单条 outbound(`--message-id`)或整箱清空(`--all`);可用 `--yes` 跳过确认 |
+| `requeue-inbound`                           | 清除一封来信的隔离标记与失败计数(`--uid`),让它重新进入队列                 |
 | `init-state`                                | 初始化当前 active session 的 memory 和 state.db                            |
 | `run-once`                                  | 立即执行一次完整 pipeline                                                  |
 | `scheduler-tick`                            | 执行一次调度检查,到点才跑 pipeline                                         |
 | `mark-stale-runs-failed`                    | 把当前 active session 中超过指定天数仍为 running 的 run 标为 failed        |
+| `status`                                    | 查看当前 session 的最近 run、失败计数、收/发件箱状态与今日调度              |
 | `install-scheduler` / `uninstall-scheduler` | 安装 / 卸载系统定时任务                                                    |
 | `reset-dev-state`                           | 清空所有 session、日志、数据库后按当前 active 重建;可用 `--yes` 跳过确认   |
 

@@ -12,15 +12,18 @@ from dropline.launchd import build_launchd_paths, build_launchd_plist
 from dropline.models import RunOutcome
 from dropline.power import PowerContext
 from dropline.scheduler import (
+    CATCH_UP_ATTEMPTED_FOR_KEY,
     SCHEDULED_FOR_DATE_KEY,
     SENT_TIME_KEY,
     TARGET_PICKED_AT_KEY,
     TARGET_SEND_TIME_KEY,
+    TickResult,
+    execute_scheduler_tick,
     pick_target_send_time,
     run_scheduler_tick,
 )
 from dropline.scheduler_tick import scheduler_tick_command
-from dropline.storage import StateStore
+from dropline.storage import RUNS_TODAY_KEY, StateStore
 
 from tests.helpers import create_test_repo, load_test_settings
 
@@ -65,8 +68,8 @@ class SchedulerTests(unittest.TestCase):
                 "dropline.scheduler_tick.PipelineService",
                 return_value=pipeline,
             ), patch(
-                "dropline.scheduler_tick.run_scheduler_tick",
-                return_value=None,
+                "dropline.scheduler_tick.execute_scheduler_tick",
+                return_value=TickResult(event="skipped"),
             ), patch(
                 "dropline.scheduler_tick.now_in_timezone",
                 side_effect=[started_at, finished_at],
@@ -101,7 +104,7 @@ class SchedulerTests(unittest.TestCase):
 
             def fake_tick(*args, **kwargs):
                 store.set_kv(SENT_TIME_KEY, started_at.isoformat())
-                return pipeline._outcome
+                return TickResult(event="run_succeeded", outcome=pipeline._outcome)
 
             finished_at = started_at + timedelta(seconds=3)
 
@@ -112,7 +115,7 @@ class SchedulerTests(unittest.TestCase):
                 "dropline.scheduler_tick.PipelineService",
                 return_value=pipeline,
             ), patch(
-                "dropline.scheduler_tick.run_scheduler_tick",
+                "dropline.scheduler_tick.execute_scheduler_tick",
                 side_effect=fake_tick,
             ), patch(
                 "dropline.scheduler_tick.now_in_timezone",
@@ -155,7 +158,7 @@ class SchedulerTests(unittest.TestCase):
             ), patch(
                 "dropline.scheduler_tick.PipelineService",
             ) as pipeline_service, patch(
-                "dropline.scheduler_tick.run_scheduler_tick",
+                "dropline.scheduler_tick.execute_scheduler_tick",
             ) as run_tick, patch(
                 "dropline.scheduler_tick.now_in_timezone",
                 side_effect=[started_at, finished_at],
@@ -364,6 +367,289 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(store.get_kv(SCHEDULED_FOR_DATE_KEY), now.date().isoformat())
             self.assertEqual(store.get_kv(TARGET_PICKED_AT_KEY), now.isoformat())
             self.assertEqual(store.get_kv(TARGET_SEND_TIME_KEY), now.replace(hour=22, minute=30).isoformat())
+
+    def _prime_due_state(self, store: StateStore, now: datetime) -> None:
+        store.initialize()
+        store.set_kv(SCHEDULED_FOR_DATE_KEY, now.date().isoformat())
+        store.set_kv(TARGET_PICKED_AT_KEY, now.replace(hour=0, minute=5).isoformat())
+        store.set_kv(TARGET_SEND_TIME_KEY, now.replace(hour=19, minute=30).isoformat())
+
+    def test_execute_scheduler_tick_backs_off_after_recent_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            now = datetime(2026, 4, 2, 20, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+            self._prime_due_state(store, now)
+            store.record_run_failure(failed_at=(now - timedelta(minutes=30)).isoformat())
+            pipeline = _FakePipeline(
+                store,
+                RunOutcome(success=True, run_id="run-backoff", mode="initiative", batch_id="batch-backoff"),
+            )
+
+            with self.assertLogs("dropline.scheduler", level="WARNING") as captured:
+                result = execute_scheduler_tick(settings, pipeline, now=now)
+
+            self.assertEqual(result.event, "skipped_backoff")
+            self.assertIsNone(result.outcome)
+            self.assertEqual(pipeline.run_count, 0)
+            self.assertEqual(store.get_runs_today(now.date()), 0)
+            self.assertFalse(store.get_kv(SENT_TIME_KEY))
+            self.assertIn("backing off after 1 consecutive failure(s)", "\n".join(captured.output))
+
+            later = now + timedelta(hours=2)
+            result = execute_scheduler_tick(settings, pipeline, now=later)
+
+            self.assertEqual(result.event, "run_succeeded")
+            self.assertEqual(result.outcome, pipeline._outcome)
+            self.assertEqual(pipeline.run_count, 1)
+            self.assertEqual(store.get_runs_today(now.date()), 1)
+            self.assertEqual(store.get_kv(SENT_TIME_KEY), later.isoformat())
+
+    def test_execute_scheduler_tick_enforces_daily_run_limit_per_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            now = datetime(2026, 4, 2, 20, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+            self._prime_due_state(store, now)
+            for _ in range(3):
+                store.increment_runs_today(now.date())
+            pipeline = _FakePipeline(
+                store,
+                RunOutcome(success=True, run_id="run-limit", mode="initiative", batch_id="batch-limit"),
+            )
+
+            result = execute_scheduler_tick(settings, pipeline, now=now)
+
+            self.assertEqual(result.event, "skipped_daily_limit")
+            self.assertIsNone(result.outcome)
+            self.assertEqual(pipeline.run_count, 0)
+            self.assertFalse(store.get_kv(SENT_TIME_KEY))
+
+            store.set_kv(RUNS_TODAY_KEY, "2026-04-01:3")
+            result = execute_scheduler_tick(settings, pipeline, now=now)
+
+            self.assertEqual(result.event, "run_succeeded")
+            self.assertEqual(pipeline.run_count, 1)
+            self.assertEqual(store.get_runs_today(now.date()), 1)
+
+    def test_execute_scheduler_tick_reports_failed_run_and_counts_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            now = datetime(2026, 4, 2, 20, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+            self._prime_due_state(store, now)
+            pipeline = _FakePipeline(
+                store,
+                RunOutcome(
+                    success=False,
+                    run_id="run-broken",
+                    mode="reply",
+                    batch_id="batch-broken",
+                    error_stage="stage2",
+                    message="boom",
+                ),
+            )
+
+            with self.assertLogs("dropline.scheduler", level="ERROR") as captured:
+                result = execute_scheduler_tick(settings, pipeline, now=now)
+
+            self.assertEqual(result.event, "run_failed")
+            self.assertEqual(result.outcome, pipeline._outcome)
+            self.assertEqual(pipeline.run_count, 1)
+            self.assertEqual(store.get_runs_today(now.date()), 1)
+            self.assertFalse(store.get_kv(SENT_TIME_KEY))
+            self.assertIn("Scheduled run failed at stage2: boom", "\n".join(captured.output))
+
+    def test_execute_scheduler_tick_attempts_catch_up_only_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            now = datetime(2026, 4, 5, 1, 3, tzinfo=ZoneInfo("America/Los_Angeles"))
+            yesterday = now.date() - timedelta(days=1)
+            store.set_kv(SCHEDULED_FOR_DATE_KEY, yesterday.isoformat())
+            store.set_kv(TARGET_PICKED_AT_KEY, datetime(2026, 4, 4, 0, 28, tzinfo=now.tzinfo).isoformat())
+            store.set_kv(TARGET_SEND_TIME_KEY, datetime(2026, 4, 4, 22, 32, tzinfo=now.tzinfo).isoformat())
+            pipeline = _FakePipeline(
+                store,
+                RunOutcome(
+                    success=False,
+                    run_id="run-catch-up",
+                    mode="initiative",
+                    batch_id="batch-catch-up",
+                    error_stage="stage2",
+                    message="boom",
+                ),
+            )
+
+            first = execute_scheduler_tick(settings, pipeline, now=now)
+
+            self.assertEqual(first.event, "catch_up_failed")
+            self.assertEqual(first.outcome, pipeline._outcome)
+            self.assertEqual(pipeline.run_count, 1)
+            self.assertEqual(store.get_kv(CATCH_UP_ATTEMPTED_FOR_KEY), yesterday.isoformat())
+            self.assertEqual(store.get_runs_today(now.date()), 1)
+            self.assertFalse(store.get_kv(SENT_TIME_KEY))
+
+            with patch(
+                "dropline.scheduler.pick_target_send_time",
+                return_value=now.replace(hour=22, minute=0),
+            ), self.assertLogs("dropline.scheduler", level="WARNING") as captured:
+                second = execute_scheduler_tick(settings, pipeline, now=now + timedelta(minutes=30))
+
+            self.assertEqual(second.event, "picked_today_target")
+            self.assertIsNone(second.outcome)
+            self.assertEqual(pipeline.run_count, 1)
+            self.assertEqual(store.get_kv(SCHEDULED_FOR_DATE_KEY), now.date().isoformat())
+            self.assertIn("skipped catch-up for 2026-04-04", "\n".join(captured.output))
+
+    def test_execute_scheduler_tick_reports_catch_up_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            now = datetime(2026, 4, 5, 1, 3, tzinfo=ZoneInfo("America/Los_Angeles"))
+            yesterday = now.date() - timedelta(days=1)
+            store.set_kv(SCHEDULED_FOR_DATE_KEY, yesterday.isoformat())
+            store.set_kv(TARGET_PICKED_AT_KEY, datetime(2026, 4, 4, 0, 28, tzinfo=now.tzinfo).isoformat())
+            store.set_kv(TARGET_SEND_TIME_KEY, datetime(2026, 4, 4, 22, 32, tzinfo=now.tzinfo).isoformat())
+            pipeline = _FakePipeline(
+                store,
+                RunOutcome(success=True, run_id="run-catch-up-ok", mode="initiative", batch_id="batch-catch-up-ok"),
+            )
+
+            result = execute_scheduler_tick(settings, pipeline, now=now)
+
+            self.assertEqual(result.event, "catch_up_succeeded")
+            self.assertEqual(result.outcome, pipeline._outcome)
+            self.assertEqual(store.get_kv(SENT_TIME_KEY), now.isoformat())
+            self.assertEqual(store.get_kv(CATCH_UP_ATTEMPTED_FOR_KEY), yesterday.isoformat())
+            self.assertEqual(store.get_runs_today(now.date()), 1)
+
+    def test_execute_scheduler_tick_marks_stale_running_runs_failed_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            now = datetime(2026, 4, 2, 20, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+            store.start_run("run-stale", (now - timedelta(hours=7)).isoformat())
+            store.start_run("run-fresh", (now - timedelta(hours=1)).isoformat())
+            pipeline = _FakePipeline(
+                store,
+                RunOutcome(success=True, run_id="run-after-stale", mode="initiative", batch_id="batch-after-stale"),
+            )
+
+            with patch(
+                "dropline.scheduler.pick_target_send_time",
+                return_value=now.replace(hour=23, minute=0),
+            ), self.assertLogs("dropline.scheduler", level="WARNING") as captured:
+                result = execute_scheduler_tick(settings, pipeline, now=now)
+
+            self.assertEqual(result.event, "picked_today_target")
+            self.assertEqual(pipeline.run_count, 0)
+            stale_run = store.get_run("run-stale")
+            fresh_run = store.get_run("run-fresh")
+            self.assertEqual(stale_run.status, "failed")
+            self.assertEqual(stale_run.error_stage, "stale_running")
+            self.assertEqual(stale_run.finished_at, now.isoformat())
+            self.assertEqual(fresh_run.status, "running")
+            self.assertIn("Marked stale running run as failed: run_id=run-stale", "\n".join(captured.output))
+
+    def test_run_scheduler_tick_wrapper_returns_only_the_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            now = datetime(2026, 4, 2, 20, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+            self._prime_due_state(store, now)
+            pipeline = _FakePipeline(
+                store,
+                RunOutcome(success=True, run_id="run-wrapper", mode="initiative", batch_id="batch-wrapper"),
+            )
+
+            outcome = run_scheduler_tick(settings, pipeline, now=now)
+
+            self.assertEqual(outcome, pipeline._outcome)
+            self.assertEqual(store.get_runs_today(now.date()), 1)
+
+    def test_scheduler_tick_command_logs_guard_and_catch_up_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            pipeline = _FakePipeline(
+                store,
+                RunOutcome(success=True, run_id="run-unused", mode="initiative", batch_id="batch-unused"),
+            )
+            started_at = datetime(2026, 4, 5, 20, 8, tzinfo=ZoneInfo("America/Los_Angeles"))
+            finished_at = started_at + timedelta(seconds=1)
+            cases = (
+                (TickResult(event="skipped_backoff", detail="2026-04-05T22:00:00-07:00"), 0, ["event=skipped_backoff"]),
+                (TickResult(event="skipped_daily_limit", detail="3"), 0, ["event=skipped_daily_limit"]),
+                (
+                    TickResult(
+                        event="catch_up_failed",
+                        outcome=RunOutcome(
+                            success=False,
+                            run_id="run-cu",
+                            mode="initiative",
+                            batch_id="batch-cu",
+                            error_stage="stage2",
+                            message="boom",
+                        ),
+                    ),
+                    1,
+                    ["event=catch_up_failed", "run_id=run-cu", "error_stage=stage2", "message=boom"],
+                ),
+                (
+                    TickResult(
+                        event="catch_up_succeeded",
+                        outcome=RunOutcome(success=True, run_id="run-cu", mode="initiative", batch_id="batch-cu"),
+                    ),
+                    0,
+                    ["event=catch_up_succeeded", "run_id=run-cu"],
+                ),
+            )
+
+            for result, expected_exit_code, expected_fragments in cases:
+                with self.subTest(event=result.event), patch(
+                    "dropline.scheduler_tick.load_settings",
+                    return_value=settings,
+                ), patch(
+                    "dropline.scheduler_tick.PipelineService",
+                    return_value=pipeline,
+                ), patch(
+                    "dropline.scheduler_tick.execute_scheduler_tick",
+                    return_value=result,
+                ), patch(
+                    "dropline.scheduler_tick.now_in_timezone",
+                    side_effect=[started_at, finished_at],
+                ), patch(
+                    "dropline.scheduler_tick.time.perf_counter",
+                    side_effect=[1.0, 2.0],
+                ), self.assertLogs("dropline.scheduler_tick", level="INFO") as captured:
+                    exit_code = scheduler_tick_command(str(root / "config.yaml"))
+
+                self.assertEqual(exit_code, expected_exit_code)
+                output = "\n".join(captured.output)
+                for fragment in expected_fragments:
+                    self.assertIn(fragment, output)
+                self.assertIn("runs_today=", output)
+                self.assertIn("consecutive_failures=", output)
 
     def test_build_launchd_plist_uses_absolute_paths(self) -> None:
         repo_root = Path("/tmp/dropline")

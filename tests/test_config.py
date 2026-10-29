@@ -410,6 +410,82 @@ class ConfigTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "schedule.check_every_minutes"):
                         load_settings(config_path)
 
+    def test_load_settings_applies_failure_handling_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir).resolve()
+            create_test_repo(root)
+
+            settings = load_test_settings(root)
+
+        self.assertEqual(settings.schedule.retry_after_minutes, 120)
+        self.assertEqual(settings.schedule.max_runs_per_day, 3)
+        self.assertEqual(settings.schedule.max_batch_attempts, 3)
+        self.assertTrue(settings.mail.alerts.enabled)
+        self.assertEqual(settings.mail.alerts.recipient, "user@example.com")
+        self.assertEqual(settings.mail.alerts.after_failures, 2)
+        self.assertEqual(settings.llm.image.on_failure, "abort")
+
+    def test_load_settings_reads_failure_handling_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir).resolve()
+            create_test_repo(root)
+            config_path = root / "config.yaml"
+            payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            payload["schedule"].update({"retry_after_minutes": 45, "max_runs_per_day": 5, "max_batch_attempts": 1})
+            payload["mail"]["alerts"] = {"enabled": False, "recipient": "ops@example.com", "after_failures": 4}
+            payload["llm"]["image"]["on_failure"] = "TEXT_ONLY"
+            config_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+            settings = load_settings(config_path)
+
+        self.assertEqual(settings.schedule.retry_after_minutes, 45)
+        self.assertEqual(settings.schedule.max_runs_per_day, 5)
+        self.assertEqual(settings.schedule.max_batch_attempts, 1)
+        self.assertFalse(settings.mail.alerts.enabled)
+        self.assertEqual(settings.mail.alerts.recipient, "ops@example.com")
+        self.assertEqual(settings.mail.alerts.after_failures, 4)
+        self.assertEqual(settings.llm.image.on_failure, "text_only")
+
+    def test_load_settings_rejects_invalid_failure_handling_values(self) -> None:
+        cases = (
+            (("schedule", "retry_after_minutes"), 0, "schedule.retry_after_minutes"),
+            (("schedule", "max_runs_per_day"), "3", "schedule.max_runs_per_day"),
+            (("schedule", "max_batch_attempts"), -1, "schedule.max_batch_attempts"),
+            (("mail", "alerts"), "yes", "mail.alerts"),
+            (("mail", "alerts", "enabled"), "true", "mail.alerts.enabled"),
+            (("mail", "alerts", "after_failures"), 0, "mail.alerts.after_failures"),
+            (("mail", "alerts", "recipient"), "", "mail.alerts.recipient"),
+            (("llm", "image", "on_failure"), "retry", "llm.image.on_failure"),
+        )
+        for keys, value, expected_path in cases:
+            with self.subTest(path=expected_path), tempfile.TemporaryDirectory() as tmp_dir:
+                root = Path(tmp_dir).resolve()
+                create_test_repo(root)
+                config_path = root / "config.yaml"
+                payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                target = payload
+                for key in keys[:-1]:
+                    target = target.setdefault(key, {})
+                target[keys[-1]] = value
+                config_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, expected_path):
+                    load_settings(config_path)
+
+    def test_validate_live_settings_requires_alert_recipient_only_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir).resolve()
+            create_test_repo(root)
+            config_path = root / "config.yaml"
+            payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            payload["mail"]["alerts"] = {"recipient": "REPLACE_ME_ALERT_RECIPIENT"}
+            config_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "mail.alerts.recipient"):
+                validate_live_settings(load_settings(config_path))
+
+            payload["mail"]["alerts"]["enabled"] = False
+            config_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            validate_live_settings(load_settings(config_path))
+
 
 if __name__ == "__main__":
     unittest.main()

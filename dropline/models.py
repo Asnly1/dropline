@@ -543,6 +543,10 @@ class StoredInboundMessage:
     relationship_slug: str
     consumed_batch_id: str | None = None
     thread_message_id: str | None = None
+    attempt_count: int = 0
+    last_error: str | None = None
+    last_attempt_at: str | None = None
+    quarantined_at: str | None = None
 
 
 @dataclass(slots=True)
@@ -573,6 +577,7 @@ class StoredRun:
     stage2_path: str | None
     character_slug: str
     relationship_slug: str
+    error_message: str | None = None
 
 
 @dataclass(slots=True)

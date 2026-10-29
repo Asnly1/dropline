@@ -8,11 +8,18 @@ schedule:
   window_end: "23:59"
   daily_target_pick_time: "00:05"
   check_every_minutes: 30
+  retry_after_minutes: 120
+  max_runs_per_day: 3
+  max_batch_attempts: 3
 
 mail:
   allowlist_senders:
     - "user@example.com"
   primary_user_recipient: "user@example.com"
+  alerts:
+    enabled: true
+    recipient: "user@example.com"
+    after_failures: 2
   character_mailbox:
     address: "character@example.com"
     imap:
@@ -41,6 +48,7 @@ llm:
   image:
     enabled: true
     provider: "openai"
+    on_failure: "abort"
 
 openai:
   api_key: "REPLACE_ME_OPENAI_API_KEY"

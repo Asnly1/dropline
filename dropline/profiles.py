@@ -11,7 +11,7 @@ from .documents import read_optional_text
 from .llm import build_profile_generation_client
 from .llm_contracts import CHINESE_OUTPUT_LANGUAGE, ENGLISH_OUTPUT_LANGUAGE
 from .memory import MemoryManager
-from .models import CharacterProfileDraft, RelationshipProfileDraft
+from .models import CharacterProfileDraft, RelationshipProfileDraft, StoredInboundMessage
 from .provider_registry import get_provider_text_model
 from .profile_manager import (
     CharacterProfileMeta,
@@ -914,9 +914,10 @@ def show_inbox(
         character_slug_value=character_slug_value,
         relationship_slug_value=relationship_slug_value,
     )
-    messages = store.list_unconsumed_inbound(limit=limit)
+    messages = store.list_unconsumed_inbound(limit=limit, include_quarantined=True)
     print(f"Session: {_session_label(character, relationship)} ({'ready' if session is not None else 'missing'})")
     print(f"Unconsumed inbound: {store.count_unconsumed_inbound()}")
+    print(f"Quarantined inbound: {store.count_quarantined_inbound()}")
     if not messages:
         print("Messages: none")
         return 0
@@ -924,9 +925,20 @@ def show_inbox(
     for message in messages:
         print(
             f"  - uid={message.imap_uid} received_at={message.received_at} "
-            f"from={message.from_email} subject={message.subject}"
+            f"from={message.from_email} subject={message.subject}{_format_inbound_attempt_state(message)}"
         )
     return 0
+
+
+def _format_inbound_attempt_state(message: StoredInboundMessage) -> str:
+    if message.quarantined_at is None and message.attempt_count == 0:
+        return ""
+    state = f" attempts={message.attempt_count}"
+    if message.quarantined_at is not None:
+        state += f" QUARANTINED quarantined_at={message.quarantined_at}"
+    if message.last_error:
+        state += f" last_error={message.last_error}"
+    return state
 
 
 def show_outbox(

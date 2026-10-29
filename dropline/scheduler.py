@@ -18,6 +18,18 @@ SCHEDULED_FOR_DATE_KEY = "scheduled_for_date"
 TARGET_PICKED_AT_KEY = "target_picked_at"
 TARGET_SEND_TIME_KEY = "target_send_time"
 SENT_TIME_KEY = "sent_time"
+CATCH_UP_ATTEMPTED_FOR_KEY = "catch_up_attempted_for"
+# Runs still marked "running" after this long were killed mid-way (power loss, SIGKILL) and are closed as failed.
+STALE_RUN_MAX_AGE_HOURS = 6
+
+EVENT_SKIPPED = "skipped"
+EVENT_SKIPPED_BACKOFF = "skipped_backoff"
+EVENT_SKIPPED_DAILY_LIMIT = "skipped_daily_limit"
+EVENT_PICKED_TODAY_TARGET = "picked_today_target"
+EVENT_RUN_SUCCEEDED = "run_succeeded"
+EVENT_RUN_FAILED = "run_failed"
+EVENT_CATCH_UP_SUCCEEDED = "catch_up_succeeded"
+EVENT_CATCH_UP_FAILED = "catch_up_failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +38,15 @@ class ScheduleState:
     target_picked_at: datetime | None
     target_send_time: datetime | None
     sent_time: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class TickResult:
+    """What one scheduler tick decided: a stable ``event`` label for logs plus the run outcome, if any."""
+
+    event: str
+    outcome: RunOutcome | None = None
+    detail: str = ""
 
 
 def parse_hhmm(value: str) -> dt_time:
@@ -144,20 +165,94 @@ def pick_target_send_time(settings: Settings, now: datetime) -> datetime:
     return start + timedelta(minutes=rng.randint(0, max(total_minutes, 0)))
 
 
-def run_scheduler_tick(
+def _mark_stale_runs_failed(pipeline: PipelineService, now: datetime) -> None:
+    store = pipeline.dependencies.state_store
+    cutoff = now - timedelta(hours=STALE_RUN_MAX_AGE_HOURS)
+    for run in store.mark_stale_running_runs_failed(cutoff=cutoff, finished_at=now):
+        LOGGER.warning(
+            "Marked stale running run as failed: run_id=%s started_at=%s (older than %s hours).",
+            run.run_id,
+            run.started_at,
+            STALE_RUN_MAX_AGE_HOURS,
+        )
+
+
+def _check_run_guards(settings: Settings, pipeline: PipelineService, now: datetime) -> TickResult | None:
+    """Circuit breaker: back off after failures and cap scheduler-triggered runs per day."""
+    store = pipeline.dependencies.state_store
+    consecutive_failures = store.get_consecutive_failures()
+    if consecutive_failures > 0:
+        last_failed_at = _parse_timestamp(store.get_last_failed_at() or "", now)
+        if last_failed_at is not None:
+            retry_at = last_failed_at + timedelta(minutes=settings.schedule.retry_after_minutes)
+            if now < retry_at:
+                LOGGER.warning(
+                    "Scheduled tick skipped: backing off after %s consecutive failure(s); retry allowed at %s.",
+                    consecutive_failures,
+                    retry_at.isoformat(),
+                )
+                return TickResult(event=EVENT_SKIPPED_BACKOFF, detail=retry_at.isoformat())
+    runs_today = store.get_runs_today(now.date())
+    if runs_today >= settings.schedule.max_runs_per_day:
+        LOGGER.warning(
+            "Scheduled tick skipped: daily run limit reached (%s/%s) for %s.",
+            runs_today,
+            settings.schedule.max_runs_per_day,
+            now.date().isoformat(),
+        )
+        return TickResult(event=EVENT_SKIPPED_DAILY_LIMIT, detail=str(runs_today))
+    return None
+
+
+def _run_scheduled_pipeline(
+    settings: Settings,
+    pipeline: PipelineService,
+    state: ScheduleState,
+    now: datetime,
+    *,
+    catch_up: bool,
+) -> TickResult:
+    guard = _check_run_guards(settings, pipeline, now)
+    if guard is not None:
+        return guard
+    store = pipeline.dependencies.state_store
+    if catch_up:
+        store.set_kv(CATCH_UP_ATTEMPTED_FOR_KEY, state.scheduled_for_date.isoformat())
+    runs_today = store.increment_runs_today(now.date())
+    label = "catch-up" if catch_up else "run"
+    outcome = pipeline.run_once()
+    if outcome.success:
+        _mark_schedule_sent(pipeline, state, now)
+        LOGGER.info("Scheduled %s succeeded: %s (runs_today=%s)", label, outcome.run_id, runs_today)
+        return TickResult(event=EVENT_CATCH_UP_SUCCEEDED if catch_up else EVENT_RUN_SUCCEEDED, outcome=outcome)
+    LOGGER.error(
+        "Scheduled %s failed at %s: %s (runs_today=%s, consecutive_failures=%s)",
+        label,
+        outcome.error_stage,
+        outcome.message,
+        runs_today,
+        store.get_consecutive_failures(),
+    )
+    return TickResult(event=EVENT_CATCH_UP_FAILED if catch_up else EVENT_RUN_FAILED, outcome=outcome)
+
+
+def execute_scheduler_tick(
     settings: Settings,
     pipeline: PipelineService,
     *,
     now: datetime | None = None,
-) -> RunOutcome | None:
+) -> TickResult:
     pipeline.dependencies.state_store.initialize()
     current_now = now or now_in_timezone(settings.project.timezone)
+    _mark_stale_runs_failed(pipeline, current_now)
     if not settings.schedule.enabled:
         LOGGER.info("Scheduled tick skipped: schedule disabled.")
-        return None
+        return TickResult(event=EVENT_SKIPPED)
 
+    store = pipeline.dependencies.state_store
     state = _load_schedule_state(pipeline, current_now)
     yesterday = current_now.date() - timedelta(days=1)
+    picked_today = False
 
     if state and state.scheduled_for_date < current_now.date():
         state_window_end = _window_end(settings, state.scheduled_for_date, current_now.tzinfo)
@@ -168,19 +263,19 @@ def run_scheduler_tick(
             and not _window_crosses_midnight(settings)
             and state.sent_time is None
             and state.target_send_time is not None
+            and store.get_kv(CATCH_UP_ATTEMPTED_FOR_KEY) != state.scheduled_for_date.isoformat()
         ):
             LOGGER.info(
                 "Scheduled tick detected yesterday's missed send for %s; catching up immediately.",
                 yesterday.isoformat(),
             )
-            outcome = pipeline.run_once()
-            if outcome.success:
-                _mark_schedule_sent(pipeline, state, current_now)
-                LOGGER.info("Scheduled catch-up succeeded: %s", outcome.run_id)
-            else:
-                LOGGER.error("Scheduled catch-up failed at %s: %s", outcome.error_stage, outcome.message)
-            return outcome
+            return _run_scheduled_pipeline(settings, pipeline, state, current_now, catch_up=True)
         else:
+            if state.sent_time is None and state.scheduled_for_date == yesterday:
+                LOGGER.warning(
+                    "Scheduled tick skipped catch-up for %s: it was already attempted once or its window has closed.",
+                    state.scheduled_for_date.isoformat(),
+                )
             _clear_schedule_state(pipeline)
             state = None
 
@@ -188,25 +283,30 @@ def run_scheduler_tick(
         state = _pick_schedule_state_for_today(settings, pipeline, current_now)
         if state is None:
             LOGGER.info("Scheduled tick skipped: waiting for daily_target_pick_time.")
-            return None
+            return TickResult(event=EVENT_SKIPPED)
+        picked_today = True
 
     if state.sent_time is not None:
         LOGGER.info("Scheduled tick skipped: schedule for %s already sent.", state.scheduled_for_date.isoformat())
-        return None
+        return TickResult(event=EVENT_SKIPPED)
 
     if state.target_send_time is None:
         LOGGER.info("Scheduled tick skipped: schedule for %s has no target send time.", state.scheduled_for_date.isoformat())
-        return None
+        return TickResult(event=EVENT_SKIPPED)
 
     window_end = _window_end(settings, state.scheduled_for_date, current_now.tzinfo)
     if not (state.target_send_time <= current_now <= window_end):
         LOGGER.info("Scheduled tick skipped: not due yet.")
-        return None
+        return TickResult(event=EVENT_PICKED_TODAY_TARGET if picked_today else EVENT_SKIPPED)
 
-    outcome = pipeline.run_once()
-    if outcome.success:
-        _mark_schedule_sent(pipeline, state, current_now)
-        LOGGER.info("Scheduled run succeeded: %s", outcome.run_id)
-    else:
-        LOGGER.error("Scheduled run failed at %s: %s", outcome.error_stage, outcome.message)
-    return outcome
+    return _run_scheduled_pipeline(settings, pipeline, state, current_now, catch_up=False)
+
+
+def run_scheduler_tick(
+    settings: Settings,
+    pipeline: PipelineService,
+    *,
+    now: datetime | None = None,
+) -> RunOutcome | None:
+    """Compatibility wrapper around ``execute_scheduler_tick`` that only returns the run outcome."""
+    return execute_scheduler_tick(settings, pipeline, now=now).outcome

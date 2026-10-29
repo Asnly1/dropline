@@ -9,6 +9,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from datetime import date as dt_date
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,22 @@ from .utils import ensure_parent, resolve_path_within_roots
 
 OUTBOUND_PENDING = "pending"
 OUTBOUND_SENT = "sent"
+
+CONSECUTIVE_FAILURES_KEY = "consecutive_failures"
+LAST_FAILED_AT_KEY = "last_failed_at"
+RUNS_TODAY_KEY = "runs_today"
+LAST_ALERT_AT_KEY = "last_alert_at"
+INBOUND_LAST_ERROR_MAX_CHARS = 1000
+# Columns added after the first release; applied with ALTER TABLE so existing databases keep their rows.
+INBOUND_MESSAGE_MIGRATION_COLUMNS = {
+    "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+    "last_error": "TEXT",
+    "last_attempt_at": "TEXT",
+    "quarantined_at": "TEXT",
+}
+RUN_MIGRATION_COLUMNS = {
+    "error_message": "TEXT",
+}
 
 LOGGER = logging.getLogger(__name__)
 
@@ -225,6 +242,7 @@ class StateStore:
         finished_at: str,
         *,
         error_stage: str | None = None,
+        error_message: str | None = None,
         stage1_path: str | None = None,
         stage2_path: str | None = None,
     ) -> None:
@@ -233,14 +251,15 @@ class StateStore:
             conn.execute(
                 """
                 UPDATE runs
-                SET finished_at = ?, status = ?, error_stage = ?, stage1_path = COALESCE(?, stage1_path),
-                    stage2_path = COALESCE(?, stage2_path)
+                SET finished_at = ?, status = ?, error_stage = ?, error_message = ?,
+                    stage1_path = COALESCE(?, stage1_path), stage2_path = COALESCE(?, stage2_path)
                 WHERE run_id = ? AND character_slug = ? AND relationship_slug = ?
                 """,
                 (
                     finished_at,
                     status,
                     error_stage,
+                    error_message,
                     stage1_path,
                     stage2_path,
                     run_id,
@@ -256,8 +275,8 @@ class StateStore:
             scope = self._require_scope()
             rows = conn.execute(
                 """
-                SELECT run_id, batch_id, started_at, finished_at, mode, status, error_stage, stage1_path, stage2_path,
-                       character_slug, relationship_slug
+                SELECT run_id, batch_id, started_at, finished_at, mode, status, error_stage, error_message,
+                       stage1_path, stage2_path, character_slug, relationship_slug
                 FROM runs
                 WHERE character_slug = ? AND relationship_slug = ? AND status = 'running'
                 ORDER BY started_at ASC
@@ -277,16 +296,46 @@ class StateStore:
         scope = self._require_scope()
         run_ids = [run.run_id for run in stale_runs]
         placeholders = ",".join("?" for _ in run_ids)
+        error_message = f"Run was still 'running' after the stale cutoff {cutoff.isoformat()}; marked failed."
         with self._connect() as conn:
             conn.execute(
                 (
-                    "UPDATE runs SET status = 'failed', finished_at = ?, error_stage = 'stale_running' "
+                    "UPDATE runs SET status = 'failed', finished_at = ?, error_stage = 'stale_running', "
+                    "error_message = ? "
                     f"WHERE character_slug = ? AND relationship_slug = ? AND status = 'running' "
                     f"AND run_id IN ({placeholders})"
                 ),
-                (finished_at.isoformat(), scope.character_slug, scope.relationship_slug, *run_ids),
+                (finished_at.isoformat(), error_message, scope.character_slug, scope.relationship_slug, *run_ids),
             )
         return stale_runs
+
+    def get_consecutive_failures(self) -> int:
+        value = self.get_kv(CONSECUTIVE_FAILURES_KEY)
+        return int(value) if value else 0
+
+    def get_last_failed_at(self) -> str | None:
+        return self.get_kv(LAST_FAILED_AT_KEY) or None
+
+    def record_run_failure(self, *, failed_at: str) -> int:
+        consecutive_failures = self.get_consecutive_failures() + 1
+        self.set_kv(CONSECUTIVE_FAILURES_KEY, str(consecutive_failures))
+        self.set_kv(LAST_FAILED_AT_KEY, failed_at)
+        return consecutive_failures
+
+    def reset_run_failures(self) -> None:
+        self.set_kv(CONSECUTIVE_FAILURES_KEY, "0")
+        self.set_kv(LAST_FAILED_AT_KEY, "")
+
+    def get_runs_today(self, today: dt_date) -> int:
+        day, _, count = (self.get_kv(RUNS_TODAY_KEY) or "").partition(":")
+        if day != today.isoformat() or not count.isdigit():
+            return 0
+        return int(count)
+
+    def increment_runs_today(self, today: dt_date) -> int:
+        runs_today = self.get_runs_today(today) + 1
+        self.set_kv(RUNS_TODAY_KEY, f"{today.isoformat()}:{runs_today}")
+        return runs_today
 
     def upsert_inbound_message(
         self,
@@ -330,19 +379,38 @@ class StateStore:
                 ),
             )
 
-    def list_unconsumed_inbound(self, *, limit: int | None = None) -> list[StoredInboundMessage]:
+    def list_unconsumed_inbound(
+        self,
+        *,
+        limit: int | None = None,
+        include_quarantined: bool = False,
+    ) -> list[StoredInboundMessage]:
+        """List inbound mail that still needs a reply.
+
+        Quarantined messages (repeated pipeline failures) are excluded unless
+        ``include_quarantined`` is set, so the next run can fall back to initiative mode.
+        """
+        condition = "consumed_batch_id IS NULL"
+        if not include_quarantined:
+            condition += " AND quarantined_at IS NULL"
+        return self._list_inbound_where(condition, limit=limit)
+
+    def list_quarantined_inbound(self, *, limit: int | None = None) -> list[StoredInboundMessage]:
+        return self._list_inbound_where("quarantined_at IS NOT NULL", limit=limit)
+
+    def _list_inbound_where(self, condition: str, *, limit: int | None = None) -> list[StoredInboundMessage]:
         with self._connect() as conn:
             if not self._table_exists(conn, "inbound_messages"):
                 return []
             scope = self._require_scope()
-            query = """
-                SELECT imap_uid, message_id, received_at, from_email, subject, raw_path,
-                       normalized_text_path, body_text, character_slug, relationship_slug,
-                       consumed_batch_id, thread_message_id
-                FROM inbound_messages
-                WHERE character_slug = ? AND relationship_slug = ? AND consumed_batch_id IS NULL
-                ORDER BY imap_uid ASC
-                """
+            query = (
+                "SELECT imap_uid, message_id, received_at, from_email, subject, raw_path, "
+                "normalized_text_path, body_text, character_slug, relationship_slug, "
+                "consumed_batch_id, thread_message_id, attempt_count, last_error, last_attempt_at, quarantined_at "
+                "FROM inbound_messages "
+                f"WHERE character_slug = ? AND relationship_slug = ? AND {condition} "
+                "ORDER BY imap_uid ASC"
+            )
             params: list[object] = [scope.character_slug, scope.relationship_slug]
             if limit is not None:
                 query += " LIMIT ?"
@@ -351,19 +419,87 @@ class StateStore:
         return [self._build_stored_inbound_message(row) for row in rows]
 
     def count_unconsumed_inbound(self) -> int:
+        return self._count_inbound_where("consumed_batch_id IS NULL AND quarantined_at IS NULL")
+
+    def count_quarantined_inbound(self) -> int:
+        return self._count_inbound_where("quarantined_at IS NOT NULL")
+
+    def _count_inbound_where(self, condition: str) -> int:
         with self._connect() as conn:
             if not self._table_exists(conn, "inbound_messages"):
                 return 0
             scope = self._require_scope()
             row = conn.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM inbound_messages
-                WHERE character_slug = ? AND relationship_slug = ? AND consumed_batch_id IS NULL
-                """,
+                (
+                    "SELECT COUNT(*) AS count FROM inbound_messages "
+                    f"WHERE character_slug = ? AND relationship_slug = ? AND {condition}"
+                ),
                 (scope.character_slug, scope.relationship_slug),
             ).fetchone()
             return int(row["count"]) if row else 0
+
+    def record_inbound_attempt_failure(
+        self,
+        imap_uids: list[int],
+        *,
+        error_stage: str,
+        message: str,
+        attempted_at: str,
+        max_attempts: int,
+    ) -> list[int]:
+        """Count one failed processing attempt for a batch; quarantine messages that reached ``max_attempts``.
+
+        Returns the UIDs that were newly quarantined by this call.
+        """
+        if not imap_uids:
+            return []
+        scope = self._require_scope()
+        placeholders = ",".join("?" for _ in imap_uids)
+        last_error = f"{error_stage}: {message}"[:INBOUND_LAST_ERROR_MAX_CHARS]
+        with self._connect() as conn:
+            conn.execute(
+                (
+                    "UPDATE inbound_messages "
+                    "SET attempt_count = attempt_count + 1, last_error = ?, last_attempt_at = ? "
+                    f"WHERE character_slug = ? AND relationship_slug = ? AND imap_uid IN ({placeholders})"
+                ),
+                (last_error, attempted_at, scope.character_slug, scope.relationship_slug, *imap_uids),
+            )
+            rows = conn.execute(
+                (
+                    "SELECT imap_uid FROM inbound_messages "
+                    f"WHERE character_slug = ? AND relationship_slug = ? AND imap_uid IN ({placeholders}) "
+                    "AND quarantined_at IS NULL AND attempt_count >= ? ORDER BY imap_uid ASC"
+                ),
+                (scope.character_slug, scope.relationship_slug, *imap_uids, max_attempts),
+            ).fetchall()
+            quarantined_uids = [int(row["imap_uid"]) for row in rows]
+            if quarantined_uids:
+                quarantine_placeholders = ",".join("?" for _ in quarantined_uids)
+                conn.execute(
+                    (
+                        "UPDATE inbound_messages SET quarantined_at = ? "
+                        f"WHERE character_slug = ? AND relationship_slug = ? AND imap_uid IN ({quarantine_placeholders})"
+                    ),
+                    (attempted_at, scope.character_slug, scope.relationship_slug, *quarantined_uids),
+                )
+        return quarantined_uids
+
+    def requeue_inbound_message(self, imap_uid: int) -> bool:
+        """Clear quarantine and attempt bookkeeping so the message is processed again."""
+        scope = self._require_scope()
+        with self._connect() as conn:
+            if not self._table_exists(conn, "inbound_messages"):
+                return False
+            updated = conn.execute(
+                """
+                UPDATE inbound_messages
+                SET attempt_count = 0, last_error = NULL, last_attempt_at = NULL, quarantined_at = NULL
+                WHERE character_slug = ? AND relationship_slug = ? AND imap_uid = ?
+                """,
+                (scope.character_slug, scope.relationship_slug, imap_uid),
+            ).rowcount
+        return updated > 0
 
     def mark_inbound_consumed(self, imap_uids: list[int], batch_id: str) -> None:
         if not imap_uids:
@@ -564,6 +700,21 @@ class StateStore:
         latest_row = max(rows, key=lambda row: datetime.fromisoformat(str(row["sent_at"])))
         return self._build_stored_outbound_message(latest_row)
 
+    def count_pending_outbound(self) -> int:
+        with self._connect() as conn:
+            if not self._table_exists(conn, "outbound_messages"):
+                return 0
+            scope = self._require_scope()
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM outbound_messages
+                WHERE character_slug = ? AND relationship_slug = ? AND delivery_status = ?
+                """,
+                (scope.character_slug, scope.relationship_slug, OUTBOUND_PENDING),
+            ).fetchone()
+            return int(row["count"]) if row else 0
+
     def delete_outbound_message(self, message_id: str) -> bool:
         scope = self._require_scope()
         with self._connect() as conn:
@@ -655,8 +806,8 @@ class StateStore:
             scope = self._require_scope()
             rows = conn.execute(
                 """
-                SELECT run_id, batch_id, started_at, finished_at, mode, status, error_stage, stage1_path, stage2_path,
-                       character_slug, relationship_slug
+                SELECT run_id, batch_id, started_at, finished_at, mode, status, error_stage, error_message,
+                       stage1_path, stage2_path, character_slug, relationship_slug
                 FROM runs
                 WHERE character_slug = ? AND relationship_slug = ?
                 """,
@@ -672,8 +823,8 @@ class StateStore:
             scope = self._require_scope()
             row = conn.execute(
                 """
-                SELECT run_id, batch_id, started_at, finished_at, mode, status, error_stage, stage1_path, stage2_path,
-                       character_slug, relationship_slug
+                SELECT run_id, batch_id, started_at, finished_at, mode, status, error_stage, error_message,
+                       stage1_path, stage2_path, character_slug, relationship_slug
                 FROM runs
                 WHERE run_id = ? AND character_slug = ? AND relationship_slug = ?
                 LIMIT 1
@@ -681,6 +832,31 @@ class StateStore:
                 (run_id, scope.character_slug, scope.relationship_slug),
             ).fetchone()
         return self._build_stored_run(row) if row else None
+
+    def get_latest_run(self, *, status: str) -> StoredRun | None:
+        runs = self._list_runs_where("status = ?", (status,))
+        return runs[0] if runs else None
+
+    def get_latest_failed_run_for_batch(self, batch_id: str) -> StoredRun | None:
+        runs = self._list_runs_where("status = 'failed' AND batch_id = ?", (batch_id,))
+        return runs[0] if runs else None
+
+    def _list_runs_where(self, condition: str, params: tuple[object, ...]) -> list[StoredRun]:
+        """Scoped runs matching ``condition``, newest ``started_at`` first (sorted as real instants, not strings)."""
+        with self._connect() as conn:
+            if not self._table_exists(conn, "runs"):
+                return []
+            scope = self._require_scope()
+            rows = conn.execute(
+                (
+                    "SELECT run_id, batch_id, started_at, finished_at, mode, status, error_stage, error_message, "
+                    "stage1_path, stage2_path, character_slug, relationship_slug "
+                    f"FROM runs WHERE character_slug = ? AND relationship_slug = ? AND {condition}"
+                ),
+                (scope.character_slug, scope.relationship_slug, *params),
+            ).fetchall()
+        rows = sorted(rows, key=lambda row: datetime.fromisoformat(str(row["started_at"])), reverse=True)
+        return [self._build_stored_run(row) for row in rows]
 
     def list_recent_outbound_messages(self, *, limit: int = 5) -> list[StoredOutboundMessage]:
         with self._connect() as conn:
@@ -975,7 +1151,18 @@ class StateStore:
             );
             """
         )
+        self._ensure_columns(conn, "inbound_messages", INBOUND_MESSAGE_MIGRATION_COLUMNS)
+        self._ensure_columns(conn, "runs", RUN_MIGRATION_COLUMNS)
         self._ensure_indexes(conn)
+
+    def _ensure_columns(self, conn: sqlite3.Connection, table_name: str, columns: dict[str, str]) -> None:
+        """Add missing columns in place (ALTER TABLE ADD COLUMN) without rebuilding the table."""
+        existing = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table_name})")}
+        for column_name, definition in columns.items():
+            if column_name in existing:
+                continue
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+            LOGGER.info("Migrated table %s: added column %s", table_name, column_name)
 
     def _ensure_indexes(self, conn: sqlite3.Connection) -> None:
         conn.executescript(
@@ -1045,6 +1232,10 @@ class StateStore:
             relationship_slug=str(row["relationship_slug"]),
             consumed_batch_id=str(row["consumed_batch_id"]) if row["consumed_batch_id"] else None,
             thread_message_id=str(row["thread_message_id"]) if row["thread_message_id"] else None,
+            attempt_count=int(_optional_row_text(row, "attempt_count") or 0),
+            last_error=_optional_row_text(row, "last_error"),
+            last_attempt_at=_optional_row_text(row, "last_attempt_at"),
+            quarantined_at=_optional_row_text(row, "quarantined_at"),
         )
 
     def _build_stored_outbound_message(self, row: sqlite3.Row) -> StoredOutboundMessage:
@@ -1075,6 +1266,7 @@ class StateStore:
             stage2_path=str(row["stage2_path"]) if row["stage2_path"] else None,
             character_slug=str(row["character_slug"]),
             relationship_slug=str(row["relationship_slug"]),
+            error_message=_optional_row_text(row, "error_message"),
         )
 
     def _build_stored_asset(self, row: sqlite3.Row) -> StoredAsset:
@@ -1099,6 +1291,15 @@ class StateStore:
                 yield conn
         finally:
             conn.close()
+
+
+def _optional_row_text(row: sqlite3.Row, column: str) -> str | None:
+    """Read a nullable column that older databases or narrower SELECTs may not carry."""
+    columns = row.keys()
+    if column not in columns:
+        return None
+    value = row[column]
+    return str(value) if value is not None and value != "" else None
 
 
 def _parse_run_started_at(value: str, cutoff: datetime) -> datetime:

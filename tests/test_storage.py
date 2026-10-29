@@ -3,13 +3,13 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 from dropline.models import NormalizedInboundMessage
-from dropline.storage import SessionScope, StateStore
+from dropline.storage import RUNS_TODAY_KEY, SessionScope, StateStore
 
 from tests.helpers import create_test_repo, load_test_settings
 
@@ -844,6 +844,341 @@ class StateStoreTests(unittest.TestCase):
 
             recent = store.list_recent_assets(limit=1)
             self.assertEqual([item.asset_id for item in recent], ["asset-pst"])
+
+    def _inbound(self, uid: int, subject: str) -> NormalizedInboundMessage:
+        return NormalizedInboundMessage(
+            message_id=f"<uid-{uid}@example.com>",
+            imap_uid=uid,
+            from_email="user@example.com",
+            subject=subject,
+            received_at="2026-04-01T12:00:00+00:00",
+            body_text=subject,
+            body_html_present=False,
+            attachments=[],
+        )
+
+    def test_initialize_migrates_old_schema_in_place_and_keeps_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+
+            conn = sqlite3.connect(settings.storage.sqlite_path)
+            conn.executescript(
+                """
+                CREATE TABLE inbound_messages (
+                    imap_uid INTEGER NOT NULL,
+                    message_id TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    from_email TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    raw_path TEXT NOT NULL,
+                    normalized_text_path TEXT NOT NULL,
+                    body_text TEXT NOT NULL,
+                    thread_message_id TEXT,
+                    consumed_batch_id TEXT,
+                    character_slug TEXT NOT NULL,
+                    relationship_slug TEXT NOT NULL,
+                    PRIMARY KEY(character_slug, relationship_slug, imap_uid)
+                );
+                CREATE TABLE runs (
+                    run_id TEXT PRIMARY KEY,
+                    batch_id TEXT,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error_stage TEXT,
+                    stage1_path TEXT,
+                    stage2_path TEXT,
+                    character_slug TEXT NOT NULL,
+                    relationship_slug TEXT NOT NULL
+                );
+                INSERT INTO inbound_messages VALUES (
+                    5, '<old@example.com>', '2026-04-01T12:00:00+00:00', 'user@example.com', 'old subject',
+                    '/tmp/old.eml', '', 'old body', NULL, NULL, 'keqing', 'childhood-friends'
+                );
+                INSERT INTO runs VALUES (
+                    'run-old', 'batch-old', '2026-04-01T13:00:00+00:00', '2026-04-01T13:01:00+00:00', 'reply',
+                    'failed', 'stage2', NULL, NULL, 'keqing', 'childhood-friends'
+                );
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            store = StateStore(settings)
+            store.initialize()
+            store.initialize()
+
+            conn = sqlite3.connect(settings.storage.sqlite_path)
+            inbound_columns = {row[1] for row in conn.execute("PRAGMA table_info(inbound_messages)")}
+            runs_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+            conn.close()
+
+            self.assertTrue({"attempt_count", "last_error", "last_attempt_at", "quarantined_at"}.issubset(inbound_columns))
+            self.assertIn("error_message", runs_columns)
+            messages = store.list_unconsumed_inbound()
+            self.assertEqual([item.imap_uid for item in messages], [5])
+            self.assertEqual(messages[0].subject, "old subject")
+            self.assertEqual(messages[0].attempt_count, 0)
+            self.assertIsNone(messages[0].last_error)
+            self.assertIsNone(messages[0].quarantined_at)
+            old_run = store.get_run("run-old")
+            self.assertEqual(old_run.error_stage, "stage2")
+            self.assertIsNone(old_run.error_message)
+
+    def test_inbound_attempt_failures_quarantine_after_max_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            store.upsert_inbound_message(self._inbound(1, "first"), raw_path=root / "first.eml")
+            store.upsert_inbound_message(self._inbound(2, "second"), raw_path=root / "second.eml")
+
+            first_quarantined = store.record_inbound_attempt_failure(
+                [1, 2],
+                error_stage="stage2",
+                message="boom",
+                attempted_at="2026-04-01T20:00:00+00:00",
+                max_attempts=2,
+            )
+
+            self.assertEqual(first_quarantined, [])
+            self.assertEqual(
+                [
+                    (item.imap_uid, item.attempt_count, item.last_error, item.last_attempt_at, item.quarantined_at)
+                    for item in store.list_unconsumed_inbound()
+                ],
+                [
+                    (1, 1, "stage2: boom", "2026-04-01T20:00:00+00:00", None),
+                    (2, 1, "stage2: boom", "2026-04-01T20:00:00+00:00", None),
+                ],
+            )
+
+            second_quarantined = store.record_inbound_attempt_failure(
+                [1],
+                error_stage="validation",
+                message="x" * 2000,
+                attempted_at="2026-04-01T21:00:00+00:00",
+                max_attempts=2,
+            )
+
+            self.assertEqual(second_quarantined, [1])
+            self.assertEqual([item.imap_uid for item in store.list_unconsumed_inbound()], [2])
+            self.assertEqual([item.imap_uid for item in store.list_unconsumed_inbound(include_quarantined=True)], [1, 2])
+            self.assertEqual([item.imap_uid for item in store.list_quarantined_inbound()], [1])
+            self.assertEqual(store.count_unconsumed_inbound(), 1)
+            self.assertEqual(store.count_quarantined_inbound(), 1)
+            quarantined = store.list_quarantined_inbound()[0]
+            self.assertEqual(quarantined.attempt_count, 2)
+            self.assertEqual(quarantined.quarantined_at, "2026-04-01T21:00:00+00:00")
+            self.assertEqual(quarantined.last_attempt_at, "2026-04-01T21:00:00+00:00")
+            self.assertTrue(quarantined.last_error.startswith("validation: xxx"))
+            self.assertEqual(len(quarantined.last_error), 1000)
+
+            self.assertEqual(
+                store.record_inbound_attempt_failure(
+                    [1],
+                    error_stage="stage2",
+                    message="again",
+                    attempted_at="2026-04-01T22:00:00+00:00",
+                    max_attempts=2,
+                ),
+                [],
+            )
+            self.assertEqual(store.list_quarantined_inbound()[0].quarantined_at, "2026-04-01T21:00:00+00:00")
+            self.assertEqual(
+                store.record_inbound_attempt_failure(
+                    [],
+                    error_stage="stage2",
+                    message="noop",
+                    attempted_at="2026-04-01T22:00:00+00:00",
+                    max_attempts=2,
+                ),
+                [],
+            )
+
+    def test_requeue_inbound_message_clears_quarantine_and_counters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            store.upsert_inbound_message(self._inbound(1, "first"), raw_path=root / "first.eml")
+            store.record_inbound_attempt_failure(
+                [1],
+                error_stage="stage2",
+                message="boom",
+                attempted_at="2026-04-01T20:00:00+00:00",
+                max_attempts=1,
+            )
+            self.assertEqual(store.list_unconsumed_inbound(), [])
+
+            self.assertTrue(store.requeue_inbound_message(1))
+            self.assertFalse(store.requeue_inbound_message(99))
+
+            messages = store.list_unconsumed_inbound()
+            self.assertEqual([item.imap_uid for item in messages], [1])
+            self.assertEqual(messages[0].attempt_count, 0)
+            self.assertIsNone(messages[0].last_error)
+            self.assertIsNone(messages[0].last_attempt_at)
+            self.assertIsNone(messages[0].quarantined_at)
+            self.assertEqual(store.count_quarantined_inbound(), 0)
+
+    def test_delete_inbound_message_removes_quarantined_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            raw_path = settings.documents.session_archive_dir / "quarantined.eml"
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_path.write_text("raw", encoding="utf-8")
+            store.upsert_inbound_message(self._inbound(1, "first"), raw_path=raw_path)
+            store.record_inbound_attempt_failure(
+                [1],
+                error_stage="image",
+                message="boom",
+                attempted_at="2026-04-01T20:00:00+00:00",
+                max_attempts=1,
+            )
+            self.assertEqual(store.count_quarantined_inbound(), 1)
+
+            self.assertTrue(store.delete_inbound_message(1))
+
+            self.assertFalse(raw_path.exists())
+            self.assertEqual(store.count_quarantined_inbound(), 0)
+            self.assertEqual(store.list_unconsumed_inbound(include_quarantined=True), [])
+
+    def test_finish_run_stores_error_message_and_latest_run_lookups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            store.start_run("run-1", "2026-04-01T13:00:00+00:00")
+            store.update_run_context("run-1", "reply", "batch-x")
+            store.finish_run("run-1", "success", "2026-04-01T13:01:00+00:00")
+            store.start_run("run-2", "2026-04-02T13:00:00+00:00")
+            store.update_run_context("run-2", "reply", "batch-x")
+            store.finish_run(
+                "run-2",
+                "failed",
+                "2026-04-02T13:01:00+00:00",
+                error_stage="stage2",
+                error_message="boom",
+                stage1_path="/archive/run-2/stage1.json",
+            )
+            store.start_run("run-3", "2026-04-03T13:00:00+00:00")
+            store.update_run_context("run-3", "initiative", "batch-y")
+            store.finish_run("run-3", "failed", "2026-04-03T13:01:00+00:00", error_stage="image")
+            store.start_run("run-4", "2026-04-04T13:00:00+00:00")
+
+            self.assertEqual(store.get_run("run-2").error_message, "boom")
+            self.assertIsNone(store.get_run("run-1").error_message)
+            self.assertEqual(store.get_latest_run(status="success").run_id, "run-1")
+            self.assertEqual(store.get_latest_run(status="failed").run_id, "run-3")
+            self.assertEqual(store.get_latest_run(status="running").run_id, "run-4")
+            self.assertIsNone(store.get_latest_run(status="cancelled"))
+            latest_for_batch = store.get_latest_failed_run_for_batch("batch-x")
+            self.assertEqual(latest_for_batch.run_id, "run-2")
+            self.assertEqual(latest_for_batch.stage1_path, "/archive/run-2/stage1.json")
+            self.assertIsNone(store.get_latest_failed_run_for_batch("batch-none"))
+
+            store.start_run("run-pdt", "2026-11-01T01:30:00-07:00")
+            store.update_run_context("run-pdt", "reply", "batch-dst")
+            store.finish_run("run-pdt", "failed", "2026-11-01T01:31:00-07:00", error_stage="stage2")
+            store.start_run("run-pst", "2026-11-01T01:15:00-08:00")
+            store.update_run_context("run-pst", "reply", "batch-dst")
+            store.finish_run("run-pst", "failed", "2026-11-01T01:16:00-08:00", error_stage="stage2")
+
+            self.assertEqual(store.get_latest_failed_run_for_batch("batch-dst").run_id, "run-pst")
+
+    def test_mark_stale_running_runs_failed_records_error_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            store.start_run("run-stale", "2026-04-08T11:00:00+00:00")
+
+            store.mark_stale_running_runs_failed(
+                cutoff=datetime(2026, 4, 8, 12, 0, tzinfo=ZoneInfo("UTC")),
+                finished_at=datetime(2026, 4, 8, 18, 0, tzinfo=ZoneInfo("UTC")),
+            )
+
+            run = store.get_run("run-stale")
+            self.assertEqual(run.status, "failed")
+            self.assertEqual(run.error_stage, "stale_running")
+            self.assertIn("stale cutoff 2026-04-08T12:00:00+00:00", run.error_message)
+
+    def test_failure_counters_and_runs_today_bookkeeping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+
+            self.assertEqual(store.get_consecutive_failures(), 0)
+            self.assertIsNone(store.get_last_failed_at())
+            self.assertEqual(store.record_run_failure(failed_at="2026-04-05T20:00:00-07:00"), 1)
+            self.assertEqual(store.record_run_failure(failed_at="2026-04-05T21:00:00-07:00"), 2)
+            self.assertEqual(store.get_consecutive_failures(), 2)
+            self.assertEqual(store.get_last_failed_at(), "2026-04-05T21:00:00-07:00")
+            store.reset_run_failures()
+            self.assertEqual(store.get_consecutive_failures(), 0)
+            self.assertIsNone(store.get_last_failed_at())
+
+            today = date(2026, 4, 5)
+            self.assertEqual(store.get_runs_today(today), 0)
+            self.assertEqual(store.increment_runs_today(today), 1)
+            self.assertEqual(store.increment_runs_today(today), 2)
+            self.assertEqual(store.get_kv(RUNS_TODAY_KEY), "2026-04-05:2")
+            self.assertEqual(store.get_runs_today(date(2026, 4, 6)), 0)
+            self.assertEqual(store.increment_runs_today(date(2026, 4, 6)), 1)
+            self.assertEqual(store.get_runs_today(today), 0)
+            store.set_kv(RUNS_TODAY_KEY, "garbage")
+            self.assertEqual(store.get_runs_today(today), 0)
+
+    def test_count_pending_outbound_counts_only_pending_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            store.record_pending_outbound_message(
+                message_id="<pending@example.com>",
+                sent_at="2026-04-01T13:00:00+00:00",
+                to_email="user@example.com",
+                subject="pending",
+                raw_path=root / "pending.eml",
+                image_path=None,
+                run_id="run-pending",
+                batch_id="batch-pending",
+            )
+            store.record_outbound_message(
+                message_id="<sent@example.com>",
+                sent_at="2026-04-01T13:05:00+00:00",
+                to_email="user@example.com",
+                subject="sent",
+                raw_path=root / "sent.eml",
+                image_path=None,
+                run_id="run-sent",
+                batch_id="batch-sent",
+            )
+
+            self.assertEqual(store.count_pending_outbound(), 1)
+            store.mark_outbound_message_sent(message_id="<pending@example.com>", sent_at="2026-04-01T13:06:00+00:00")
+            self.assertEqual(store.count_pending_outbound(), 0)
 
 
 if __name__ == "__main__":
