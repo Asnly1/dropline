@@ -1014,16 +1014,15 @@ def _request_sentences(texts: Sequence[str]) -> list[str]:
 
 
 def _correction_sentences(texts: Sequence[str]) -> list[str]:
-    sentences: list[str] = []
-    for text in texts:
-        for sentence in _sentences(text):
-            if CORRECTION_PATTERN.search(sentence):
-                sentences.append(sentence)
-            elif WEAK_CORRECTION_PATTERN.search(sentence) and (
-                BACK_REFERENCE_PATTERN.search(sentence) or _has_negation(sentence)
-            ):
-                sentences.append(sentence)
-    return sentences
+    return [sentence for text in texts for sentence in _sentences(text) if _is_correction_sentence(sentence)]
+
+
+def _is_correction_sentence(sentence: str) -> bool:
+    if CORRECTION_PATTERN.search(sentence):
+        return True
+    if not WEAK_CORRECTION_PATTERN.search(sentence):
+        return False
+    return bool(BACK_REFERENCE_PATTERN.search(sentence)) or _has_negation(sentence)
 
 
 def _marked_sentence_matches(candidate: CandidateMemory, sentence: str) -> bool:
