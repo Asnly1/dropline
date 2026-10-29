@@ -8,10 +8,59 @@ from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from dropline.models import NormalizedInboundMessage
+from dropline.models import AttachmentMeta, NormalizedInboundMessage
 from dropline.storage import SessionScope, StateStore
 
 from tests.helpers import create_test_repo, load_test_settings
+
+
+LEGACY_INBOUND_SCHEMA = """
+CREATE TABLE kv_state (
+    character_slug TEXT NOT NULL,
+    relationship_slug TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY(character_slug, relationship_slug, key)
+);
+CREATE TABLE inbound_messages (
+    imap_uid INTEGER NOT NULL,
+    message_id TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    from_email TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    raw_path TEXT NOT NULL,
+    normalized_text_path TEXT NOT NULL,
+    body_text TEXT NOT NULL,
+    thread_message_id TEXT,
+    consumed_batch_id TEXT,
+    character_slug TEXT NOT NULL,
+    relationship_slug TEXT NOT NULL,
+    PRIMARY KEY(character_slug, relationship_slug, imap_uid)
+);
+CREATE INDEX idx_inbound_messages_scope_consumed
+    ON inbound_messages(character_slug, relationship_slug, consumed_batch_id, imap_uid);
+"""
+
+
+def _inbound(message_id: str, imap_uid: int, *, uidvalidity: int = 0, subject: str = "", **overrides) -> NormalizedInboundMessage:
+    fields = {
+        "message_id": message_id,
+        "imap_uid": imap_uid,
+        "from_email": "user@example.com",
+        "subject": subject or message_id,
+        "received_at": "2026-04-01T12:00:00+00:00",
+        "body_text": "hello",
+        "body_html_present": False,
+        "attachments": [],
+        "uidvalidity": uidvalidity,
+    }
+    fields.update(overrides)
+    return NormalizedInboundMessage(**fields)
+
+
+def _primary_key_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    rows = sorted(conn.execute(f"PRAGMA table_info({table})").fetchall(), key=lambda row: row[5])
+    return [row[1] for row in rows if row[5]]
 
 
 class StateStoreTests(unittest.TestCase):
@@ -45,10 +94,239 @@ class StateStoreTests(unittest.TestCase):
                 {"character_slug", "relationship_slug", "key", "value"},
             )
             self.assertTrue({"character_slug", "relationship_slug"}.issubset(inbound_columns))
-            self.assertEqual(inbound_pk_columns, ["character_slug", "relationship_slug", "imap_uid"])
+            self.assertTrue(
+                {
+                    "uidvalidity",
+                    "body_html_present",
+                    "attachments_json",
+                    "attempt_count",
+                    "last_error",
+                    "last_attempt_at",
+                    "quarantined_at",
+                }.issubset(inbound_columns)
+            )
+            self.assertEqual(inbound_pk_columns, ["character_slug", "relationship_slug", "uidvalidity", "imap_uid"])
             self.assertTrue({"character_slug", "relationship_slug", "delivery_status"}.issubset(outbound_columns))
             self.assertTrue({"character_slug", "relationship_slug"}.issubset(runs_columns))
             self.assertTrue({"character_slug", "relationship_slug"}.issubset(assets_columns))
+
+    def test_initialize_migrates_legacy_inbound_schema_keeping_rows_and_extra_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+
+            conn = sqlite3.connect(settings.storage.sqlite_path)
+            conn.executescript(LEGACY_INBOUND_SCHEMA)
+            # Columns another migration may have added with ALTER TABLE, plus one this code knows nothing about.
+            conn.executescript(
+                """
+                ALTER TABLE inbound_messages ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE inbound_messages ADD COLUMN last_error TEXT;
+                ALTER TABLE inbound_messages ADD COLUMN last_attempt_at TEXT;
+                ALTER TABLE inbound_messages ADD COLUMN quarantined_at TEXT;
+                ALTER TABLE inbound_messages ADD COLUMN operator_note TEXT NOT NULL DEFAULT 'none';
+                """
+            )
+            legacy_rows = [
+                (10, "<a@example.com>", "batch-a", 2, "boom", "keep", "keqing", "childhood-friends"),
+                (11, "<b@example.com>", None, 0, None, "none", "keqing", "childhood-friends"),
+                # The same letter stored again after being moved out of and back into INBOX (new UID).
+                (12, "<b@example.com>", None, 1, "retry", "dup", "keqing", "childhood-friends"),
+                (10, "<a@example.com>", None, 0, None, "none", "keqing", "study-buddies"),
+            ]
+            conn.executemany(
+                """
+                INSERT INTO inbound_messages(
+                    imap_uid, message_id, received_at, from_email, subject, raw_path, normalized_text_path,
+                    body_text, thread_message_id, consumed_batch_id, attempt_count, last_error, operator_note,
+                    character_slug, relationship_slug
+                )
+                VALUES(?, ?, '2026-04-01T12:00:00+00:00', 'user@example.com', ?, '/tmp/raw.eml', '', 'body', NULL,
+                       ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (uid, message_id, f"subject-{uid}", consumed, attempts, error, note, character, relationship)
+                    for uid, message_id, consumed, attempts, error, note, character, relationship in legacy_rows
+                ],
+            )
+            conn.execute(
+                "INSERT INTO kv_state(character_slug, relationship_slug, key, value) "
+                "VALUES('keqing', 'childhood-friends', 'last_seen_imap_uid', '12')"
+            )
+            conn.commit()
+            conn.close()
+
+            store = StateStore(settings)
+            with self.assertLogs("dropline.storage", level="WARNING") as logs:
+                store.initialize()
+            store.initialize()  # idempotent: a second run must not migrate or drop anything again
+
+            self.assertTrue(any("Migrating inbound_messages" in line for line in logs.output))
+            self.assertTrue(any("duplicate inbound row" in line for line in logs.output))
+            conn = sqlite3.connect(settings.storage.sqlite_path)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(inbound_messages)")}
+            self.assertTrue(
+                {"uidvalidity", "body_html_present", "attachments_json", "attempt_count", "last_error", "operator_note"}.issubset(
+                    columns
+                )
+            )
+            self.assertEqual(
+                _primary_key_columns(conn, "inbound_messages"),
+                ["character_slug", "relationship_slug", "uidvalidity", "imap_uid"],
+            )
+            self.assertEqual(
+                conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'inbound_messages%'").fetchall(),
+                [("inbound_messages",)],
+            )
+            self.assertIsNotNone(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_inbound_messages_scope_message_id'"
+                ).fetchone()
+            )
+            rows = conn.execute(
+                """
+                SELECT relationship_slug, imap_uid, uidvalidity, message_id, consumed_batch_id, attempt_count,
+                       last_error, operator_note, attachments_json, body_html_present
+                FROM inbound_messages
+                ORDER BY relationship_slug, imap_uid
+                """
+            ).fetchall()
+            conn.close()
+            self.assertEqual(
+                rows,
+                [
+                    ("childhood-friends", 10, 0, "<a@example.com>", "batch-a", 2, "boom", "keep", "[]", 0),
+                    ("childhood-friends", 11, 0, "<b@example.com>", None, 0, None, "none", "[]", 0),
+                    ("study-buddies", 10, 0, "<a@example.com>", None, 0, None, "none", "[]", 0),
+                ],
+            )
+            self.assertEqual(store.get_last_seen_imap_uid(), 12)
+            unconsumed = store.list_unconsumed_inbound()
+            self.assertEqual([(item.imap_uid, item.uidvalidity, item.attachments) for item in unconsumed], [(11, 0, [])])
+            self.assertFalse(unconsumed[0].body_html_present)
+
+            # The new primary key keeps the same UID apart across UIDVALIDITY epochs ...
+            store.upsert_inbound_message(_inbound("<c@example.com>", 11, uidvalidity=7), raw_path=root / "c.eml")
+            self.assertEqual(
+                [(item.uidvalidity, item.imap_uid) for item in store.list_unconsumed_inbound()],
+                [(0, 11), (7, 11)],
+            )
+            store.mark_inbound_consumed([(7, 11)], batch_id="batch-c")
+            self.assertEqual([(item.uidvalidity, item.imap_uid) for item in store.list_unconsumed_inbound()], [(0, 11)])
+            # ... while a Message-ID can only be stored once per session.
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.upsert_inbound_message(_inbound("<b@example.com>", 99, uidvalidity=7), raw_path=root / "b2.eml")
+
+    def test_upsert_inbound_round_trips_attachment_metadata_and_html_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            attachments = [
+                AttachmentMeta(filename="notes.pdf", content_type="application/pdf", size=12),
+                AttachmentMeta(filename="图.png", content_type="image/png", size=5, inline=True),
+            ]
+
+            store.upsert_inbound_message(
+                _inbound("<with-files@example.com>", 3, uidvalidity=9, body_html_present=True, attachments=attachments),
+                raw_path=root / "with-files.eml",
+            )
+
+            stored = store.list_unconsumed_inbound()
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].attachments, attachments)
+            self.assertTrue(stored[0].body_html_present)
+            self.assertEqual(stored[0].uidvalidity, 9)
+            self.assertTrue(store.has_inbound_message_id("<with-files@example.com>"))
+
+            store.upsert_inbound_message(
+                _inbound("<with-files@example.com>", 3, uidvalidity=9, body_text="updated"),
+                raw_path=root / "with-files-2.eml",
+            )
+
+            stored = store.list_unconsumed_inbound()
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].attachments, [])
+            self.assertFalse(stored[0].body_html_present)
+            self.assertEqual(stored[0].body_text, "updated")
+
+    def test_has_inbound_message_id_is_session_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store_a = StateStore(settings)
+            store_b = StateStore(settings, scope=SessionScope(character_slug="keqing", relationship_slug="study-buddies"))
+
+            self.assertFalse(store_a.has_inbound_message_id("<shared@example.com>"))
+
+            store_a.initialize()
+            store_a.upsert_inbound_message(_inbound("<shared@example.com>", 1), raw_path=root / "shared.eml")
+
+            self.assertTrue(store_a.has_inbound_message_id("<shared@example.com>"))
+            self.assertFalse(store_a.has_inbound_message_id("<other@example.com>"))
+            self.assertFalse(store_b.has_inbound_message_id("<shared@example.com>"))
+            # Another session may legitimately store the same letter.
+            store_b.upsert_inbound_message(_inbound("<shared@example.com>", 1), raw_path=root / "shared-b.eml")
+            self.assertTrue(store_b.has_inbound_message_id("<shared@example.com>"))
+
+    def test_inbound_uid_operations_are_scoped_by_uidvalidity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            old_raw = settings.documents.session_archive_dir / "old-epoch.eml"
+            old_raw.parent.mkdir(parents=True, exist_ok=True)
+            old_raw.write_text("old", encoding="utf-8")
+            new_raw = settings.documents.session_archive_dir / "new-epoch.eml"
+            new_raw.write_text("new", encoding="utf-8")
+            store.upsert_inbound_message(_inbound("<old-epoch@example.com>", 5, uidvalidity=100), raw_path=old_raw)
+            store.upsert_inbound_message(_inbound("<new-epoch@example.com>", 5, uidvalidity=200), raw_path=new_raw)
+            store.upsert_inbound_message(_inbound("<old-later@example.com>", 9, uidvalidity=100), raw_path=root / "x.eml")
+
+            # Oldest epoch first, then UID order inside the epoch.
+            self.assertEqual(
+                [(item.uidvalidity, item.imap_uid) for item in store.list_unconsumed_inbound()],
+                [(100, 5), (100, 9), (200, 5)],
+            )
+
+            store.mark_inbound_consumed([(100, 9), (100, 404)], batch_id="batch-old")
+            self.assertEqual(
+                [(item.uidvalidity, item.imap_uid) for item in store.list_unconsumed_inbound()],
+                [(100, 5), (200, 5)],
+            )
+
+            self.assertEqual(store.get_imap_uidvalidity(), 0)
+            self.assertFalse(store.delete_inbound_message(5))  # no row in epoch 0
+            store.set_imap_uidvalidity(200)
+            self.assertEqual(store.get_imap_uidvalidity(), 200)
+            self.assertTrue(store.delete_inbound_message(5))
+            self.assertFalse(new_raw.exists())
+            self.assertTrue(old_raw.exists())
+            self.assertEqual([(item.uidvalidity, item.imap_uid) for item in store.list_unconsumed_inbound()], [(100, 5)])
+            self.assertTrue(store.delete_inbound_message(5, uidvalidity=100))
+            self.assertFalse(old_raw.exists())
+            self.assertEqual(store.list_unconsumed_inbound(), [])
+
+    def test_imap_uidvalidity_kv_is_session_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store_a = StateStore(settings)
+            store_a.initialize()
+            store_b = StateStore(settings, scope=SessionScope(character_slug="keqing", relationship_slug="study-buddies"))
+
+            self.assertEqual(store_a.get_imap_uidvalidity(), 0)
+            store_a.set_imap_uidvalidity(1700000000)
+            self.assertEqual(store_a.get_imap_uidvalidity(), 1700000000)
+            self.assertEqual(store_b.get_imap_uidvalidity(), 0)
+            self.assertEqual(store_a.get_kv("imap_uidvalidity"), "1700000000")
 
     def test_run_lock_rejects_second_lock_in_same_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

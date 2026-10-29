@@ -6,7 +6,7 @@ import logging
 import os
 import shutil
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +15,7 @@ from typing import Any
 
 from .config import Settings, ensure_active_profile
 from .models import (
+    AttachmentMeta,
     GeneratedImage,
     NormalizedInboundMessage,
     StoredAsset,
@@ -28,6 +29,32 @@ from .utils import ensure_parent, resolve_path_within_roots
 
 OUTBOUND_PENDING = "pending"
 OUTBOUND_SENT = "sent"
+INBOUND_MESSAGE_ID_INDEX = "idx_inbound_messages_scope_message_id"
+# Shared by the live schema and the legacy-table rebuild so both always agree on the column set.
+# attempt_count / last_error / last_attempt_at / quarantined_at are owned by the failure-handling
+# code path; they are declared here so a rebuild never drops them and ALTER TABLE never re-adds them.
+INBOUND_MESSAGES_COLUMNS_SQL = """
+                imap_uid INTEGER NOT NULL,
+                uidvalidity INTEGER NOT NULL DEFAULT 0,
+                message_id TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                from_email TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                raw_path TEXT NOT NULL,
+                normalized_text_path TEXT NOT NULL,
+                body_text TEXT NOT NULL,
+                body_html_present INTEGER NOT NULL DEFAULT 0,
+                attachments_json TEXT NOT NULL DEFAULT '[]',
+                thread_message_id TEXT,
+                consumed_batch_id TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_attempt_at TEXT,
+                quarantined_at TEXT,
+                character_slug TEXT NOT NULL,
+                relationship_slug TEXT NOT NULL,
+                PRIMARY KEY(character_slug, relationship_slug, uidvalidity, imap_uid)
+"""
 
 LOGGER = logging.getLogger(__name__)
 
@@ -158,6 +185,13 @@ class StateStore:
 
     def set_last_seen_imap_uid(self, imap_uid: int) -> None:
         self.set_kv("last_seen_imap_uid", str(imap_uid))
+
+    def get_imap_uidvalidity(self) -> int:
+        value = self.get_kv("imap_uidvalidity")
+        return int(value) if value else 0
+
+    def set_imap_uidvalidity(self, uidvalidity: int) -> None:
+        self.set_kv("imap_uidvalidity", str(uidvalidity))
 
     def has_outbound_messages(self) -> bool:
         with self._connect() as conn:
@@ -300,12 +334,12 @@ class StateStore:
             conn.execute(
                 """
                 INSERT INTO inbound_messages(
-                    imap_uid, message_id, received_at, from_email, subject, raw_path,
-                    normalized_text_path, body_text, thread_message_id, consumed_batch_id,
-                    character_slug, relationship_slug
+                    imap_uid, uidvalidity, message_id, received_at, from_email, subject, raw_path,
+                    normalized_text_path, body_text, body_html_present, attachments_json,
+                    thread_message_id, consumed_batch_id, character_slug, relationship_slug
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-                ON CONFLICT(character_slug, relationship_slug, imap_uid) DO UPDATE SET
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                ON CONFLICT(character_slug, relationship_slug, uidvalidity, imap_uid) DO UPDATE SET
                     message_id = excluded.message_id,
                     received_at = excluded.received_at,
                     from_email = excluded.from_email,
@@ -313,10 +347,13 @@ class StateStore:
                     raw_path = excluded.raw_path,
                     normalized_text_path = excluded.normalized_text_path,
                     body_text = excluded.body_text,
+                    body_html_present = excluded.body_html_present,
+                    attachments_json = excluded.attachments_json,
                     thread_message_id = excluded.thread_message_id
                 """,
                 (
                     message.imap_uid,
+                    message.uidvalidity,
                     message.message_id,
                     message.received_at,
                     message.from_email,
@@ -324,11 +361,29 @@ class StateStore:
                     str(raw_path),
                     str(normalized_text_path) if normalized_text_path else "",
                     message.body_text,
+                    1 if message.body_html_present else 0,
+                    json.dumps([item.to_dict() for item in message.attachments], ensure_ascii=False),
                     message.thread_message_id,
                     scope.character_slug,
                     scope.relationship_slug,
                 ),
             )
+
+    def has_inbound_message_id(self, message_id: str) -> bool:
+        with self._connect() as conn:
+            if not self._table_exists(conn, "inbound_messages"):
+                return False
+            scope = self._require_scope()
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM inbound_messages
+                WHERE character_slug = ? AND relationship_slug = ? AND message_id = ?
+                LIMIT 1
+                """,
+                (scope.character_slug, scope.relationship_slug, message_id),
+            ).fetchone()
+            return row is not None
 
     def list_unconsumed_inbound(self, *, limit: int | None = None) -> list[StoredInboundMessage]:
         with self._connect() as conn:
@@ -336,12 +391,12 @@ class StateStore:
                 return []
             scope = self._require_scope()
             query = """
-                SELECT imap_uid, message_id, received_at, from_email, subject, raw_path,
-                       normalized_text_path, body_text, character_slug, relationship_slug,
-                       consumed_batch_id, thread_message_id
+                SELECT imap_uid, uidvalidity, message_id, received_at, from_email, subject, raw_path,
+                       normalized_text_path, body_text, body_html_present, attachments_json,
+                       character_slug, relationship_slug, consumed_batch_id, thread_message_id
                 FROM inbound_messages
                 WHERE character_slug = ? AND relationship_slug = ? AND consumed_batch_id IS NULL
-                ORDER BY imap_uid ASC
+                ORDER BY uidvalidity ASC, imap_uid ASC
                 """
             params: list[object] = [scope.character_slug, scope.relationship_slug]
             if limit is not None:
@@ -365,22 +420,28 @@ class StateStore:
             ).fetchone()
             return int(row["count"]) if row else 0
 
-    def mark_inbound_consumed(self, imap_uids: list[int], batch_id: str) -> None:
-        if not imap_uids:
+    def mark_inbound_consumed(self, message_keys: Sequence[tuple[int, int]], batch_id: str) -> None:
+        """Mark inbound rows consumed; each key is ``(uidvalidity, imap_uid)`` as stored on the message."""
+        if not message_keys:
             return
         scope = self._require_scope()
-        placeholders = ",".join("?" for _ in imap_uids)
         with self._connect() as conn:
-            conn.execute(
-                (
-                    f"UPDATE inbound_messages SET consumed_batch_id = ? "
-                    f"WHERE character_slug = ? AND relationship_slug = ? AND imap_uid IN ({placeholders})"
-                ),
-                (batch_id, scope.character_slug, scope.relationship_slug, *imap_uids),
+            conn.executemany(
+                """
+                UPDATE inbound_messages SET consumed_batch_id = ?
+                WHERE character_slug = ? AND relationship_slug = ? AND uidvalidity = ? AND imap_uid = ?
+                """,
+                [
+                    (batch_id, scope.character_slug, scope.relationship_slug, uidvalidity, imap_uid)
+                    for uidvalidity, imap_uid in message_keys
+                ],
             )
 
-    def delete_inbound_message(self, imap_uid: int) -> bool:
+    def delete_inbound_message(self, imap_uid: int, *, uidvalidity: int | None = None) -> bool:
+        """Delete one inbound row by UID within a UIDVALIDITY epoch (the current mailbox epoch by default)."""
         scope = self._require_scope()
+        if uidvalidity is None:
+            uidvalidity = self.get_imap_uidvalidity()
         with self._connect() as conn:
             if not self._table_exists(conn, "inbound_messages"):
                 return False
@@ -388,9 +449,9 @@ class StateStore:
                 """
                 SELECT raw_path, normalized_text_path
                 FROM inbound_messages
-                WHERE character_slug = ? AND relationship_slug = ? AND imap_uid = ?
+                WHERE character_slug = ? AND relationship_slug = ? AND uidvalidity = ? AND imap_uid = ?
                 """,
-                (scope.character_slug, scope.relationship_slug, imap_uid),
+                (scope.character_slug, scope.relationship_slug, uidvalidity, imap_uid),
             ).fetchone()
             if row is None:
                 return False
@@ -403,9 +464,9 @@ class StateStore:
             conn.execute(
                 """
                 DELETE FROM inbound_messages
-                WHERE character_slug = ? AND relationship_slug = ? AND imap_uid = ?
+                WHERE character_slug = ? AND relationship_slug = ? AND uidvalidity = ? AND imap_uid = ?
                 """,
-                (scope.character_slug, scope.relationship_slug, imap_uid),
+                (scope.character_slug, scope.relationship_slug, uidvalidity, imap_uid),
             )
         self._delete_paths(paths)
         return True
@@ -909,8 +970,9 @@ class StateStore:
         return self.scope
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        self._migrate_legacy_inbound_messages(conn)
         conn.executescript(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS kv_state (
                 character_slug TEXT NOT NULL,
                 relationship_slug TEXT NOT NULL,
@@ -919,21 +981,7 @@ class StateStore:
                 PRIMARY KEY(character_slug, relationship_slug, key)
             );
 
-            CREATE TABLE IF NOT EXISTS inbound_messages (
-                imap_uid INTEGER NOT NULL,
-                message_id TEXT NOT NULL,
-                received_at TEXT NOT NULL,
-                from_email TEXT NOT NULL,
-                subject TEXT NOT NULL,
-                raw_path TEXT NOT NULL,
-                normalized_text_path TEXT NOT NULL,
-                body_text TEXT NOT NULL,
-                thread_message_id TEXT,
-                consumed_batch_id TEXT,
-                character_slug TEXT NOT NULL,
-                relationship_slug TEXT NOT NULL,
-                PRIMARY KEY(character_slug, relationship_slug, imap_uid)
-            );
+            CREATE TABLE IF NOT EXISTS inbound_messages ({INBOUND_MESSAGES_COLUMNS_SQL});
 
             CREATE TABLE IF NOT EXISTS outbound_messages (
                 message_id TEXT PRIMARY KEY,
@@ -977,11 +1025,81 @@ class StateStore:
         )
         self._ensure_indexes(conn)
 
-    def _ensure_indexes(self, conn: sqlite3.Connection) -> None:
-        conn.executescript(
+    def _migrate_legacy_inbound_messages(self, conn: sqlite3.Connection) -> None:
+        """Rebuild a pre-UIDVALIDITY inbound_messages table in place.
+
+        SQLite cannot change a primary key with ALTER TABLE, so the legacy table (keyed by
+        session + imap_uid) is copied into a fresh table keyed by session + uidvalidity + imap_uid.
+        Legacy rows get uidvalidity 0. Every legacy column is carried over, including columns added
+        by other migrations (attempt_count & co. are part of the new definition; anything else is
+        re-added from PRAGMA table_info), so no concurrent ALTER TABLE migration loses data.
+        """
+        if not self._table_exists(conn, "inbound_messages"):
+            return
+        legacy_columns = conn.execute("PRAGMA table_info(inbound_messages)").fetchall()
+        legacy_names = [str(column["name"]) for column in legacy_columns]
+        if "uidvalidity" in legacy_names:
+            return
+        row_count = int(conn.execute("SELECT COUNT(*) AS count FROM inbound_messages").fetchone()["count"])
+        LOGGER.warning(
+            "Migrating inbound_messages to the UIDVALIDITY-scoped schema; %s existing row(s) keep uidvalidity=0.",
+            row_count,
+        )
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+        conn.execute("DROP TABLE IF EXISTS inbound_messages__new")
+        conn.execute(f"CREATE TABLE inbound_messages__new ({INBOUND_MESSAGES_COLUMNS_SQL})")
+        new_names = {str(column["name"]) for column in conn.execute("PRAGMA table_info(inbound_messages__new)")}
+        for column in legacy_columns:
+            if str(column["name"]) in new_names:
+                continue
+            conn.execute(f"ALTER TABLE inbound_messages__new ADD COLUMN {_legacy_column_definition(column)}")
+        copied = ", ".join(_quote_identifier(name) for name in legacy_names)
+        conn.execute(f"INSERT INTO inbound_messages__new ({copied}) SELECT {copied} FROM inbound_messages")
+        conn.execute("DROP TABLE inbound_messages")
+        conn.execute("ALTER TABLE inbound_messages__new RENAME TO inbound_messages")
+        conn.commit()
+
+    def _dedupe_inbound_message_ids(self, conn: sqlite3.Connection) -> None:
+        """Keep one row per (session, Message-ID) before the unique index is created.
+
+        Legacy databases could store the same letter twice when it was moved out of and back into
+        INBOX (new UID). The consumed copy wins so the letter is not answered again; otherwise the
+        lowest UID wins.
+        """
+        rows = conn.execute(
             """
+            SELECT rowid, character_slug, relationship_slug, message_id
+            FROM inbound_messages
+            ORDER BY character_slug, relationship_slug, message_id,
+                     (consumed_batch_id IS NULL) ASC, uidvalidity ASC, imap_uid ASC
+            """
+        ).fetchall()
+        seen: set[tuple[str, str, str]] = set()
+        duplicate_rowids: list[tuple[int]] = []
+        for row in rows:
+            key = (str(row["character_slug"]), str(row["relationship_slug"]), str(row["message_id"]))
+            if key in seen:
+                duplicate_rowids.append((int(row["rowid"]),))
+                continue
+            seen.add(key)
+        if not duplicate_rowids:
+            return
+        LOGGER.warning(
+            "Removing %s duplicate inbound row(s) sharing a Message-ID before enforcing uniqueness.",
+            len(duplicate_rowids),
+        )
+        conn.executemany("DELETE FROM inbound_messages WHERE rowid = ?", duplicate_rowids)
+
+    def _ensure_indexes(self, conn: sqlite3.Connection) -> None:
+        if not self._index_exists(conn, INBOUND_MESSAGE_ID_INDEX):
+            self._dedupe_inbound_message_ids(conn)
+        conn.executescript(
+            f"""
             CREATE INDEX IF NOT EXISTS idx_inbound_messages_scope_consumed
                 ON inbound_messages(character_slug, relationship_slug, consumed_batch_id, imap_uid);
+            CREATE UNIQUE INDEX IF NOT EXISTS {INBOUND_MESSAGE_ID_INDEX}
+                ON inbound_messages(character_slug, relationship_slug, message_id);
             CREATE INDEX IF NOT EXISTS idx_outbound_messages_scope_sent_at
                 ON outbound_messages(character_slug, relationship_slug, sent_at);
             CREATE INDEX IF NOT EXISTS idx_runs_scope_started_at
@@ -995,6 +1113,13 @@ class StateStore:
         row = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
             (table_name,),
+        ).fetchone()
+        return row is not None
+
+    def _index_exists(self, conn: sqlite3.Connection, index_name: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
         ).fetchone()
         return row is not None
 
@@ -1045,6 +1170,9 @@ class StateStore:
             relationship_slug=str(row["relationship_slug"]),
             consumed_batch_id=str(row["consumed_batch_id"]) if row["consumed_batch_id"] else None,
             thread_message_id=str(row["thread_message_id"]) if row["thread_message_id"] else None,
+            uidvalidity=int(row["uidvalidity"] or 0),
+            body_html_present=bool(row["body_html_present"]),
+            attachments=_parse_attachments_json(row["attachments_json"]),
         )
 
     def _build_stored_outbound_message(self, row: sqlite3.Row) -> StoredOutboundMessage:
@@ -1099,6 +1227,34 @@ class StateStore:
                 yield conn
         finally:
             conn.close()
+
+
+def _parse_attachments_json(value: object) -> list[AttachmentMeta]:
+    if not value:
+        return []
+    try:
+        payload = json.loads(str(value))
+    except ValueError:
+        LOGGER.warning("Ignoring malformed attachments_json on inbound row: %r", value)
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [AttachmentMeta.from_dict(item) for item in payload if isinstance(item, dict)]
+
+
+def _quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _legacy_column_definition(column: sqlite3.Row) -> str:
+    """Rebuild an ``ADD COLUMN`` clause from a ``PRAGMA table_info`` row of the legacy table."""
+    definition = f"{_quote_identifier(str(column['name']))} {column['type'] or ''}".rstrip()
+    default_value = column["dflt_value"]
+    if default_value is not None:
+        definition += f" DEFAULT {default_value}"
+        if column["notnull"]:
+            definition += " NOT NULL"
+    return definition
 
 
 def _parse_run_started_at(value: str, cutoff: datetime) -> datetime:
