@@ -122,6 +122,7 @@ Examples:
 - Short-term preferences not mentioned again for 30 days should be downweighted.
 - Long-term memories explicitly negated by the user should immediately be marked as `superseded`.
 - Deduplicate weekly: merge semantically similar memories and keep the one that is more specific, newer, and better supported by evidence.
+- Current implementation: the rules in this section are not automated yet. The code only merges entries that are identical after normalization (or substrings of each other) at write time; there is no 30-day downweighting, no `superseded` marker, and no weekly deduplication. Resolved `active_arc` entries are removed from the file when Stage 2 suggests `archive`.
 
 ## 10. Final Judgment Question
 

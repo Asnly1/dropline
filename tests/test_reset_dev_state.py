@@ -93,6 +93,10 @@ class ResetDevStateTests(unittest.TestCase):
             self.assertFalse(pycache_dir.exists())
             self.assertTrue(settings.storage.sqlite_path.exists())
             self.assertTrue((root / "profiles" / "characters" / "keqing" / "sessions").exists())
+            session_meta = root / "profiles" / "characters" / "keqing" / "sessions" / "childhood-friends" / "meta.json"
+            self.assertTrue(session_meta.exists())
+            reloaded = load_settings(root / "config.yaml")
+            self.assertIsNotNone(reloaded.active_profile)
             self.assertTrue(settings.documents.user_episode_dir.exists())
             self.assertTrue(settings.documents.character_episode_dir.exists())
             self.assertEqual(list(settings.documents.user_episode_dir.glob("*.json")), [])

@@ -47,10 +47,10 @@ flowchart TD
 设计要点:
 
 - **LLM 提议,代码决策**:Stage 1 只输出候选记忆,真正写入哪个文件由本地代码按 [docs/memory_promotion_rules.md](docs/memory_promotion_rules.md) 决定
-- **图片是硬门槛**:若启用图片生成且失败,本轮运行中断,memory 不受污染
+- **图片是硬门槛**:若启用图片生成且失败,本轮运行中断、不发信;Stage 1 已写入的用户侧记忆保留,角色侧 episode 不写入
 - **归档留痕**:每次运行的输入、Stage 1/2 输出、生成的图片都保存在 `archive/YYYY-MM-DD/run-*/`
 
-> 📬 **看真实运行:** [**examples/conversation_keqing.cn.md**](examples/conversation_keqing.cn.md) 完整走一遍刻晴的 `init-once` 主动来信 + 第一轮一来一回——附每轮真实生成的配图,以及每封回信背后 Stage 1 记忆候选的可折叠「幕后」。([English](examples/conversation_keqing.en.md))
+> 📬 **看真实运行:** [**examples/conversation_keqing.cn.md**](examples/conversation_keqing.cn.md) 完整走一遍刻晴在首次 `run-once` 时发出的主动来信 + 第一轮一来一回——附每轮真实生成的配图,以及每封回信背后 Stage 1 记忆候选的可折叠「幕后」。([English](examples/conversation_keqing.en.md))
 
 ---
 
@@ -74,7 +74,7 @@ flowchart LR
 
 - `profiles/active.json` 指向当前生效的角色 + 关系
 - 每个 **session = 角色 × 关系**,切换不同关系就是一个全新记忆空间
-- CLI 默认按"角色名 + 关系描述"交互,slug 只是内部目录键
+- CLI 按角色名(可带作品名)和关系名匹配,也接受 slug;关系描述不参与匹配
 
 ---
 
@@ -169,7 +169,7 @@ mail:
       security: "ssl" # ssl | starttls | none
 ```
 
-`ssl` 表示直连 SMTP_SSL,`starttls` 表示普通 SMTP 连接后升级 STARTTLS,`none` 表示不启用传输层加密。
+`ssl` 表示直连 SMTP_SSL,`starttls` 表示普通 SMTP 连接后升级 STARTTLS,`none` 表示不启用传输层加密。`ssl` 与 `starttls` 都会按系统信任库校验服务器证书;`none` 会把授权码明文发送,每次发信都会在日志里打出警告。IMAP 侧由 `imap.ssl` 控制,同样校验证书。所有邮件连接都有 60 秒超时。
 
 如果你想统一控制模型输出的文本语言,可以在 `llm` 下增加 `language`:
 
@@ -201,23 +201,28 @@ llm:
 
 ### 生成第一个角色 + 关系
 
+仓库自带两套可直接使用的 profile:`刻晴`(原神)+ 关系 `青梅竹马`,以及 `keqing`(Genshin Impact)+ 关系 `childhood-friends`,可以直接跳到[运行一次 pipeline](#运行一次-pipeline)。要生成自己的角色:
+
 ```bash
 # 动漫/游戏角色:附带作品名
-python3 -m dropline generate-character --character "刻晴" --work "原神"
+python3 -m dropline generate-character --character "胡桃" --work "原神"
 
 # 现实公众人物:不填作品名,自动走"公开形象优先"模式
 python3 -m dropline generate-character --character "某位作家"
 
-# 生成关系 prompt
+# 生成关系 prompt。--name 是之后传给 select 的关系名;不填则取描述的前 24 个字符
 python3 -m dropline generate-relationship \
-    --character "刻晴" \
-    --relationship "青梅竹马,久别重逢,通信克制但熟悉"
+    --character "胡桃" \
+    --relationship "诗社认识的笔友,爱开玩笑但真诚" \
+    --name "笔友"
 ```
+
+两个生成命令都不会覆盖已存在的角色或关系。
 
 ### 运行一次 pipeline
 
 ```bash
-# 选中 active profile(会自动创建 session)
+# 选中 active profile(会自动创建 session);这里用的是仓库自带的示例 profile
 python3 -m dropline select --character "刻晴" --relationship "青梅竹马"
 
 # 初始化 session 的 memory 和 state.db
@@ -259,15 +264,17 @@ session 的记忆分 6 类,Stage 1 只负责**提议**,代码负责**裁决**是
 ### 一键安装
 
 ```bash
-python3 -m dropline install-scheduler --config /绝对/路径/config.yaml
-python3 -m dropline uninstall-scheduler --config /绝对/路径/config.yaml
+python3 -m dropline install-scheduler --config /绝对/路径/config.yaml --yes
+python3 -m dropline uninstall-scheduler --config /绝对/路径/config.yaml --yes
 ```
+
+两个命令都会要求确认,加 `--yes` 跳过;无人值守时不加会直接以 `Cancelled.` 退出。
 
 可选参数:
 
 - `--task-name` 自定义任务名(默认 `dropline`)
 - `--python` 指定 Python 解释器(默认跟随当前 `sys.executable`)
-- `--no-load` 仅生成安装产物,不实际注册到系统
+- `--no-load` 只写出安装产物,不调用 `launchctl` / `schtasks`。注意 macOS 上 plist 仍会被复制到 `~/Library/LaunchAgents/`,launchd 会在下次登录时自动加载;不想这样就手动删掉它
 
 日志统一输出到:
 
@@ -381,13 +388,13 @@ python3 -m dropline
 | `scheduler-tick`                            | 执行一次调度检查,到点才跑 pipeline                                         |
 | `mark-stale-runs-failed`                    | 把当前 active session 中超过指定天数仍为 running 的 run 标为 failed        |
 | `install-scheduler` / `uninstall-scheduler` | 安装 / 卸载系统定时任务                                                    |
-| `reset-dev-state`                           | 清空所有 session、日志、数据库后按当前 active 重建;可用 `--yes` 跳过确认   |
+| `reset-dev-state`                           | 清空所有 session、日志、数据库,再为当前 active 重建一个空 session;可用 `--yes` 跳过确认 |
 
 </details>
 
 ## 📚 更多文档
 
-- [examples/conversation_keqing.cn.md](examples/conversation_keqing.cn.md) — 一段真实的首轮通信(init-once + 第一轮),含配图与幕后
+- [examples/conversation_keqing.cn.md](examples/conversation_keqing.cn.md) — 一段真实的首轮通信(首封主动信 + 第一轮),含配图与幕后
 - [docs/run_pipeline.md](docs/run_pipeline.md) — Pipeline 每阶段的输入输出约定
 - [docs/memory_promotion_rules.md](docs/memory_promotion_rules.md) — 记忆晋升的完整规则
 

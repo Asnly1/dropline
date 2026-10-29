@@ -5,6 +5,7 @@ import imaplib
 import logging
 import re
 import smtplib
+import ssl
 from datetime import date
 from email import policy
 from email.header import decode_header, make_header
@@ -21,6 +22,7 @@ from .utils import retry_call
 
 LOGGER = logging.getLogger(__name__)
 FROM_HEADER_SECTION = "(BODY.PEEK[HEADER.FIELDS (FROM)])"
+MAIL_SOCKET_TIMEOUT_SECONDS = 60.0
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 SCRIPT_STYLE_RE = re.compile(r"<(script|style).*?</\1>", re.IGNORECASE | re.DOTALL)
 STOP_PATTERNS = (
@@ -33,6 +35,15 @@ SIGNATURE_PATTERNS = (
     re.compile(r"^--\s*$"),
     re.compile(r"^Sent from my ", re.IGNORECASE),
 )
+
+
+def build_tls_context() -> ssl.SSLContext:
+    """Return a TLS context that verifies server certificates against the system trust store.
+
+    The standard library's IMAP4_SSL / SMTP_SSL / starttls() default to an *unverified*
+    context when none is passed, so every TLS connection must go through this helper.
+    """
+    return ssl.create_default_context()
 
 
 class InboundMailClient(Protocol):
@@ -83,8 +94,7 @@ class IMAPInboundClient:
     ) -> tuple[list[RawInboundMessage], int]:
         if not self.endpoint.folder:
             raise RuntimeError("IMAP folder configuration is required.")
-        client_cls = imaplib.IMAP4_SSL if self.endpoint.ssl else imaplib.IMAP4
-        with client_cls(self.endpoint.host, self.endpoint.port) as client:
+        with self._connect() as client:
             client.login(self.endpoint.username, self.endpoint.password)
             client.select(self.endpoint.folder)
             base_criteria = self._build_search_criteria(since_uid=since_uid, received_since=received_since)
@@ -110,6 +120,21 @@ class IMAPInboundClient:
                 raw_bytes = self._fetch_section(client, uid, "BODY.PEEK[]")
                 messages.append(RawInboundMessage(imap_uid=uid, raw_bytes=raw_bytes))
             return messages, highest_seen_uid
+
+    def _connect(self) -> imaplib.IMAP4:
+        if self.endpoint.ssl:
+            return imaplib.IMAP4_SSL(
+                self.endpoint.host,
+                self.endpoint.port,
+                ssl_context=build_tls_context(),
+                timeout=MAIL_SOCKET_TIMEOUT_SECONDS,
+            )
+        LOGGER.warning(
+            "IMAP connection to %s:%s is unencrypted (imap.ssl=false); credentials and mail are sent in cleartext.",
+            self.endpoint.host,
+            self.endpoint.port,
+        )
+        return imaplib.IMAP4(self.endpoint.host, self.endpoint.port, timeout=MAIL_SOCKET_TIMEOUT_SECONDS)
 
     def _filter_allowlist_by_from_header(
         self,
@@ -177,11 +202,24 @@ class SMTPOutboundClient:
     def _send_once(self, message: EmailMessage) -> str:
         endpoint = self.mailbox.smtp
         message_id = message.get("Message-ID")
-        smtp_cls = smtplib.SMTP_SSL if endpoint.security == "ssl" else smtplib.SMTP
-        client = smtp_cls(endpoint.host, endpoint.port)
+        if endpoint.security == "ssl":
+            client = smtplib.SMTP_SSL(
+                endpoint.host,
+                endpoint.port,
+                timeout=MAIL_SOCKET_TIMEOUT_SECONDS,
+                context=build_tls_context(),
+            )
+        else:
+            client = smtplib.SMTP(endpoint.host, endpoint.port, timeout=MAIL_SOCKET_TIMEOUT_SECONDS)
         try:
             if endpoint.security == "starttls":
-                client.starttls()
+                client.starttls(context=build_tls_context())
+            elif endpoint.security == "none":
+                LOGGER.warning(
+                    "SMTP connection to %s:%s is unencrypted (smtp.security=none); credentials are sent in cleartext.",
+                    endpoint.host,
+                    endpoint.port,
+                )
             client.login(endpoint.username, endpoint.password)
             client.send_message(message)
         except Exception:

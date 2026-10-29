@@ -18,7 +18,7 @@ pipeline_mode: profile_first
 
 1. 静态 prompt 文档只读
 2. LLM 只提候选记忆，代码决定写入
-3. 图片失败会中断本次 run，但不会写坏 memory
+3. 图片失败会中断本次 run 且不发信；Stage 1 已写入的用户侧记忆保留，角色侧 episode 不写入
 4. 所有输入输出必须可归档、可追溯
 
 ## 2. 文档来源

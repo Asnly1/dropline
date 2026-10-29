@@ -47,10 +47,10 @@ flowchart TD
 Key design choices:
 
 - **LLM proposes, code decides** — Stage 1 only emits _candidate_ memories. The decision of what gets written, and to which file, is made by local code following [docs/memory_promotion_rules.en.md](docs/memory_promotion_rules.en.md).
-- **Image is a hard gate** — if image generation is enabled and fails, the run aborts and memory stays untouched.
+- **Image is a hard gate** — if image generation is enabled and fails, the run aborts and no email is sent. The user-side memory Stage 1 already wrote is kept; the character-side episode is not written.
 - **Everything is archived** — inputs, Stage 1/2 outputs, and the generated image for each run are saved under `archive/YYYY-MM-DD/run-*/`.
 
-> 📬 **See a real run:** [**examples/conversation_keqing.en.md**](examples/conversation_keqing.en.md) walks through Keqing's `init-once` opening letter and the first round of back-and-forth — with the real generated images, and a collapsible look at the Stage 1 memory candidates behind each reply. ([中文版](examples/conversation_keqing.cn.md))
+> 📬 **See a real run:** [**examples/conversation_keqing.en.md**](examples/conversation_keqing.en.md) walks through the opening letter Keqing sends on the first `run-once` and the first round of back-and-forth — with the real generated images, and a collapsible look at the Stage 1 memory candidates behind each reply. ([中文版](examples/conversation_keqing.cn.md))
 
 ---
 
@@ -74,7 +74,7 @@ flowchart LR
 
 - `profiles/active.json` points to the currently active character + relationship.
 - A **session** is uniquely identified by `character × relationship` — switching relationship gives you a brand-new memory space.
-- The CLI operates on human-readable names (character name + relationship description). Slugs are internal directory keys only.
+- The CLI matches characters and relationships by name (the character name, optionally with its work title, and the relationship name); slugs are accepted too. The relationship description is not used for matching.
 
 ---
 
@@ -169,7 +169,7 @@ mail:
       security: "ssl" # ssl | starttls | none
 ```
 
-`ssl` means direct `SMTP_SSL`, `starttls` means plain SMTP followed by STARTTLS, and `none` means no transport encryption.
+`ssl` means direct `SMTP_SSL`, `starttls` means plain SMTP followed by STARTTLS, and `none` means no transport encryption. Both `ssl` and `starttls` verify the server certificate against the system trust store; `none` sends the password in cleartext and logs a warning on every send. IMAP is controlled by `imap.ssl` and verifies certificates the same way. Every mail socket has a 60-second timeout.
 
 To pin the language used by model outputs, add `language` under `llm`:
 
@@ -201,24 +201,30 @@ Email bodies are sent as plain text. Stage 2 emits the reply in the `body` field
 
 ### Create your first character + relationship
 
+The repo ships two ready-made profiles — `刻晴` (原神) with the relationship `青梅竹马`, and `keqing` (Genshin Impact) with `childhood-friends` — so you can skip straight to [Run the pipeline once](#run-the-pipeline-once). To create your own:
+
 ```bash
 # Fictional character from a work: pass --work
-python3 -m dropline generate-character --character "刻晴" --work "原神"
-# ("Keqing" from "Genshin Impact" — Chinese names work as slugs)
+python3 -m dropline generate-character --character "胡桃" --work "原神"
+# (Chinese names work as slugs)
 
 # Real-life public figure: omit --work; it falls back to "public image only" mode
 python3 -m dropline generate-character --character "Some Author"
 
-# Generate the relationship prompt
+# Generate the relationship prompt. --name is the short name you will later pass to `select`;
+# without it the name defaults to the first 24 characters of the description.
 python3 -m dropline generate-relationship \
-    --character "刻晴" \
-    --relationship "childhood friends, reunited after years, reserved but familiar"
+    --character "胡桃" \
+    --relationship "pen pals who met at a poetry club, playful but sincere" \
+    --name "pen pals"
 ```
+
+Neither command overwrites an existing character or relationship.
 
 ### Run the pipeline once
 
 ```bash
-# Select the active profile (auto-creates the session)
+# Select the active profile (auto-creates the session) — here the bundled example profile
 python3 -m dropline select --character "刻晴" --relationship "青梅竹马"
 
 # Initialize the session's memory and state.db
@@ -260,15 +266,17 @@ Recommended pattern: **fire `scheduler-tick` on a cron-like interval**, let it d
 ### One-shot install
 
 ```bash
-python3 -m dropline install-scheduler --config /absolute/path/config.yaml
-python3 -m dropline uninstall-scheduler --config /absolute/path/config.yaml
+python3 -m dropline install-scheduler --config /absolute/path/config.yaml --yes
+python3 -m dropline uninstall-scheduler --config /absolute/path/config.yaml --yes
 ```
+
+Both commands ask for confirmation unless `--yes` is given; without it, an unattended run exits with `Cancelled.`.
 
 Optional flags:
 
 - `--task-name` — override the task name (default `dropline`)
 - `--python` — override the Python interpreter (defaults to the current `sys.executable`)
-- `--no-load` — generate install artifacts but don't register with the OS
+- `--no-load` — write the install artifacts without calling `launchctl` / `schtasks`. On macOS the plist is still copied to `~/Library/LaunchAgents/`, which launchd loads at your next login; delete it if you don't want that.
 
 Logs land in:
 
@@ -382,13 +390,13 @@ python3 -m dropline
 | `scheduler-tick`                            | One scheduling check — runs the pipeline only if it's time                                          |
 | `mark-stale-runs-failed`                    | Mark stale `running` runs as `failed` for the active session                                        |
 | `install-scheduler` / `uninstall-scheduler` | Install / uninstall the OS-level timer                                                              |
-| `reset-dev-state`                           | Wipe all sessions / logs / DB and rebuild from the active profile; `--yes` skips confirmation       |
+| `reset-dev-state`                           | Wipe all sessions / logs / DB, then recreate an empty session for the active profile; `--yes` skips confirmation |
 
 </details>
 
 ## 📚 More docs
 
-- [examples/conversation_keqing.en.md](examples/conversation_keqing.en.md) — a real first exchange (init-once + first round), with images and behind-the-scenes
+- [examples/conversation_keqing.en.md](examples/conversation_keqing.en.md) — a real first exchange (opening letter + first round), with images and behind-the-scenes
 - [docs/run_pipeline.en.md](docs/run_pipeline.en.md) — pipeline-stage I/O contract
 - [docs/memory_promotion_rules.en.md](docs/memory_promotion_rules.en.md) — full memory promotion rules
 

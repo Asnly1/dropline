@@ -6,7 +6,7 @@ import shutil
 
 from .config import Settings, load_settings
 from .memory import MemoryManager
-from .profile_manager import list_session_root_dirs
+from .profile_manager import create_session_profile, list_session_root_dirs
 from .scheduler_install import DEFAULT_SCHEDULER_TASK_NAME, build_scheduler_runtime_paths, uninstall_scheduler
 from .storage import StateStore
 from .utils import resolve_path_within_roots
@@ -74,6 +74,13 @@ def reset_dev_state(settings: Settings, *, task_name: str = DEFAULT_SCHEDULER_TA
 
     reinitialized = settings.active_profile is not None
     if reinitialized:
+        # The session directory (including its meta.json) was just deleted; recreate it so the
+        # active profile stays selectable and `run-once` works without a fresh `select`.
+        create_session_profile(
+            settings.repo_root,
+            character=settings.active_profile.character,
+            relationship=settings.active_profile.relationship,
+        )
         store = StateStore(settings)
         store.initialize()
         MemoryManager(settings).bootstrap()

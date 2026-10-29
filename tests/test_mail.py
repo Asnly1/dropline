@@ -4,6 +4,7 @@ from datetime import date
 from email.message import EmailMessage
 from pathlib import Path
 import smtplib
+import ssl
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -324,6 +325,49 @@ Content-Type: text/plain; charset="utf-8"
         self.assertEqual([item.imap_uid for item in messages], [1])
         self.assertEqual(highest_seen_uid, 1)
 
+    def test_imap_ssl_connection_verifies_certificates_and_sets_timeout(self) -> None:
+        fake_client = _FakeIMAPClient()
+        fake_client.search_results = {("ALL",): b""}
+        endpoint = MailEndpointConfig(
+            host="imap.qq.com",
+            port=993,
+            ssl=True,
+            username="keqing@qq.com",
+            password="secret",
+            folder="INBOX",
+        )
+        with patch("dropline.mail.imaplib.IMAP4_SSL", return_value=fake_client) as imap_ssl, patch(
+            "dropline.mail.imaplib.IMAP4",
+        ) as imap_plain:
+            messages, highest_seen_uid = IMAPInboundClient(endpoint).fetch_since(0, 0, ())
+
+        self.assertEqual(messages, [])
+        self.assertEqual(highest_seen_uid, 0)
+        imap_ssl.assert_called_once()
+        self.assertEqual(imap_ssl.call_args.args, ("imap.qq.com", 993))
+        self.assertEqual(imap_ssl.call_args.kwargs["timeout"], mail_module.MAIL_SOCKET_TIMEOUT_SECONDS)
+        _assert_verified_tls_context(self, imap_ssl.call_args.kwargs["ssl_context"])
+        imap_plain.assert_not_called()
+
+    def test_imap_plain_connection_sets_timeout(self) -> None:
+        fake_client = _FakeIMAPClient()
+        fake_client.search_results = {("ALL",): b""}
+        endpoint = MailEndpointConfig(
+            host="imap.example.com",
+            port=143,
+            ssl=False,
+            username="keqing@example.com",
+            password="secret",
+            folder="INBOX",
+        )
+        with patch("dropline.mail.imaplib.IMAP4", return_value=fake_client) as imap_plain, patch(
+            "dropline.mail.imaplib.IMAP4_SSL",
+        ) as imap_ssl:
+            IMAPInboundClient(endpoint).fetch_since(0, 0, ())
+
+        imap_plain.assert_called_once_with("imap.example.com", 143, timeout=mail_module.MAIL_SOCKET_TIMEOUT_SECONDS)
+        imap_ssl.assert_not_called()
+
     def test_smtp_send_retries_transient_disconnect(self) -> None:
         endpoint = _smtp_endpoint(
             host="smtp.qq.com",
@@ -385,7 +429,10 @@ Content-Type: text/plain; charset="utf-8"
         ) as smtp:
             SMTPOutboundClient(mailbox).send(message)
 
-        smtp_ssl.assert_called_once_with("smtp.example.com", 465)
+        smtp_ssl.assert_called_once()
+        self.assertEqual(smtp_ssl.call_args.args, ("smtp.example.com", 465))
+        self.assertEqual(smtp_ssl.call_args.kwargs["timeout"], mail_module.MAIL_SOCKET_TIMEOUT_SECONDS)
+        _assert_verified_tls_context(self, smtp_ssl.call_args.kwargs["context"])
         smtp.assert_not_called()
         self.assertEqual(fake_client.starttls_calls, 0)
         self.assertEqual(fake_client.sent_message_ids, ["<fixed@example.com>"])
@@ -401,9 +448,10 @@ Content-Type: text/plain; charset="utf-8"
         ) as smtp:
             SMTPOutboundClient(mailbox).send(message)
 
-        smtp.assert_called_once_with("smtp.example.com", 587)
+        smtp.assert_called_once_with("smtp.example.com", 587, timeout=mail_module.MAIL_SOCKET_TIMEOUT_SECONDS)
         smtp_ssl.assert_not_called()
         self.assertEqual(fake_client.starttls_calls, 1)
+        _assert_verified_tls_context(self, fake_client.starttls_contexts[0])
         self.assertEqual(fake_client.sent_message_ids, ["<fixed@example.com>"])
 
     def test_smtp_security_none_uses_plain_smtp_without_starttls(self) -> None:
@@ -417,7 +465,7 @@ Content-Type: text/plain; charset="utf-8"
         ) as smtp:
             SMTPOutboundClient(mailbox).send(message)
 
-        smtp.assert_called_once_with("smtp.example.com", 25)
+        smtp.assert_called_once_with("smtp.example.com", 25, timeout=mail_module.MAIL_SOCKET_TIMEOUT_SECONDS)
         smtp_ssl.assert_not_called()
         self.assertEqual(fake_client.starttls_calls, 0)
         self.assertEqual(fake_client.sent_message_ids, ["<fixed@example.com>"])
@@ -468,6 +516,7 @@ class _FakeSMTPClient:
     def __init__(self, *, quit_exception: Exception | None = None) -> None:
         self.sent_message_ids: list[str] = []
         self.starttls_calls = 0
+        self.starttls_contexts: list[object] = []
         self.quit_calls = 0
         self.close_calls = 0
         self._quit_exception = quit_exception
@@ -475,8 +524,9 @@ class _FakeSMTPClient:
     def login(self, username: str, password: str) -> None:
         return None
 
-    def starttls(self) -> None:
+    def starttls(self, *, context: object = None) -> None:
         self.starttls_calls += 1
+        self.starttls_contexts.append(context)
 
     def send_message(self, message: EmailMessage) -> None:
         self.sent_message_ids.append(message["Message-ID"])
@@ -488,6 +538,12 @@ class _FakeSMTPClient:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+def _assert_verified_tls_context(test_case: unittest.TestCase, context: object) -> None:
+    test_case.assertIsInstance(context, ssl.SSLContext)
+    test_case.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+    test_case.assertTrue(context.check_hostname)
 
 
 def _smtp_endpoint(*, host: str, port: int, security: str, username: str, password: str):

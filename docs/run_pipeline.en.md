@@ -18,7 +18,7 @@ Core principles:
 
 1. Static prompt documents are read-only.
 2. The LLM only proposes candidate memories; code decides what to write.
-3. Image failure interrupts the current run, but does not corrupt memory.
+3. Image failure interrupts the current run and no email is sent; user-side memory already written by Stage 1 is kept, and the character-side episode is not written.
 4. All inputs and outputs must be archived and traceable.
 
 ## 2. Document Sources

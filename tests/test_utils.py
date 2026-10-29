@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import smtplib
+import ssl
 import unittest
 
 from dropline.utils import is_transient_network_error
@@ -26,6 +27,10 @@ class IsTransientNetworkErrorTests(unittest.TestCase):
     def test_connection_error_is_transient(self) -> None:
         exc = ConnectionError("connection reset by peer")
         self.assertTrue(is_transient_network_error(exc))
+
+    def test_certificate_verification_failure_is_not_transient(self) -> None:
+        exc = ssl.SSLCertVerificationError("certificate verify failed")
+        self.assertFalse(is_transient_network_error(exc))
 
     def test_plain_os_error_is_transient(self) -> None:
         exc = OSError("some low level failure")

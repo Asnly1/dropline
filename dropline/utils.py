@@ -4,6 +4,7 @@ import hashlib
 import imaplib
 import logging
 import smtplib
+import ssl
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -60,6 +61,8 @@ def resolve_path_within_roots(path_value: str | Path, allowed_roots: Iterable[st
 
 
 def is_transient_network_error(exc: BaseException) -> bool:
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return False
     if isinstance(exc, smtplib.SMTPException) and not isinstance(
         exc, (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError)
     ):

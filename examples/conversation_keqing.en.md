@@ -1,7 +1,7 @@
 # Example exchange · Keqing / Childhood Friends (English)
 
-> **What this is**: a real, unedited dropline run — one of Keqing's `init-once` opening
-> letters, plus the first round of back-and-forth (your reply → Keqing's reply).
+> **What this is**: a real, unedited dropline run — the opening letter Keqing sends on the first
+> `run-once`, plus the first round of back-and-forth (your reply → Keqing's reply).
 >
 > **Images**: each one was generated for that turn from its `scene_card`, by the image
 > model — not hand-picked.
@@ -15,7 +15,7 @@
 
 ---
 
-## ① Keqing reaches out first · init-once
+## ① Keqing reaches out first · first run-once
 
 **Subject:** Recent adjustments at the harbor
 
@@ -32,7 +32,7 @@ Remember to eat something proper, not just a hasty bite to save time. Write back
 <details>
 <summary>🔍 Behind the scenes · two-stage pipeline</summary>
 
-**Inbound**: none — this is an init-once letter; the character reaches out on her own, so there is no incoming mail and no memory is extracted this turn.
+**Inbound**: none — this is the opening letter from the first run-once; the character reaches out on her own, so there is no incoming mail and no memory is extracted this turn.
 
 **scene_card → image**: a quiet section of the southern wharves in Liyue Harbor · pausing from a cargo manifest near stacked crates to gaze at the ocean · late afternoon, near sunset · briefly nostalgic, quietly satisfied with the day's work.
 
