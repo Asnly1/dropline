@@ -674,6 +674,18 @@ class MemoryManager:
         key = hash_text(f"{candidate.type}:{candidate.content}", prefix=f"{candidate.type}-")
         existing = next((entry for entry in entries if entry.key == key), None)
         if existing is None:
+            # Hand-written files may carry arbitrary keys: a retired entry with the same statement
+            # is still the one to bring back rather than a second copy of it.
+            normalized = _normalize_memory(candidate.content)
+            existing = next(
+                (
+                    entry
+                    for entry in entries
+                    if entry.status != MEMORY_STATUS_ACTIVE and _normalize_memory(entry.content) == normalized
+                ),
+                None,
+            )
+        if existing is None:
             entry = self._new_entry(candidate, source_message_ids=source_message_ids, source_dates=source_dates, now=now)
             entries.append(entry)
             return entry

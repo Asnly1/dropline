@@ -1,15 +1,17 @@
 """Local web page for viewing and editing the active session's long-term memory.
 
 The server is a thin JSON layer over :class:`MemoryManager`, served with the standard
-library's ``http.server`` on the loopback interface. A random token generated at start-up
-is injected into the page and must accompany every non-GET request, and the ``Origin`` and
-``Host`` headers of every request must point at this server, so a page from any other
-origin cannot read or change the memory files.
+library's ``http.server`` on the loopback interface by default. A random token generated at
+start-up is injected into the page and must accompany every non-GET request, and the ``Origin``
+and ``Host`` headers of every request must point at this server, so a page from any other
+origin cannot read or change the memory files. The page is only as private as the address it
+listens on: anyone who can reach the port of a non-loopback bind can fetch the page and its token.
 """
 
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import logging
 import secrets
@@ -17,6 +19,8 @@ import socket
 import socketserver
 import threading
 import webbrowser
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,8 +30,14 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from .config import Settings, current_character_name, load_settings
-from .documents import list_json_files, load_json_file
-from .memory import MEMORY_FILE_KEYS, MemoryManager
+from .documents import list_json_files, load_entries, load_json_file
+from .memory import (
+    MEMORY_FILE_KEYS,
+    MEMORY_STATUS_ACTIVE,
+    MemoryManager,
+    suppressed_memory_path,
+)
+from .storage import StateStore
 from .utils import now_in_timezone
 
 LOGGER = logging.getLogger(__name__)
@@ -44,9 +54,15 @@ PAGE_CSP = (
 )
 EPISODE_DAYS = 7
 MAX_BODY_BYTES = 256 * 1024
+REQUEST_TIMEOUT_SECONDS = 30
 LOOPBACK_HOSTNAMES = frozenset({"127.0.0.1", "::1", "localhost"})
 WILDCARD_HOSTS = frozenset({"", "0.0.0.0", "::"})
 NO_PROFILE_MESSAGE = "No active profile selected. Use `python3 -m dropline select ...` first."
+PIPELINE_RUNNING_MESSAGE = "A pipeline run is in progress, retry later."
+NON_LOOPBACK_WARNING = (
+    "Listening on %s, which is not a loopback address: anyone who can reach this port can read and change "
+    "the session's memory. Use it only inside a trusted network, behind a firewall or through an SSH tunnel."
+)
 
 
 class MemoryUIError(Exception):
@@ -59,7 +75,11 @@ class MemoryUIError(Exception):
 
 
 class MemoryUIService:
-    """What the page can do, independent of HTTP. Calls are serialized with a lock."""
+    """What the page can do, independent of HTTP.
+
+    Calls are serialized with a lock, and every write also takes the pipeline's run lock
+    (without waiting) so the page and a running pipeline never rewrite the memory files together.
+    """
 
     def __init__(self, settings: Settings) -> None:
         if settings.active_profile is None:
@@ -67,10 +87,27 @@ class MemoryUIService:
         self.settings = settings
         self.profile = settings.active_profile
         self.manager = MemoryManager(settings)
+        self.state_store = StateStore(settings)
         self._lock = threading.Lock()
 
     def _now(self) -> datetime:
         return now_in_timezone(self.settings.project.timezone)
+
+    @contextmanager
+    def _write_lock(self) -> Iterator[None]:
+        with self._lock, ExitStack() as stack:
+            try:
+                stack.enter_context(self.state_store.acquire_lock())
+            except RuntimeError as exc:
+                raise MemoryUIError(HTTPStatus.CONFLICT, PIPELINE_RUNNING_MESSAGE) from exc
+            yield
+
+    def list_suppressed(self) -> list[dict[str, Any]]:
+        """Tombstones from ``suppressed.json``; a hand-edited file may hold non-objects, which are skipped."""
+        path = suppressed_memory_path(self.settings)
+        if not path.exists():
+            return []
+        return [dict(item) for item in load_entries(path) if isinstance(item, dict)]
 
     def overview(self) -> dict[str, Any]:
         with self._lock:
@@ -89,7 +126,7 @@ class MemoryUIService:
                 "episode_days": EPISODE_DAYS,
                 "memory": {file_key: self.manager.list_entries(file_key) for file_key in MEMORY_FILE_KEYS},
                 "conflicts": self.manager.list_conflicts(),
-                "suppressed": self.manager.list_suppressed(),
+                "suppressed": self.list_suppressed(),
                 "recent_user_episodes": _recent_episode_records(documents.user_episode_dir, days=EPISODE_DAYS, now=now),
                 "recent_character_episodes": _recent_episode_records(
                     documents.character_episode_dir, days=EPISODE_DAYS, now=now
@@ -97,19 +134,32 @@ class MemoryUIService:
             }
 
     def add_entry(self, file_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Add an entry.
+
+        ``created`` is False when the same memory was already active; ``revived`` is True when the
+        content matched a superseded entry, which is active again instead of being duplicated.
+        """
         content = _required_text(payload, "content")
         why_it_matters = _optional_text(payload, "why_it_matters") or ""
-        with self._lock:
-            existing_keys = {str(item.get("key", "")) for item in self.manager.list_entries(file_key)}
+        with self._write_lock():
+            statuses_before = {
+                str(item.get("key", "")): str(item.get("status", MEMORY_STATUS_ACTIVE)) or MEMORY_STATUS_ACTIVE
+                for item in self.manager.list_entries(file_key)
+            }
             entry = self.manager.add_manual_entry(file_key, content=content, why_it_matters=why_it_matters, now=self._now())
-        return {"entry": entry, "created": entry["key"] not in existing_keys}
+        status_before = statuses_before.get(entry["key"])
+        return {
+            "entry": entry,
+            "created": status_before is None,
+            "revived": status_before is not None and status_before != entry["status"],
+        }
 
     def update_entry(self, file_key: str, key: str, payload: dict[str, Any]) -> dict[str, Any]:
         content = _optional_text(payload, "content")
         why_it_matters = _optional_text(payload, "why_it_matters")
         if content is None and why_it_matters is None:
             raise MemoryUIError(HTTPStatus.BAD_REQUEST, "Provide content and/or why_it_matters to update.")
-        with self._lock:
+        with self._write_lock():
             entry = self.manager.update_entry(
                 file_key, key, content=content, why_it_matters=why_it_matters, now=self._now()
             )
@@ -118,14 +168,14 @@ class MemoryUIService:
         return {"entry": entry}
 
     def delete_entry(self, file_key: str, key: str) -> dict[str, Any]:
-        with self._lock:
+        with self._write_lock():
             deleted = self.manager.delete_entry(file_key, key, suppress=True, now=self._now())
         if not deleted:
             raise MemoryUIError(HTTPStatus.NOT_FOUND, f"Memory entry not found: {key}")
         return {"deleted": True, "key": key}
 
     def unsuppress(self, key: str) -> dict[str, Any]:
-        with self._lock:
+        with self._write_lock():
             restored = self.manager.unsuppress(key)
         if not restored:
             raise MemoryUIError(HTTPStatus.NOT_FOUND, f"Deleted memory not found: {key}")
@@ -133,7 +183,7 @@ class MemoryUIService:
 
     def resolve_conflict(self, key: str, payload: dict[str, Any]) -> dict[str, Any]:
         choice = _required_text(payload, "choice")
-        with self._lock:
+        with self._write_lock():
             resolved = self.manager.resolve_conflict(key, choice=choice, now=self._now())
         if not resolved:
             raise MemoryUIError(HTTPStatus.NOT_FOUND, f"Conflict not found: {key}")
@@ -168,7 +218,10 @@ class MemoryUIServer(ThreadingHTTPServer):
 
     @property
     def url(self) -> str:
-        host = f"[{self.bind_host}]" if ":" in self.bind_host else self.bind_host
+        """The address to print and open; a wildcard bind is reached through the loopback address."""
+        host = _reachable_host(self.bind_host)
+        if ":" in host:
+            host = f"[{host}]"
         return f"http://{host}:{self.port}/"
 
     def render_page(self) -> bytes:
@@ -181,7 +234,11 @@ class MemoryUIServer(ThreadingHTTPServer):
         hostname, port = parsed
         if port != self.port:
             return False
-        return self.bind_host in WILDCARD_HOSTS or hostname in self.allowed_hostnames
+        if self.bind_host in WILDCARD_HOSTS:
+            # Reachable through any interface, but never through a domain name: a DNS name that
+            # resolves here (DNS rebinding) must not let another site's page read the token.
+            return hostname == "localhost" or _is_ip_literal(hostname)
+        return hostname in self.allowed_hostnames
 
     def origin_allowed(self, origin: str | None, host_header: str | None) -> bool:
         """True when ``origin`` is this server as reached through the (already allowed) host."""
@@ -199,6 +256,7 @@ class MemoryUIServer(ThreadingHTTPServer):
 
 class MemoryUIHandler(BaseHTTPRequestHandler):
     server: MemoryUIServer
+    timeout = REQUEST_TIMEOUT_SECONDS
 
     def do_GET(self) -> None:
         self._handle("GET")
@@ -226,6 +284,13 @@ class MemoryUIHandler(BaseHTTPRequestHandler):
             status, payload = self._route(method, path)
         except MemoryUIError as exc:
             self._send_json(exc.status, {"error": exc.message})
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # The request body is validated in _read_json_body, so this is a session file that is not JSON.
+            LOGGER.exception("Memory UI could not parse one of the session's files")
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": "One of the session's files is not valid UTF-8 JSON; see the log."},
+            )
         except ValueError as exc:
             # MemoryManager validation: unknown memory file, empty content, bad conflict choice, ...
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -234,6 +299,14 @@ class MemoryUIHandler(BaseHTTPRequestHandler):
             self._send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {"error": "Could not read or write the session's memory files; see the log."},
+            )
+        except Exception:
+            # Typically a hand-edited file with the wrong shape (a null confidence, a number where a
+            # list belongs, ...); the client gets an answer and the details stay in the log.
+            LOGGER.exception("Memory UI failed to handle %s %s", method, path)
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": "Unexpected server error, possibly a malformed session file; see the log."},
             )
         else:
             self._send_json(status, payload)
@@ -291,15 +364,19 @@ class MemoryUIHandler(BaseHTTPRequestHandler):
         self._send(status, body, "application/json; charset=utf-8")
 
     def _send(self, status: HTTPStatus, body: bytes, content_type: str, *, csp: str | None = None) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        if csp is not None:
-            self.send_header("Content-Security-Policy", csp)
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if csp is not None:
+                self.send_header("Content-Security-Policy", csp)
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            # The browser went away (tab closed, page reloaded) before the response was written.
+            LOGGER.debug("%s - connection closed before the response was sent: %s", self.address_string(), exc)
 
 
 def load_page_template() -> str:
@@ -333,6 +410,8 @@ def memory_ui_command(
     except OSError as exc:
         print(f"Could not listen on {host}:{port}: {exc}. Pick another port with --port.")
         return 1
+    if not _is_loopback_host(host):
+        LOGGER.warning(NON_LOOPBACK_WARNING, host)
     character = current_character_name(settings)
     relationship = settings.active_profile.relationship.name
     print(f"Memory UI for {character} / {relationship}: {server.url}")
@@ -376,11 +455,12 @@ def _recent_episode_records(directory: Path, *, days: int, now: datetime) -> lis
             if batch_id:
                 seen_batch_ids.add(batch_id)
             episode = item.get("episode", item.get("payload", {}))
+            source_dates = item.get("source_dates")
             record: dict[str, Any] = {
                 "date": path.stem,
                 "batch_id": batch_id,
                 "created_at": str(item.get("created_at", "")),
-                "source_dates": [str(value) for value in item.get("source_dates", [])],
+                "source_dates": [str(value) for value in source_dates] if isinstance(source_dates, list) else [],
                 "episode": dict(episode) if isinstance(episode, dict) else {},
             }
             for extra in ("memory_observations", "open_loops"):
@@ -402,6 +482,31 @@ def _parse_host(value: str | None) -> tuple[str, int] | None:
     if not hostname:
         return None
     return hostname.lower(), port if port is not None else 80
+
+
+def _is_ip_literal(hostname: str) -> bool:
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for ``localhost`` and loopback IP literals, the binds nobody else on the network can reach."""
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _reachable_host(bind_host: str) -> str:
+    """The host a browser on this machine should use: a wildcard bind is reached through loopback."""
+    if bind_host in WILDCARD_HOSTS:
+        return "::1" if ":" in bind_host else "127.0.0.1"
+    return bind_host
 
 
 def _required_text(payload: dict[str, Any], key: str) -> str:
