@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import io
 import json
+import logging
+import re
 import socket
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
 from datetime import timedelta
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -15,13 +18,18 @@ from urllib import request
 from urllib.error import HTTPError
 
 from dropline.documents import load_entries, write_json_file
+from dropline.memory import suppressed_memory_path
 from dropline.memory_ui import (
     TOKEN_HEADER,
     TOKEN_PLACEHOLDER,
+    MemoryUIHandler,
     MemoryUIServer,
+    _reachable_host,
+    load_page_template,
     memory_ui_command,
 )
 from dropline.models import ConflictNote, ManagedMemoryEntry
+from dropline.storage import StateStore
 from dropline.utils import now_in_timezone
 from tests.helpers import create_test_repo, load_test_settings
 
@@ -198,6 +206,72 @@ class MemoryUIServerTests(unittest.TestCase):
             ],
         )
 
+    def test_overview_tolerates_hand_edited_episode_and_tombstone_files(self) -> None:
+        today = now_in_timezone(self.settings.project.timezone).date()
+        write_json_file(
+            self.settings.documents.user_episode_dir / f"{today.isoformat()}.json",
+            [
+                {
+                    "batch_id": "batch-1",
+                    "source_dates": 20260331,
+                    "episode": {"main_event": "你说自己在准备考试。"},
+                    "memory_observations": "用户在准备考试",
+                    "open_loops": {"topic": "考试结果"},
+                }
+            ],
+        )
+        write_json_file(suppressed_memory_path(self.settings), [1, "x", {"key": "suppressed-1", "content": "用户喜欢猫"}])
+
+        payload = self._overview()
+
+        record = payload["recent_user_episodes"][0]
+        self.assertEqual(record["source_dates"], [])
+        self.assertEqual(record["episode"], {"main_event": "你说自己在准备考试。"})
+        self.assertNotIn("memory_observations", record)
+        self.assertNotIn("open_loops", record)
+        self.assertEqual(payload["suppressed"], [{"key": "suppressed-1", "content": "用户喜欢猫"}])
+
+    def test_malformed_session_files_are_reported_as_500_without_a_traceback(self) -> None:
+        documents = self.settings.documents
+        profile_path = documents.user_profile
+        cases = (
+            (
+                "confidence is null",
+                profile_path,
+                [{**_entry("用户喜欢猫", key="user_profile-1"), "confidence": None}],
+                "POST",
+                {"content": "用户喜欢狗"},
+            ),
+            ("memory entries are numbers", profile_path, [1, 2], "GET", None),
+            ("conflict notes are numbers", documents.conflict_notes, [1], "GET", None),
+        )
+        for label, file_path, entries, method, body in cases:
+            with self.subTest(case=label):
+                write_json_file(file_path, entries)
+                path = "/api/overview" if method == "GET" else "/api/memory/user_profile"
+
+                with self.assertLogs("dropline.memory_ui", level="ERROR") as logs:
+                    status, payload, headers = self._request(method, path, body)
+
+                self.assertEqual(status, 500)
+                self.assertTrue(headers["Content-Type"].startswith("application/json"))
+                self.assertEqual(payload, {"error": "Unexpected server error, possibly a malformed session file; see the log."})
+                self.assertEqual(len(logs.records), 1)
+                self.assertIn("Traceback", logs.output[0])
+                write_json_file(file_path, [])
+
+        for label, raw in (("not json", b"[{not json"), ("not utf-8", b"\xff\xfe[]")):
+            with self.subTest(case=label):
+                profile_path.write_bytes(raw)
+                with self.assertLogs("dropline.memory_ui", level="ERROR"):
+                    status, payload, _ = self._request("GET", "/api/overview")
+                self.assertEqual(status, 500)
+                self.assertEqual(payload, {"error": "One of the session's files is not valid UTF-8 JSON; see the log."})
+
+        # The server keeps answering once the file is fixed.
+        write_json_file(profile_path, [_entry("用户喜欢猫", key="user_profile-1")])
+        self.assertEqual([item["key"] for item in self._overview()["memory"]["user_profile"]], ["user_profile-1"])
+
     def test_add_update_delete_tombstone_restore_round_trip(self) -> None:
         status, payload, _ = self._request(
             "POST",
@@ -206,6 +280,7 @@ class MemoryUIServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertTrue(payload["created"])
+        self.assertFalse(payload["revived"])
         entry = payload["entry"]
         key = entry["key"]
         self.assertEqual(entry["content"], "用户养了一只叫团子的猫")
@@ -217,6 +292,7 @@ class MemoryUIServerTests(unittest.TestCase):
         status, payload, _ = self._request("POST", "/api/memory/user_profile", {"content": "用户养了一只叫团子的猫"})
         self.assertEqual(status, 200)
         self.assertFalse(payload["created"])
+        self.assertFalse(payload["revived"])
         self.assertEqual(payload["entry"]["key"], key)
         self.assertEqual(len(load_entries(self.settings.documents.user_profile)), 1)
 
@@ -257,9 +333,57 @@ class MemoryUIServerTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertTrue(payload["created"])
+        self.assertFalse(payload["revived"])
         overview = self._overview()
         self.assertEqual(overview["suppressed"], [])
         self.assertEqual([item["content"] for item in overview["memory"]["relationship_memory"]], ["用户希望被称呼为小鱼"])
+
+    def test_adding_the_content_of_a_superseded_entry_revives_it(self) -> None:
+        write_json_file(
+            self.settings.documents.user_profile,
+            [
+                {**_entry("用户喜欢猫", key="user_profile-old", status="superseded"), "superseded_by": "user_profile-new"},
+                _entry("用户不喜欢猫", key="user_profile-new"),
+            ],
+        )
+
+        status, payload, _ = self._request("POST", "/api/memory/user_profile", {"content": "用户喜欢猫"})
+
+        self.assertEqual(status, 200)
+        self.assertEqual((payload["created"], payload["revived"]), (False, True))
+        self.assertEqual(payload["entry"]["key"], "user_profile-old")
+        self.assertEqual(payload["entry"]["status"], "active")
+        entries = self._overview()["memory"]["user_profile"]
+        self.assertEqual(
+            [(item["key"], item["status"], item["superseded_by"]) for item in entries],
+            [("user_profile-old", "active", ""), ("user_profile-new", "superseded", "user_profile-old")],
+        )
+
+    def test_writes_are_refused_with_409_while_a_pipeline_run_holds_the_lock(self) -> None:
+        cases = (
+            ("POST", "/api/memory/user_profile", {"content": "用户喜欢猫"}),
+            ("PUT", "/api/memory/user_profile/user_profile-1", {"content": "用户喜欢狗"}),
+            ("DELETE", "/api/memory/user_profile/user_profile-1", None),
+            ("DELETE", "/api/suppressed/suppressed-1", None),
+            ("POST", "/api/conflicts/conflict-1", {"choice": "take_new"}),
+        )
+        write_json_file(self.settings.documents.user_profile, [_entry("用户喜欢猫", key="user_profile-1")])
+
+        with StateStore(self.settings).acquire_lock():
+            for method, path, body in cases:
+                with self.subTest(method=method, path=path):
+                    status, payload, _ = self._request(method, path, body)
+                    self.assertEqual(status, 409)
+                    self.assertIn("pipeline run is in progress", payload["error"])
+            # Reading is not affected, and nothing was changed.
+            self.assertEqual([item["content"] for item in self._overview()["memory"]["user_profile"]], ["用户喜欢猫"])
+
+        status, payload, _ = self._request("PUT", "/api/memory/user_profile/user_profile-1", {"content": "用户喜欢狗"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["entry"]["content"], "用户喜欢狗")
+        # The page releases the run lock after each write, so the pipeline can take it again.
+        with StateStore(self.settings).acquire_lock():
+            pass
 
     def test_active_arc_limit_is_reported_as_400(self) -> None:
         for content in ("用户在准备考试", "用户在找新房子"):
@@ -430,6 +554,139 @@ class MemoryUIServerTests(unittest.TestCase):
                 self.assertNotIn(TOKEN_PLACEHOLDER, body)
                 self.assertNotIn("http://", body.split("<body>", 1)[1].split("<script>", 1)[0])
 
+    def test_handler_times_out_idle_connections_and_ignores_a_vanished_client(self) -> None:
+        self.assertEqual(MemoryUIHandler.timeout, 30)
+        for error in (BrokenPipeError("Broken pipe"), ConnectionResetError("Connection reset by peer")):
+            with self.subTest(error=type(error).__name__):
+                handler = MemoryUIHandler.__new__(MemoryUIHandler)
+                handler.client_address = ("127.0.0.1", 54321)
+                handler.request_version = "HTTP/1.1"
+                handler.requestline = "GET /api/overview HTTP/1.1"
+                handler.command = "GET"
+                handler.close_connection = True
+                handler.wfile = _VanishedClient(error)
+
+                with self.assertLogs("dropline.memory_ui", level="DEBUG") as logs:
+                    handler._send_json(HTTPStatus.OK, {"ok": True})
+
+                self.assertTrue(handler.wfile.writes)
+                self.assertTrue(any("connection closed before the response was sent" in line for line in logs.output))
+                self.assertFalse(any(record.levelno > logging.DEBUG for record in logs.records))
+
+
+class _VanishedClient:
+    """A ``wfile`` whose peer has gone away: every write fails with the given error."""
+
+    def __init__(self, error: OSError) -> None:
+        self.error = error
+        self.writes = 0
+
+    def write(self, data: bytes) -> int:
+        self.writes += 1
+        raise self.error
+
+    def flush(self) -> None:
+        pass
+
+
+class WildcardBindTests(unittest.TestCase):
+    """A server bound to every interface still only answers requests addressed by IP or ``localhost``."""
+
+    def setUp(self) -> None:
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        self.root = Path(tmp_dir.name)
+        create_test_repo(self.root)
+        self.settings = load_test_settings(self.root)
+        self.server = MemoryUIServer(self.settings, host="0.0.0.0", port=0)
+        self.port = self.server.port
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._stop_server)
+        self.opener = request.build_opener(request.ProxyHandler({}))
+
+    def _stop_server(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+    def _get(self, path: str, host_header: str) -> tuple[int, Any]:
+        req = request.Request(f"http://127.0.0.1:{self.port}{path}", method="GET")
+        req.add_header("Host", host_header)
+        try:
+            with self.opener.open(req, timeout=5) as response:
+                return response.status, _decode(response)
+        except HTTPError as exc:
+            return exc.code, _decode(exc)
+
+    def test_url_points_at_the_loopback_address(self) -> None:
+        self.assertEqual(self.server.url, f"http://127.0.0.1:{self.port}/")
+        self.assertEqual(_reachable_host("::"), "::1")
+        self.assertEqual(_reachable_host(""), "127.0.0.1")
+        self.assertEqual(_reachable_host("192.0.2.10"), "192.0.2.10")
+
+    def test_ip_literals_and_localhost_are_accepted(self) -> None:
+        for host_header in (f"127.0.0.1:{self.port}", f"localhost:{self.port}", f"[::1]:{self.port}", f"192.0.2.10:{self.port}"):
+            with self.subTest(host=host_header):
+                status, payload = self._get("/api/overview", host_header)
+                self.assertEqual(status, 200)
+                self.assertIn("memory", payload)
+
+    def test_domain_names_are_rejected_to_block_dns_rebinding(self) -> None:
+        cases = (
+            f"evil.example:{self.port}",
+            f"127.0.0.1.evil.example:{self.port}",
+            f"app.localhost:{self.port}",
+            f"127.0.0.1:{self.port + 1}",
+        )
+        for host_header in cases:
+            with self.subTest(host=host_header):
+                for path in ("/", "/api/overview"):
+                    status, payload = self._get(path, host_header)
+                    self.assertEqual(status, 403)
+                    self.assertIn("Host", payload["error"])
+
+    def test_ipv6_wildcard_url_uses_the_ipv6_loopback(self) -> None:
+        try:
+            server = MemoryUIServer(self.settings, host="::", port=0)
+        except OSError as exc:
+            self.skipTest(f"IPv6 is not available here: {exc}")
+        self.addCleanup(server.server_close)
+        self.assertEqual(server.url, f"http://[::1]:{server.port}/")
+
+
+class MemoryUIPageTests(unittest.TestCase):
+    """The page is plain JavaScript without a test runner, so its guards are pinned by inspecting the source."""
+
+    def setUp(self) -> None:
+        self.template = load_page_template()
+        self.script = self.template.split("<script>", 1)[1].split("</script>", 1)[0]
+
+    def _function_body(self, name: str) -> str:
+        match = re.search(rf"\n  function {name}\([^)]*\) \{{\n(.*?)\n  \}}\n", self.script, re.DOTALL)
+        self.assertIsNotNone(match, f"function {name}() not found in the page")
+        return match.group(1)
+
+    def test_evidence_labels_only_use_own_keys(self) -> None:
+        self.assertIn("Object.prototype.hasOwnProperty.call(EVIDENCE_KEYS, item)", self._function_body("evidenceLabel"))
+
+    def test_revived_entries_get_their_own_message(self) -> None:
+        self.assertEqual(self.script.count("msg_revived:"), 2)
+        self.assertIn("已恢复为生效", self.script)
+        self.assertIn("result.revived", self._function_body("addedMessageKey"))
+        self.assertIn("addedMessageKey(result)", self.script)
+
+    def test_toolbar_buttons_are_bound_once_outside_init(self) -> None:
+        init_body = self._function_body("init")
+        self.assertNotIn("addEventListener", init_body)
+        self.assertIn("onclick: init", init_body)
+        self.assertEqual(self.script.count('addEventListener("click"'), 2)
+        bind_body = self._function_body("bindControls")
+        self.assertIn('getElementById("refresh-button").addEventListener("click"', bind_body)
+        self.assertIn('getElementById("lang-button").addEventListener("click"', bind_body)
+        self.assertEqual(self.script.count("bindControls();"), 1)
+        self.assertLess(self.script.index("bindControls();"), self.script.rindex("init();"))
+
 
 class MemoryUICommandTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -455,6 +712,7 @@ class MemoryUICommandTests(unittest.TestCase):
             patch("dropline.memory_ui.webbrowser.open") as open_browser,
             patch.object(MemoryUIServer, "serve_forever", side_effect=KeyboardInterrupt),
             redirect_stdout(stdout),
+            self.assertNoLogs("dropline.memory_ui", level="WARNING"),
         ):
             exit_code = memory_ui_command(self.config_path, host="127.0.0.1", port=0, open_browser=True)
 
@@ -464,6 +722,26 @@ class MemoryUICommandTests(unittest.TestCase):
         self.assertTrue(url.startswith("http://127.0.0.1:"))
         self.assertIn(f"Memory UI for 刻晴 / 青梅竹马: {url}", stdout.getvalue())
         self.assertIn("Memory UI stopped.", stdout.getvalue())
+
+    def test_non_loopback_bind_warns_and_opens_the_page_through_loopback(self) -> None:
+        stdout = io.StringIO()
+        with (
+            patch("dropline.memory_ui.webbrowser.open") as open_browser,
+            patch.object(MemoryUIServer, "serve_forever", side_effect=KeyboardInterrupt),
+            redirect_stdout(stdout),
+            self.assertLogs("dropline.memory_ui", level="WARNING") as logs,
+        ):
+            exit_code = memory_ui_command(self.config_path, host="0.0.0.0", port=0, open_browser=True)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(logs.records[0].levelno, logging.WARNING)
+        self.assertIn("Listening on 0.0.0.0, which is not a loopback address", logs.output[0])
+        self.assertIn("SSH tunnel", logs.output[0])
+        url = open_browser.call_args.args[0]
+        self.assertTrue(url.startswith("http://127.0.0.1:"))
+        self.assertIn(f"Memory UI for 刻晴 / 青梅竹马: {url}", stdout.getvalue())
+        self.assertNotIn("0.0.0.0", stdout.getvalue())
 
     def test_no_browser_skips_opening_the_page(self) -> None:
         with (

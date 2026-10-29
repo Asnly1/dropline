@@ -229,6 +229,7 @@
       confirm_delete: "确定删除这条记忆吗？\n\n删除后会写入一条墓碑，模型之后再提出同样的内容也不会写回；可以在「已删除的记忆」里恢复。",
       msg_added: "已新增。",
       msg_exists: "已有同样的记忆，没有重复添加。",
+      msg_revived: "已恢复为生效：这条记忆之前被替代过。",
       msg_saved: "已保存。",
       msg_deleted: "已删除，并写入墓碑。",
       msg_restored: "已移除墓碑。",
@@ -314,6 +315,7 @@
       confirm_delete: "Delete this memory?\n\nA tombstone will be written so the model cannot write the same content back. You can restore it under “Deleted memories”.",
       msg_added: "Added.",
       msg_exists: "The same memory already exists; nothing was added.",
+      msg_revived: "Restored to active: the same memory had been superseded.",
       msg_saved: "Saved.",
       msg_deleted: "Deleted; a tombstone was written.",
       msg_restored: "Tombstone removed.",
@@ -453,7 +455,7 @@
   }
 
   function evidenceLabel(item) {
-    var key = EVIDENCE_KEYS[item];
+    var key = Object.prototype.hasOwnProperty.call(EVIDENCE_KEYS, item) ? EVIDENCE_KEYS[item] : null;
     return key ? t(key) : item;
   }
 
@@ -605,7 +607,7 @@
         : api("POST", "/api/memory/" + encodeURIComponent(fileKey), body);
       request.then(function (result) {
         if (isEdit) { showStatus(t("msg_saved"), "ok"); }
-        else { showStatus(t(result && result.created === false ? "msg_exists" : "msg_added"), "ok"); openAddForms[fileKey] = false; }
+        else { showStatus(t(addedMessageKey(result)), "ok"); openAddForms[fileKey] = false; }
         return refresh(isEdit ? [fileKey] : [fileKey, "suppressed"]);
       }).catch(function (err) {
         showError(error, t("msg_failed", { error: err.message }));
@@ -614,6 +616,11 @@
     });
     if (!isEdit) { setTimeout(function () { contentInput.focus(); }, 0); }
     return form;
+  }
+
+  function addedMessageKey(result) {
+    if (result && result.revived) { return "msg_revived"; }
+    return result && result.created === false ? "msg_exists" : "msg_added";
   }
 
   function addForm(fileKey) { return memoryForm(fileKey, null); }
@@ -852,13 +859,16 @@
     });
   }
 
-  function init() {
-    var loading = document.getElementById("loading");
+  function bindControls() {
     document.getElementById("refresh-button").addEventListener("click", function () { refresh(); });
     document.getElementById("lang-button").addEventListener("click", function () {
       lang = lang === "zh" ? "en" : "zh";
       if (overview) { renderAll(); }
     });
+  }
+
+  function init() {
+    var loading = document.getElementById("loading");
     api("GET", "/api/overview").then(function (payload) {
       overview = payload;
       lang = overview.language === "简体中文" ? "zh" : "en";
@@ -873,6 +883,7 @@
     });
   }
 
+  bindControls();
   init();
 })();
 </script>

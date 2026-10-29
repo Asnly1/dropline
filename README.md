@@ -179,7 +179,7 @@ None of this is configurable; it is how the inbox pull always behaves:
 
 - **UIDVALIDITY changes**: every inbox scan reads the IMAP folder's `UIDVALIDITY` and stores it in `state.db`. When the mailbox is rebuilt or migrated its UIDs are renumbered; dropline then logs an ERROR, resets the `last_seen_imap_uid` cursor to 0, and rescans the inbox from the date of the first outbound letter. Letters already stored are deduplicated by `Message-ID`, so none of them is answered twice; likewise, moving a letter out of INBOX and back (which assigns a new UID) never triggers a second reply.
 - **Quote stripping**: before a letter reaches Stage 1, the quoted previous letter is removed so only what the user wrote remains. Plain text recognizes `>` quote lines, `On … wrote:`, `-----Original Message-----`, `From:`, plus QQ Mail / Foxmail's `------------------ 原始邮件 ------------------`, Chinese Outlook / QQ Mail's `发件人:`, 163 / Apple Mail's `在 … 写道:`, Chinese Gmail's `… 于 … 写道:`, and Outlook's `________________` separator; HTML bodies first drop `<blockquote>`, `gmail_quote`, and any element whose id/class contains `quote` as a whole. On top of that, any paragraph that repeats a paragraph of the character's two most recent letters verbatim is removed, so the character's own words are never attributed to the user.
-- **Attachments**: only metadata is recorded (file name, type, size, inline flag), inline images included; attachment contents are never read, archived, or sent to the model. The character only knows that "a file of this kind arrived".
+- **Attachments**: only metadata is recorded (file name, type, size, inline flag), inline images included; attachment contents are never parsed, never enter the prompts and are never sent to the model, so the character only knows that "a file of this kind arrived". The raw letter (attachments included) is archived in full as an `.eml` file under `archive/YYYY-MM-DD/run-*/inbox_raw/` so it can be traced later.
 
 To pin the language used by model outputs, add `language` under `llm`:
 
@@ -252,7 +252,7 @@ python3 -m dropline run-once
 
 ## 🧠 Memory system
 
-A session's memory is split into six kinds. Stage 1 only **proposes**; code **decides** whether to promote:
+A session's memory is split into seven kinds. Stage 1 only **proposes**; code **decides** whether to promote:
 
 | File / Directory                  | Kind                     | Typical content                                                    |
 | --------------------------------- | ------------------------ | ------------------------------------------------------------------ |
@@ -287,7 +287,7 @@ python3 -m dropline memory-ui
 # optional: --host 127.0.0.1  --port 8765 (0 picks a free port)  --no-browser (do not open a browser)
 ```
 
-The command starts a small server bound to `127.0.0.1` only, prints the address and opens your browser; Ctrl+C stops it. It exits with an error when no profile is active. The page is a single HTML file with no external resources, so it works offline, fits a phone screen and follows the system dark mode; its labels follow `llm.language` (简体中文 / English).
+The command starts a small server bound to `127.0.0.1` by default, prints the address and opens your browser; Ctrl+C stops it. It exits with an error when no profile is active. The page is a single HTML file with no external resources, so it works offline, fits a phone screen and follows the system dark mode; its labels follow `llm.language` (简体中文 / English).
 
 The page is split into sections for the active session:
 
@@ -298,11 +298,13 @@ The page is split into sections for the active session:
 | Deleted memories (tombstones)                   | Everything you deleted                                                                               | "Restore" removes the tombstone                                                                          |
 | Episodes from the last 7 days                   | User-side and character-side short-term notes                                                        | Read-only                                                                                                |
 
-Entries you add by hand get `confidence` 1.0 and `evidence` `manual entry`, bypassing the promotion rules; hand edits append `manual edit` to `evidence`.
+Entries you add by hand get `confidence` 1.0 and `evidence` `manual entry`, bypassing the promotion rules; hand edits append `manual edit` to `evidence`. Adding an entry by hand immediately supersedes any existing entry that contradicts it (the old entry is marked `superseded`); adding content identical to a superseded entry revives that entry as active instead of creating a duplicate.
 
 **What delete means**: deleting an entry on the page removes it from the memory file and writes a tombstone to `memory/suppressed.json`; from then on the model cannot write the same content back. "Restore" only removes the tombstone — the memory itself does not come back; add it again by hand if you want it (adding content that matches a tombstone removes that tombstone).
 
-**Security**: the server binds to `127.0.0.1` by default; every modifying request must carry the random token generated at start-up and injected into the page, and its `Origin` / `Host` headers must point at this server, so another web page cannot use your browser to change memories; every response is sent with `Cache-Control: no-store`. If you bind to another address with `--host`, open the page through that exact address.
+**While the pipeline runs**: a pipeline run holds `pipeline.lock`, and while it does the page refuses changes with "a pipeline run is in progress, retry later", so the two never rewrite the memory files at the same time; reading is unaffected.
+
+**Security**: the server binds to `127.0.0.1` by default; every modifying request must carry the random token generated at start-up and injected into the page, and its `Origin` / `Host` headers must point at this server, so another web page cannot use your browser to change memories; every response is sent with `Cache-Control: no-store`. If you bind to another address with `--host`, open the page through that exact address (for `0.0.0.0` / `::` the printed address is the loopback one, and the `Host` header must be an IP literal or `localhost`, never a domain name). **When `--host` is not `127.0.0.1`, anyone who can connect to that port can read and modify the memories** — the page and its token are served without any login — so only use it inside a trusted network, behind a firewall or through an SSH tunnel; the command prints a WARNING when started that way.
 
 ---
 
@@ -392,7 +394,7 @@ When nobody is watching, dropline contains the common failures by itself and ema
 
 - **Back off, then retry** — after a failed run the scheduler waits at least `schedule.retry_after_minutes` before trying again (tick log event `skipped_backoff`); scheduler-triggered runs are capped at `schedule.max_runs_per_day` per day (`skipped_daily_limit`), while a manual `run-once` is never limited; the "catch up yesterday's missed send" path is attempted only once (`catch_up_succeeded` / `catch_up_failed`). One success resets the consecutive-failure counter.
 - **Retries reuse archived output** — when the same batch (same `batch_id`) is retried and the failed run already archived `stage2.json`, Stage 1 and Stage 2 are skipped and the run goes straight to image generation and sending; with only `stage1.json`, just Stage 2 runs again and the user-side episode is not written twice. The log names the run whose artifacts were reused (`reused_run_id=...`).
-- **Inbound quarantine** — when a reply-mode run fails in the stage1 / stage2 / validation / image stage, every inbound message in that batch gets `attempt_count` +1 and its `last_error` recorded; after `schedule.max_batch_attempts` attempts (only 2 for Stage 2 validation failures) the message is **quarantined** (`quarantined_at`). Quarantined mail leaves the batch, so the next run falls back to an initiative letter instead of letting one bad message block the character. `show-inbox` marks them as `QUARANTINED` with their `last_error`; once the cause is fixed, `requeue-inbound --uid N` puts a message back in the queue, and `delete-inbound --uid N` can delete it outright.
+- **Inbound quarantine** — when a reply-mode run fails in the stage1 / stage2 / validation / image stage, every inbound message in that batch gets `attempt_count` +1 and its `last_error` recorded; after `schedule.max_batch_attempts` attempts (for Stage 2 validation failures the limit is `min(max_batch_attempts, 2)`) the message is **quarantined** (`quarantined_at`). Quarantined mail leaves the batch, so the next run falls back to an initiative letter instead of letting one bad message block the character. `show-inbox` marks them as `QUARANTINED` with their `last_error`; once the cause is fixed, `requeue-inbound --uid N` puts a message back in the queue, and `delete-inbound --uid N` can delete it outright.
 - **Image fallback** — `llm.image.on_failure` defaults to `abort` (image stays a hard gate); with `text_only`, an image generation error is logged as a WARNING, `image_failure.json` is written to the run archive, and the email goes out as plain text.
 - **Zombie runs get closed** — at the start of every `scheduler-tick`, runs still `running` with a `started_at` older than 6 hours are marked `failed` (`error_stage=stale_running`); `mark-stale-runs-failed` remains available for older records.
 
@@ -414,7 +416,7 @@ Related keys (all optional, defaults shown):
 schedule:
   retry_after_minutes: 120 # minimum wait after a failed run before retrying
   max_runs_per_day: 3 # max scheduler-triggered runs per day (run-once does not count)
-  max_batch_attempts: 3 # attempts per inbound batch before quarantine (2 for validation failures)
+  max_batch_attempts: 3 # attempts per inbound batch before quarantine (validation failures: min(max_batch_attempts, 2))
 
 mail:
   alerts:

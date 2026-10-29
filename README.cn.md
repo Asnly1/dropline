@@ -179,7 +179,7 @@ mail:
 
 - **UIDVALIDITY 变化**:每次拉信都会读取 IMAP 文件夹的 `UIDVALIDITY` 并记在 `state.db`。邮箱重建索引或迁移后 UID 会重新编号,此时 dropline 会打一条 ERROR 日志,把 `last_seen_imap_uid` 游标归零,并从首封出站邮件的日期起重新扫描收件箱。已入库的来信按 `Message-ID` 去重,不会被再回一次;同理,把一封信移出 INBOX 再移回来(UID 变了)也不会触发第二封回信。
 - **引用链剥离**:来信正文在送入 Stage 1 前会剥掉被引用的上一封信,只保留用户自己写的部分。纯文本识别 `>` 引用行、`On … wrote:`、`-----Original Message-----`、`From:`,以及 QQ 邮箱 / Foxmail 的 `------------------ 原始邮件 ------------------`、中文 Outlook / QQ 邮箱的 `发件人:`、163 / Apple Mail 的 `在 … 写道:`、中文 Gmail 的 `… 于 … 写道:`、Outlook 的 `________________` 分隔线;HTML 正文会先整块删掉 `<blockquote>`、`gmail_quote` 以及 id/class 含 `quote` 的元素。此外,来信中与角色最近两封信逐段相同的段落也会被删掉,避免角色自己写过的话被当成用户说的话写进记忆。
-- **附件**:只记录元数据(文件名、类型、大小、是否内嵌),内嵌图片也算在内;附件内容不会被读取、归档或发给模型,角色只知道"收到了一个什么文件"。
+- **附件**:只记录元数据(文件名、类型、大小、是否内嵌),内嵌图片也算在内;附件内容不会被解析、不会进入提示词或发给模型,角色只知道"收到了一个什么文件"。原始邮件(含附件)会作为 `.eml` 完整归档到 `archive/YYYY-MM-DD/run-*/inbox_raw/` 以便追溯。
 
 如果你想统一控制模型输出的文本语言,可以在 `llm` 下增加 `language`:
 
@@ -250,7 +250,7 @@ python3 -m dropline run-once
 
 ## 🧠 记忆系统
 
-session 的记忆分 6 类,Stage 1 只负责**提议**,代码负责**裁决**是否写入:
+session 的记忆分 7 类,Stage 1 只负责**提议**,代码负责**裁决**是否写入:
 
 | 文件 / 目录                       | 类型       | 典型内容                                 |
 | --------------------------------- | ---------- | ---------------------------------------- |
@@ -285,7 +285,7 @@ python3 -m dropline memory-ui
 # 可选:--host 127.0.0.1  --port 8765(0 表示随机端口)  --no-browser(不自动打开浏览器)
 ```
 
-命令会在本机启动一个只监听 `127.0.0.1` 的小服务,打印访问地址并自动打开浏览器,Ctrl+C 退出;没有 active profile 时会报错退出。页面是单个 HTML 文件,不引用任何外部资源,离线可用,适配手机宽度和系统深色模式,界面文案跟随 `llm.language`(简体中文 / English)。
+命令会在本机启动一个默认只监听 `127.0.0.1` 的小服务,打印访问地址并自动打开浏览器,Ctrl+C 退出;没有 active profile 时会报错退出。页面是单个 HTML 文件,不引用任何外部资源,离线可用,适配手机宽度和系统深色模式,界面文案跟随 `llm.language`(简体中文 / English)。
 
 页面按当前 active session 分区显示:
 
@@ -296,11 +296,13 @@ python3 -m dropline memory-ui
 | 已删除的记忆(墓碑)               | 你删除过的内容                                                           | 「恢复」移除墓碑                                                              |
 | 最近 7 天 episode                | 用户侧与角色侧的短期记录                                                 | 只读                                                                          |
 
-手动新增的条目 `confidence` 为 1.0、`evidence` 记为 `manual entry`,不经过晋升门槛;手动修改会在 `evidence` 里追加 `manual edit`。
+手动新增的条目 `confidence` 为 1.0、`evidence` 记为 `manual entry`,不经过晋升门槛;手动修改会在 `evidence` 里追加 `manual edit`。手动新增会立即覆盖与之矛盾的旧条目(旧条目标记 `superseded`),与已被替代条目内容相同的新增会把它恢复为生效,而不是再建一条。
 
 **删除的语义**:在页面上删除一条记忆,会把它从记忆文件里移除,并在 `memory/suppressed.json` 写一条墓碑;之后模型再提出同样的内容也不会写回。「恢复」只是移除墓碑,记忆本身不会自动回来,需要的话再手动新增(新增与墓碑相同的内容时,墓碑会自动移除)。
 
-**安全**:服务默认只绑定 `127.0.0.1`;所有修改请求都必须带上启动时随机生成、注入在页面里的令牌,并且 `Origin` / `Host` 头必须指向这个服务本身,所以其他网页无法借你的浏览器改动记忆;响应一律 `Cache-Control: no-store`。如果用 `--host` 绑定到别的地址,请直接用那个地址打开页面。
+**pipeline 运行期间**:pipeline 运行时持有 `pipeline.lock`,此时页面上的修改会被拒绝并提示"a pipeline run is in progress, retry later",避免两边同时改写记忆文件;查看不受影响。
+
+**安全**:服务默认只绑定 `127.0.0.1`;所有修改请求都必须带上启动时随机生成、注入在页面里的令牌,并且 `Origin` / `Host` 头必须指向这个服务本身,所以其他网页无法借你的浏览器改动记忆;响应一律 `Cache-Control: no-store`。如果用 `--host` 绑定到别的地址,请直接用那个地址打开页面(绑定 `0.0.0.0` / `::` 时打印的是回环地址,且 `Host` 头必须是 IP 字面量或 `localhost`,不接受域名)。**`--host` 不是 `127.0.0.1` 时,任何能连到该端口的人都可以读取并修改记忆**——页面和令牌都是无需登录就下发的——只应在可信网络内配合防火墙或 SSH 隧道使用;以这种方式启动时命令会打印一条 WARNING。
 
 ---
 
@@ -390,7 +392,7 @@ schtasks /Delete /TN "dropline" /F
 
 - **先退避,再重试**:一次 run 失败后,调度器至少等 `schedule.retry_after_minutes` 分钟才会再试(tick 日志事件 `skipped_backoff`);每天由调度器触发的 run 不超过 `schedule.max_runs_per_day` 次(`skipped_daily_limit`),手动 `run-once` 不受此限制;"昨日漏发补发"只会尝试 1 次(`catch_up_succeeded` / `catch_up_failed`)。成功一次后连续失败计数归零。
 - **重试复用归档产物**:同一批次(同一 `batch_id`)重试时,若上次失败的 run 已归档 `stage2.json`,直接跳过 Stage 1 / Stage 2 进入配图和发信;若只有 `stage1.json`,则只重跑 Stage 2,且不会重复写入用户侧 episode。日志会写明复用了哪个 run 的产物(`reused_run_id=...`)。
-- **来信隔离**:reply 模式的 run 在 stage1 / stage2 / validation / image 阶段失败时,本批来信的 `attempt_count` +1 并记录 `last_error`;达到 `schedule.max_batch_attempts` 次(Stage 2 校验失败只需 2 次)就被**隔离**(`quarantined_at`)。被隔离的来信不再进入批次,下一次 run 会恢复为主动来信模式,不会让一封坏信卡住整个角色。`show-inbox` 会标出 `QUARANTINED` 和 `last_error`;修好问题后用 `requeue-inbound --uid N` 放回队列,`delete-inbound --uid N` 也可以直接删掉它。
+- **来信隔离**:reply 模式的 run 在 stage1 / stage2 / validation / image 阶段失败时,本批来信的 `attempt_count` +1 并记录 `last_error`;达到 `schedule.max_batch_attempts` 次(Stage 2 校验失败时上限为 `min(max_batch_attempts, 2)`)就被**隔离**(`quarantined_at`)。被隔离的来信不再进入批次,下一次 run 会恢复为主动来信模式,不会让一封坏信卡住整个角色。`show-inbox` 会标出 `QUARANTINED` 和 `last_error`;修好问题后用 `requeue-inbound --uid N` 放回队列,`delete-inbound --uid N` 也可以直接删掉它。
 - **配图降级**:`llm.image.on_failure` 默认 `abort`(保持"图片是硬门槛");设为 `text_only` 时图片生成失败只记 WARNING,并在归档目录写 `image_failure.json`,邮件改为纯文本发送。
 - **僵尸 run 自动收尾**:每次 `scheduler-tick` 开始时,`started_at` 早于 6 小时前且仍为 `running` 的 run 会被自动标为 `failed`(`error_stage=stale_running`);`mark-stale-runs-failed` 仍可手动处理更久远的记录。
 
@@ -412,7 +414,7 @@ python3 -m dropline status --config /绝对/路径/config.yaml
 schedule:
   retry_after_minutes: 120 # 失败后至少等多久再试
   max_runs_per_day: 3 # 调度器每天最多触发几次 run(run-once 不计)
-  max_batch_attempts: 3 # 同一批来信最多尝试几次,之后隔离(validation 失败 2 次即隔离)
+  max_batch_attempts: 3 # 同一批来信最多尝试几次,之后隔离(validation 失败时上限为 min(max_batch_attempts, 2))
 
 mail:
   alerts:
