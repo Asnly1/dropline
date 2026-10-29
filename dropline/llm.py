@@ -160,7 +160,8 @@ def _append_output_language_requirement(instructions: str, language: str) -> str
             f"Even if every input is Chinese, when llm.language={language}, all final natural-language content must use {language}.\n"
             "Rewrite every natural-language field into the target language, including summaries, body text, paraphrases, and scene_card fields; "
             "do not keep source-language fragments.\n"
-            "Do not translate JSON Schema field names, enum values, or protocol constants that the schema requires to stay unchanged."
+            "Do not translate JSON Schema field names, enum values, or protocol constants that the schema requires to stay unchanged. "
+            "Exception: the evidence field of each candidate memory must stay a verbatim quote from the inbound mail in its original language."
         )
     return (
         f"{instructions}\n"
@@ -169,6 +170,7 @@ def _append_output_language_requirement(instructions: str, language: str) -> str
         f"即使输入全部是中文，只要 llm.language={language}，最终所有自然语言内容也必须使用 {language}。\n"
         "必须把所有自然语言字段完整改写到目标语言，包括摘要、正文、复述、scene_card 等字段；不要保留源语言片段。\n"
         "不要翻译 JSON Schema 规定必须保留原样的字段名、枚举值、协议常量。"
+        "例外：candidate_memories 里的 evidence 字段必须保持来信原文的逐字引用，不要翻译。"
     )
 
 
@@ -179,14 +181,21 @@ def _build_language_repair_instructions(language: str) -> str:
             f"{LANGUAGE_REPAIR_INSTRUCTIONS_ENGLISH}\n"
             f"The target language for this run is {language}.\n"
             "Input language does not decide output language; user wording and quoted content must also be rewritten completely into the target language.\n"
-            "Do not translate JSON Schema field names, enum values, or protocol constants that the schema requires to stay unchanged."
+            "Do not translate JSON Schema field names, enum values, or protocol constants that the schema requires to stay unchanged. "
+            "Exception: the evidence field of each candidate memory must stay a verbatim quote from the inbound mail in its original language."
         )
     return (
         f"{LANGUAGE_REPAIR_INSTRUCTIONS}\n"
         f"本次目标语言是 {language}。\n"
         "输入语言不决定输出语言，用户原话与引用内容也必须完整改写到目标语言。\n"
         "不要翻译 JSON Schema 规定必须保留原样的字段名、枚举值、协议常量。"
+        "例外：candidate_memories 里的 evidence 字段必须保持来信原文的逐字引用，不要翻译。"
     )
+
+
+# Fields that must stay exactly as the model saw them in the inbound mail, whatever
+# llm.language says: the code later checks `evidence` against the mail body verbatim.
+VERBATIM_FIELD_NAMES = frozenset({"evidence", "source_date"})
 
 
 def _collect_translatable_fields(
@@ -202,6 +211,8 @@ def _collect_translatable_fields(
         fields: list[tuple[str, str]] = []
         properties = schema.get("properties", {})
         for key, value in payload.items():
+            if key in VERBATIM_FIELD_NAMES:
+                continue
             property_schema = properties.get(key)
             if isinstance(property_schema, dict):
                 fields.extend(_collect_translatable_fields(value, property_schema, path=f"{path}.{key}"))

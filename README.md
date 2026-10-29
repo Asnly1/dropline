@@ -254,10 +254,19 @@ A session's memory is split into six kinds. Stage 1 only **proposes**; code **de
 | `episodes/user/*.json`            | User short-term          | Daily mood, temporary worries (only the last 7 days are fed to the prompts; no automatic decay) |
 | `episodes/character/*.json`       | Character short-term     | What the character handled this turn                               |
 | `memory/conflict_notes.json`      | Conflicts                | New info contradicting old memory — parked here until re-confirmed |
+| `memory/suppressed.json`          | Deletions                | Memories you deleted by hand; the model may not write them back    |
 
-Both the four memory files and the episodes are plain JSON arrays of entries — UTF-8 text you can open and hand-edit. The pipeline rewrites them after each run.
+All memory files and the episodes are plain JSON arrays of entries — UTF-8 text you can open and hand-edit. The pipeline rewrites them after each run.
 
-Promotion is strict: one-off emotions, unverified speculation, and details the character fabricates **never** get promoted. Full rules: [docs/memory_promotion_rules.en.md](docs/memory_promotion_rules.en.md).
+Promotion is enforced by code and does not trust the model's self-reported scores:
+
+- A candidate's `evidence` must be found verbatim in the inbound mail body; candidates that fail this stay in the episode and never reach long-term memory.
+- Something the user explicitly asks to be remembered ("remember", "don't forget", "call me …") is written from that letter; everything else must have appeared on at least 2 distinct mail dates (by the mail `Date` header; several letters on one day count once).
+- Each letter adds at most 2 user_profile, 1 relationship_memory and 1 active_arc entries; content phrased about "today" or "this week" never becomes user_profile.
+- A statement that contradicts an existing memory goes to conflict_notes first. An explicit correction in the letter ("I misspoke", "actually …") replaces the old value at once; otherwise it must recur on a second distinct date. The replaced entry stays in the file marked `status: superseded` and is left out of the prompts.
+- Memories you delete by hand are recorded in `memory/suppressed.json`, and the model cannot write the same content back.
+
+Full rules: [docs/memory_promotion_rules.en.md](docs/memory_promotion_rules.en.md).
 
 ---
 

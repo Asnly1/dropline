@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime
@@ -20,6 +21,15 @@ from dropline.models import (
 from dropline.utils import hash_text
 
 from tests.helpers import create_test_repo, load_test_settings
+
+
+def _texts_for(stage1: Stage1Result) -> list[str]:
+    """Pretend the letter consisted of exactly the quoted evidence sentences."""
+    return ["\n".join(candidate.evidence for candidate in stage1.candidate_memories)]
+
+
+def _active_contents(entries: list[dict]) -> list[str]:
+    return [item["content"] for item in entries if item.get("status", "active") == "active"]
 
 
 class MemoryManagerTests(unittest.TestCase):
@@ -61,6 +71,7 @@ class MemoryManagerTests(unittest.TestCase):
 
             manager.write_user_side(
                 stage1_result=stage1,
+                inbound_texts=_texts_for(stage1),
                 batch_id="batch-1",
                 now=now,
                 source_message_ids=["<msg-1@example.com>"],
@@ -68,6 +79,7 @@ class MemoryManagerTests(unittest.TestCase):
             )
             manager.write_user_side(
                 stage1_result=stage1,
+                inbound_texts=_texts_for(stage1),
                 batch_id="batch-1",
                 now=now,
                 source_message_ids=["<msg-1@example.com>"],
@@ -130,6 +142,7 @@ class MemoryManagerTests(unittest.TestCase):
 
             manager.write_user_side(
                 stage1_result=first,
+                inbound_texts=_texts_for(first),
                 batch_id="batch-1",
                 now=datetime(2026, 3, 31, 22, 0, tzinfo=ZoneInfo("America/Los_Angeles")),
                 source_message_ids=["<msg-1@example.com>"],
@@ -140,6 +153,7 @@ class MemoryManagerTests(unittest.TestCase):
 
             manager.write_user_side(
                 stage1_result=second,
+                inbound_texts=_texts_for(second),
                 batch_id="batch-2",
                 now=datetime(2026, 4, 1, 22, 0, tzinfo=ZoneInfo("America/Los_Angeles")),
                 source_message_ids=["<msg-2@example.com>"],
@@ -385,6 +399,7 @@ class MemoryManagerTests(unittest.TestCase):
 
             manager.write_user_side(
                 stage1_result=existing,
+                inbound_texts=_texts_for(existing),
                 batch_id="batch-old",
                 now=now,
                 source_message_ids=["<msg-old@example.com>"],
@@ -392,6 +407,7 @@ class MemoryManagerTests(unittest.TestCase):
             )
             manager.write_user_side(
                 stage1_result=new_observation,
+                inbound_texts=_texts_for(new_observation),
                 batch_id="batch-new",
                 now=now,
                 source_message_ids=["<msg-new@example.com>"],
@@ -445,6 +461,7 @@ class MemoryManagerTests(unittest.TestCase):
 
             manager.write_user_side(
                 stage1_result=existing,
+                inbound_texts=_texts_for(existing),
                 batch_id="batch-old",
                 now=now,
                 source_message_ids=["<msg-old@example.com>"],
@@ -452,6 +469,7 @@ class MemoryManagerTests(unittest.TestCase):
             )
             manager.write_user_side(
                 stage1_result=negated,
+                inbound_texts=_texts_for(negated),
                 batch_id="batch-new",
                 now=now,
                 source_message_ids=["<msg-new@example.com>"],
@@ -509,6 +527,7 @@ class MemoryManagerTests(unittest.TestCase):
             )
             manager.write_user_side(
                 stage1_result=existing,
+                inbound_texts=_texts_for(existing),
                 batch_id="batch-old",
                 now=now,
                 source_message_ids=["<msg-old@example.com>"],
@@ -518,6 +537,7 @@ class MemoryManagerTests(unittest.TestCase):
             # Fires the conflict once on 2026-04-01.
             manager.write_user_side(
                 stage1_result=self._negated_night_run_stage1("2026-04-01"),
+                inbound_texts=_texts_for(self._negated_night_run_stage1("2026-04-01")),
                 batch_id="batch-day1",
                 now=now,
                 source_message_ids=["<msg-day1@example.com>"],
@@ -526,6 +546,7 @@ class MemoryManagerTests(unittest.TestCase):
             # Repeats on the SAME date -> must not count as a second distinct occurrence.
             manager.write_user_side(
                 stage1_result=self._negated_night_run_stage1("2026-04-01"),
+                inbound_texts=_texts_for(self._negated_night_run_stage1("2026-04-01")),
                 batch_id="batch-day1-dup",
                 now=now,
                 source_message_ids=["<msg-day1-dup@example.com>"],
@@ -563,6 +584,7 @@ class MemoryManagerTests(unittest.TestCase):
             )
             manager.write_user_side(
                 stage1_result=existing,
+                inbound_texts=_texts_for(existing),
                 batch_id="batch-old",
                 now=now,
                 source_message_ids=["<msg-old@example.com>"],
@@ -571,6 +593,7 @@ class MemoryManagerTests(unittest.TestCase):
 
             manager.write_user_side(
                 stage1_result=self._negated_night_run_stage1("2026-04-01"),
+                inbound_texts=_texts_for(self._negated_night_run_stage1("2026-04-01")),
                 batch_id="batch-day1",
                 now=now,
                 source_message_ids=["<msg-day1@example.com>"],
@@ -582,6 +605,7 @@ class MemoryManagerTests(unittest.TestCase):
             # Second DISTINCT date -> the repeated-occurrence override path fires.
             manager.write_user_side(
                 stage1_result=self._negated_night_run_stage1("2026-04-02"),
+                inbound_texts=_texts_for(self._negated_night_run_stage1("2026-04-02")),
                 batch_id="batch-day2",
                 now=now,
                 source_message_ids=["<msg-day2@example.com>"],
@@ -590,7 +614,7 @@ class MemoryManagerTests(unittest.TestCase):
 
             profile_after_override = load_entries(settings.documents.user_profile)
             conflict_entries_after_override = load_entries(settings.documents.conflict_notes)
-            self.assertEqual([item["content"] for item in profile_after_override], ["用户不再喜欢夜跑"])
+            self.assertEqual(_active_contents(profile_after_override), ["用户不再喜欢夜跑"])
             self.assertEqual(conflict_entries_after_override, [])
 
     def test_legacy_conflict_note_without_occurrence_dates_loads_and_still_overrides(self) -> None:
@@ -639,6 +663,7 @@ class MemoryManagerTests(unittest.TestCase):
 
             manager.write_user_side(
                 stage1_result=self._negated_night_run_stage1("2026-04-02"),
+                inbound_texts=_texts_for(self._negated_night_run_stage1("2026-04-02")),
                 batch_id="batch-day2",
                 now=now,
                 source_message_ids=["<msg-day2@example.com>"],
@@ -647,7 +672,7 @@ class MemoryManagerTests(unittest.TestCase):
 
             profile_entries = load_entries(settings.documents.user_profile)
             conflict_entries = load_entries(settings.documents.conflict_notes)
-            self.assertEqual([item["content"] for item in profile_entries], ["用户不再喜欢夜跑"])
+            self.assertEqual(_active_contents(profile_entries), ["用户不再喜欢夜跑"])
             self.assertEqual(conflict_entries, [])
 
     def test_conflict_note_from_dict_backfills_missing_occurrence_dates(self) -> None:
@@ -663,6 +688,313 @@ class MemoryManagerTests(unittest.TestCase):
         }
         note = ConflictNote.from_dict(payload)
         self.assertEqual(note.occurrence_dates, ["2026-04-01"])
+
+
+    def _stage1_with(self, *candidates: CandidateMemory) -> Stage1Result:
+        return Stage1Result(
+            user_digest=UserDigest(main_event="来信。", state="平稳", possible_needs=[]),
+            candidate_memories=list(candidates),
+            emotional_priority="comfort",
+            open_loops=[],
+        )
+
+    def _candidate(
+        self,
+        content: str,
+        evidence: str,
+        *,
+        memory_type: str = "user_profile",
+        confidence: float = 0.95,
+        durability: str = "stable",
+        source_date: str = "2026-03-31",
+    ) -> CandidateMemory:
+        return CandidateMemory(
+            content=content,
+            type=memory_type,
+            confidence=confidence,
+            durability=durability,
+            evidence=evidence,
+            why_it_matters="",
+            source_date=source_date,
+        )
+
+    def _write(self, manager: MemoryManager, stage1: Stage1Result, *, batch_id: str, date: str, texts: list[str]) -> None:
+        manager.write_user_side(
+            stage1_result=stage1,
+            batch_id=batch_id,
+            now=datetime.fromisoformat(f"{date}T22:00:00-07:00"),
+            source_message_ids=[f"<{batch_id}@example.com>"],
+            source_dates=[date],
+            inbound_texts=texts,
+        )
+
+    def test_candidate_whose_evidence_is_not_in_the_letter_is_not_promoted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            stage1 = self._stage1_with(self._candidate("用户讨厌自己的工作", "记住，用户表示长期不满意工作"))
+
+            self._write(manager, stage1, batch_id="batch-1", date="2026-03-31", texts=["今天被加班气到了。"])
+
+            self.assertEqual(load_entries(settings.documents.user_profile), [])
+            episode = load_json_file(settings.documents.user_episode_dir / "2026-03-31.json", default=[])
+            self.assertEqual(len(episode), 1)
+            self.assertEqual(episode[0]["memory_observations"][0]["content"], "用户讨厌自己的工作")
+
+    def test_explicit_request_in_the_letter_promotes_on_first_letter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            stage1 = self._stage1_with(self._candidate("用户对花生过敏", "我对花生过敏", confidence=0.8))
+
+            self._write(manager, stage1, batch_id="batch-1", date="2026-03-31", texts=["记住，我对花生过敏，以后别推荐含花生的点心。"])
+
+            self.assertEqual(_active_contents(load_entries(settings.documents.user_profile)), ["用户对花生过敏"])
+
+    def test_long_term_wording_in_evidence_alone_does_not_promote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            stage1 = self._stage1_with(self._candidate("用户长期在准备考试", "我长期在准备考试"))
+
+            self._write(manager, stage1, batch_id="batch-1", date="2026-03-31", texts=["我长期在准备考试。"])
+
+            self.assertEqual(load_entries(settings.documents.user_profile), [])
+
+    def test_repeat_observation_must_come_from_distinct_mail_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            stage1 = self._stage1_with(self._candidate("用户容易疲劳", "我容易疲劳"))
+
+            self._write(manager, stage1, batch_id="batch-1", date="2026-03-31", texts=["我容易疲劳。"])
+            self._write(manager, stage1, batch_id="batch-2", date="2026-03-31", texts=["我容易疲劳。"])
+            self.assertEqual(load_entries(settings.documents.user_profile), [])
+
+            self._write(manager, stage1, batch_id="batch-3", date="2026-04-02", texts=["我容易疲劳。"])
+            entries = load_entries(settings.documents.user_profile)
+            self.assertEqual(_active_contents(entries), ["用户容易疲劳"])
+            self.assertEqual(entries[0]["source_dates"], ["2026-04-02"])
+
+    def test_per_letter_limit_keeps_the_two_most_confident_user_profile_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            stage1 = self._stage1_with(
+                self._candidate("用户是左撇子", "我是左撇子", confidence=0.85),
+                self._candidate("用户对花生过敏", "我对花生过敏", confidence=0.95),
+                self._candidate("用户住在上海", "我住在上海", confidence=0.9),
+            )
+
+            self._write(
+                manager,
+                stage1,
+                batch_id="batch-1",
+                date="2026-03-31",
+                texts=["记住，我对花生过敏。记住，我住在上海。记住，我是左撇子。"],
+            )
+
+            self.assertEqual(_active_contents(load_entries(settings.documents.user_profile)), ["用户对花生过敏", "用户住在上海"])
+
+    def test_transient_wording_in_content_blocks_user_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            transient = self._stage1_with(self._candidate("用户今天很累", "今天好累"))
+            stable = self._stage1_with(self._candidate("用户容易疲劳", "我容易疲劳"))
+
+            self._write(manager, transient, batch_id="batch-1", date="2026-03-31", texts=["今天好累。"])
+            self._write(manager, transient, batch_id="batch-2", date="2026-04-01", texts=["今天好累。"])
+            self._write(manager, stable, batch_id="batch-3", date="2026-03-31", texts=["我容易疲劳。"])
+            self._write(manager, stable, batch_id="batch-4", date="2026-04-01", texts=["我容易疲劳。"])
+
+            self.assertEqual(_active_contents(load_entries(settings.documents.user_profile)), ["用户容易疲劳"])
+
+    def test_english_remember_request_promotes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            stage1 = self._stage1_with(self._candidate("The user is allergic to peanuts", "I'm allergic to peanuts"))
+
+            self._write(manager, stage1, batch_id="batch-1", date="2026-03-31", texts=["Please remember that I'm allergic to peanuts."])
+
+            self.assertEqual(_active_contents(load_entries(settings.documents.user_profile)), ["The user is allergic to peanuts"])
+
+    def test_verb_negation_is_detected_as_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+
+            self._write(manager, self._stage1_with(self._candidate("用户喜欢猫", "我喜欢猫")), batch_id="batch-1", date="2026-03-31", texts=["记住，我喜欢猫。"])
+            self._write(
+                manager,
+                self._stage1_with(self._candidate("用户不喜欢猫", "我不喜欢猫", source_date="2026-04-01")),
+                batch_id="batch-2",
+                date="2026-04-01",
+                texts=["记住，我不喜欢猫。"],
+            )
+
+            self.assertEqual(_active_contents(load_entries(settings.documents.user_profile)), ["用户喜欢猫"])
+            conflicts = load_entries(settings.documents.conflict_notes)
+            self.assertEqual(len(conflicts), 1)
+            self.assertEqual(conflicts[0]["new_content"], "用户不喜欢猫")
+            self.assertEqual(conflicts[0]["occurrence_dates"], ["2026-04-01"])
+
+    def test_conflict_is_checked_before_substring_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+
+            self._write(
+                manager,
+                self._stage1_with(self._candidate("用户每周三次去健身房", "我每周三次去健身房")),
+                batch_id="batch-1",
+                date="2026-03-31",
+                texts=["记住，我每周三次去健身房。"],
+            )
+            self._write(
+                manager,
+                self._stage1_with(self._candidate("用户不再每周三次去健身房", "我不再去健身房了", source_date="2026-04-01")),
+                batch_id="batch-2",
+                date="2026-04-01",
+                texts=["记住，我不再去健身房了。"],
+            )
+
+            entries = load_entries(settings.documents.user_profile)
+            self.assertEqual(_active_contents(entries), ["用户每周三次去健身房"])
+            self.assertEqual(entries[0]["evidence"], ["我每周三次去健身房"])
+            self.assertEqual(len(load_entries(settings.documents.conflict_notes)), 1)
+
+    def test_user_correction_overrides_immediately_and_keeps_superseded_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+
+            self._write(manager, self._stage1_with(self._candidate("用户喜欢猫", "我喜欢猫")), batch_id="batch-1", date="2026-03-31", texts=["记住，我喜欢猫。"])
+            self._write(
+                manager,
+                self._stage1_with(self._candidate("用户不喜欢猫", "其实我不喜欢猫", source_date="2026-04-01")),
+                batch_id="batch-2",
+                date="2026-04-01",
+                texts=["我说错了，其实我不喜欢猫。"],
+            )
+
+            entries = load_entries(settings.documents.user_profile)
+            self.assertEqual(_active_contents(entries), ["用户不喜欢猫"])
+            superseded = [item for item in entries if item["status"] == "superseded"]
+            self.assertEqual(len(superseded), 1)
+            self.assertEqual(superseded[0]["content"], "用户喜欢猫")
+            active = next(item for item in entries if item["status"] == "active")
+            self.assertEqual(superseded[0]["superseded_by"], active["key"])
+            self.assertEqual(load_entries(settings.documents.conflict_notes), [])
+            prompt_entries = json.loads(manager.active_entries_text(settings.documents.user_profile))
+            self.assertEqual([item["content"] for item in prompt_entries], ["用户不喜欢猫"])
+
+    def test_deleted_memory_is_not_written_back_by_stage1(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            stage1 = self._stage1_with(self._candidate("用户对花生过敏", "我对花生过敏"))
+            now = datetime(2026, 4, 1, 12, 0, tzinfo=ZoneInfo("UTC"))
+
+            self._write(manager, stage1, batch_id="batch-1", date="2026-03-31", texts=["记住，我对花生过敏。"])
+            key = load_entries(settings.documents.user_profile)[0]["key"]
+            self.assertTrue(manager.delete_entry("user_profile", key, now=now))
+            self.assertEqual(load_entries(settings.documents.user_profile), [])
+            self.assertEqual(len(manager.list_suppressed()), 1)
+
+            self._write(manager, stage1, batch_id="batch-2", date="2026-04-02", texts=["记住，我对花生过敏。"])
+            self.assertEqual(load_entries(settings.documents.user_profile), [])
+
+            self.assertTrue(manager.unsuppress(manager.list_suppressed()[0]["key"]))
+            self._write(manager, stage1, batch_id="batch-3", date="2026-04-03", texts=["记住，我对花生过敏。"])
+            self.assertEqual(_active_contents(load_entries(settings.documents.user_profile)), ["用户对花生过敏"])
+
+    def test_relationship_memory_requires_explicit_request_or_repeat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            nickname = self._stage1_with(
+                self._candidate("用户希望被称呼为小鱼", "以后就叫我小鱼吧", memory_type="relationship_memory", confidence=0.8)
+            )
+            plan = self._stage1_with(
+                self._candidate("用户和角色约好一起看海灯节", "我们一起看海灯节吧", memory_type="relationship_memory", confidence=0.9)
+            )
+
+            self._write(manager, nickname, batch_id="batch-1", date="2026-03-31", texts=["以后就叫我小鱼吧。"])
+            self._write(manager, plan, batch_id="batch-2", date="2026-03-31", texts=["我们一起看海灯节吧。"])
+
+            self.assertEqual(_active_contents(load_entries(settings.documents.relationship_memory)), ["用户希望被称呼为小鱼"])
+
+    def test_manual_add_update_delete_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            now = datetime(2026, 4, 1, 12, 0, tzinfo=ZoneInfo("UTC"))
+
+            added = manager.add_manual_entry("user_profile", content="用户养了一只叫团子的猫", why_it_matters="写信时可以问候", now=now)
+            self.assertEqual(manager.list_entries("user_profile")[0]["content"], "用户养了一只叫团子的猫")
+            self.assertEqual(added["evidence"], ["manual entry"])
+
+            updated = manager.update_entry("user_profile", added["key"], content="用户养了一只叫团子的橘猫", now=now)
+            self.assertEqual(updated["content"], "用户养了一只叫团子的橘猫")
+            self.assertIsNone(manager.update_entry("user_profile", "missing-key", content="x", now=now))
+
+            self.assertTrue(manager.delete_entry("user_profile", added["key"], now=now))
+            self.assertEqual(manager.list_entries("user_profile"), [])
+            self.assertEqual(manager.list_suppressed()[0]["content"], "用户养了一只叫团子的橘猫")
+            with self.assertRaises(ValueError):
+                manager.add_manual_entry("unknown_file", content="x", now=now)
+
+    def test_resolve_conflict_take_new_supersedes_existing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            now = datetime(2026, 4, 2, 12, 0, tzinfo=ZoneInfo("UTC"))
+
+            self._write(manager, self._stage1_with(self._candidate("用户喜欢猫", "我喜欢猫")), batch_id="batch-1", date="2026-03-31", texts=["记住，我喜欢猫。"])
+            self._write(
+                manager,
+                self._stage1_with(self._candidate("用户不喜欢猫", "我不喜欢猫", source_date="2026-04-01")),
+                batch_id="batch-2",
+                date="2026-04-01",
+                texts=["记住，我不喜欢猫。"],
+            )
+            key = manager.list_conflicts()[0]["key"]
+
+            self.assertTrue(manager.resolve_conflict(key, choice="take_new", now=now))
+
+            self.assertEqual(_active_contents(load_entries(settings.documents.user_profile)), ["用户不喜欢猫"])
+            self.assertEqual(manager.list_conflicts(), [])
+            self.assertFalse(manager.resolve_conflict(key, choice="keep_existing", now=now))
 
 
 if __name__ == "__main__":

@@ -46,6 +46,7 @@ Only when at least one of the following is true:
 - Similar information appears independently on at least 2 different dates.
 - It clearly affects future letter style or advice.
 - The user explicitly asks the system to remember it.
+- Current implementation: the code accepts only two kinds of evidence: an explicit request in the user's own words ("remember", "don't forget", "call me …"), or the same content mentioned on at least 2 distinct mail dates (by the mail Date header). The `evidence` must be found verbatim in the mail body, otherwise nothing is written; content phrased about "today" or "this week" is not written.
 
 ### 4.2 Write to `relationship.md`
 
@@ -56,6 +57,7 @@ Only record:
 - Shared anniversaries and shared jokes
 - Repeated shared topics that affect the tone of communication
 - Nodes that define what the relationship is
+- Current implementation: the same evidence requirement as 4.1; an explicit request (such as "call me …") is written from that letter, anything else needs 2 distinct mail dates.
 
 ### 4.3 Write to `active_arc.json`
 
@@ -69,6 +71,7 @@ Examples:
 
 - The user has recently been under continuous academic pressure.
 - The character is handling an ongoing matter.
+- Current implementation: a user-side candidate needs its `evidence` found in the mail and the same content on at least 2 distinct mail dates within 7 days, or an existing matching arc.
 
 ### 4.4 Write to `episode`
 
@@ -94,7 +97,7 @@ Examples:
   - The user explicitly corrects it.
   - The new information appears repeatedly on at least 2 different dates.
   - The new information is clearly more specific, and the old value has not been reconfirmed for a long time.
-- Current implementation: only the "repeated on at least 2 different dates" path is automated. Once the same `conflict_note` has accumulated 2 distinct occurrence dates, the new value overwrites the old entry and the conflict note is cleared. The "explicit user correction" and "more specific" paths are not yet automated.
+- Current implementation: two override paths are automated: an explicit correction in the user's own words ("I misspoke", "actually", "correction") that conflicts with an existing memory replaces it at once; otherwise the same `conflict_note` must accumulate 2 distinct mail dates. The replaced entry is kept and marked `status: superseded`, and the conflict note is cleared. The "more specific" path is not automated. Conflict detection relies on a negation map (like/dislike, is/is not, has/has no, no longer, never, and the English not / never / no longer forms).
 
 ## 7. Quantity Limits
 
@@ -104,6 +107,7 @@ Examples:
 - Add at most 0-1 `relationship_memory` entry.
 - Add at most 0-1 `active_arc` entry.
 - Everything else goes to `episode` or `discard`.
+- Current implementation: these per-letter limits are enforced by code, keeping the highest-confidence candidates.
 
 ### Per Character Email
 

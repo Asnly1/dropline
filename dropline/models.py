@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+SOURCE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 class ModelValidationError(ValueError):
@@ -128,6 +131,11 @@ class CandidateMemory:
         durability = _expect_string(payload, "durability")
         if durability not in CANDIDATE_MEMORY_DURABILITIES:
             raise ModelValidationError(f"Invalid candidate memory durability '{durability}'")
+        source_date = str(payload.get("source_date", "")).strip()
+        if not SOURCE_DATE_RE.match(source_date):
+            # The model fills this in freely; anything that is not an ISO date is ignored and
+            # the mail Date header is used instead.
+            source_date = ""
         return cls(
             content=_expect_string(payload, "content"),
             type=memory_type,
@@ -135,7 +143,7 @@ class CandidateMemory:
             durability=durability,
             evidence=_expect_string(payload, "evidence"),
             why_it_matters=str(payload.get("why_it_matters", "")),
-            source_date=str(payload.get("source_date", "")),
+            source_date=source_date,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -600,6 +608,8 @@ class ManagedMemoryEntry:
     created_at: str
     updated_at: str
     why_it_matters: str = ""
+    status: str = "active"
+    superseded_by: str = ""
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ManagedMemoryEntry":
@@ -615,6 +625,8 @@ class ManagedMemoryEntry:
             created_at=str(payload.get("created_at", "")),
             updated_at=str(payload.get("updated_at", "")),
             why_it_matters=str(payload.get("why_it_matters", "")),
+            status=str(payload.get("status", "active")) or "active",
+            superseded_by=str(payload.get("superseded_by", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:

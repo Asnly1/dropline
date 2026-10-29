@@ -16,14 +16,24 @@ STAGE1_INSTRUCTIONS = (
     "你是虚拟人物邮件系统的 Stage 1 分析器。"
     "只做来信理解和候选记忆提取。"
     "禁止写正文、禁止扩展世界观、禁止把一次性情绪直接晋升为长期人格结论。"
-    "必须输出 JSON。"
+        "candidate_memories 里的 evidence 必须是来信原句的逐字引用：不要改写、不要概括、不要翻译；代码会在来信正文里逐字核对它，核对不到的候选不会进入记忆。"
+    "confidence 表示用户是否明确、直接地说了这件事，而不是你自己的把握程度。"
+    "content 带有今天、这周之类时间限定的，durability 只能是 transient 或 short。"
+    "user_profile 只收用户明确谈到自己的稳定事实或偏好；一次性情绪、你的推测、角色自己的事一律不是 user_profile。"
+    "来信的附件你看不到内容，只知道文件名和类型；不要假装读过附件。"
+"必须输出 JSON。"
 )
 
 STAGE1_INSTRUCTIONS_ENGLISH = (
     "You are the Stage 1 analyzer for a fictional character email system. "
     "Only understand inbound mail and extract candidate memories. "
     "Do not write the reply body, expand the world state, or promote one-off emotions into long-term personality conclusions. "
-    "You must output JSON."
+        "The evidence of every candidate memory must be a verbatim quote from the inbound mail: do not paraphrase, summarize, or translate it; the code checks it against the mail body and drops candidates it cannot find. "
+    "confidence means how explicitly the user stated the fact, not how sure you are. "
+    "If content is tied to a moment (today, this week), durability must be transient or short. "
+    "user_profile only holds stable facts or preferences the user stated about themselves; one-off moods, your inferences, and the character's own affairs never qualify. "
+    "You cannot see attachment contents, only their file names and types; never pretend to have read one. "
+"You must output JSON."
 )
 
 STAGE2_INSTRUCTIONS = (
@@ -35,7 +45,8 @@ STAGE2_INSTRUCTIONS = (
     "如果输入包含 recent_scene_cards，它们代表最近已经生成过的图片场景；新的 scene_card 必须主动避开与这些记录高度相似的地点、时段、动作、关键物件和镜头距离。"
     "允许夜晚场景，但不要连续依赖夜晚案前写信、整理文书或静坐灯下这类重复画面。"
     "优先从该角色自身的日常事务、工作场景与生活环境里取不同瞬间的景，而不是反复使用同一个画面。"
-    "必须输出 JSON。"
+        "来信可能带附件，但你看不到附件内容，只知道文件名；如果用户提到附件，自然地说明你这边看不到，不要假装看过。"
+"必须输出 JSON。"
 )
 
 STAGE2_INSTRUCTIONS_ENGLISH = (
@@ -50,7 +61,8 @@ STAGE2_INSTRUCTIONS_ENGLISH = (
     "actively avoid highly similar location, time, action, key object, and camera distance. "
     "Night scenes are allowed, but do not repeatedly rely on night-at-desk letter writing, paperwork sorting, or sitting under a lamp. "
     "Prefer different moments drawn from the character's own duties, work settings, and surroundings, rather than repeating the same frame. "
-    "You must output JSON."
+        "The inbound mail may carry attachments, but you cannot see their contents, only the file names; if the user refers to one, say naturally that you cannot see it instead of pretending you did. "
+"You must output JSON."
 )
 
 STAGE2_TEXT_ONLY_INSTRUCTIONS = (
@@ -58,7 +70,8 @@ STAGE2_TEXT_ONLY_INSTRUCTIONS = (
     "必须保持角色一致、聚焦一件主事、生成完整回信、character_episode 和 active_arc_update_suggestion。"
     "输入里的 user_profile、relationship_memory、active_arc 是长期记忆：user_profile 放用户的稳定事实、稳定偏好与长期目标；relationship_memory 放你与用户之间的称呼、约定、共同梗与未完的话头；active_arc 是最多 1~2 条仍在推进的连续主线，由 active_arc_update_suggestion 决定保持、更新或归档。"
     "当前图片生成功能已关闭，不要输出 scene_card，不要为图片额外设计画面描述。"
-    "必须输出 JSON。"
+        "来信可能带附件，但你看不到附件内容，只知道文件名；如果用户提到附件，自然地说明你这边看不到，不要假装看过。"
+"必须输出 JSON。"
 )
 
 STAGE2_TEXT_ONLY_INSTRUCTIONS_ENGLISH = (
@@ -67,7 +80,8 @@ STAGE2_TEXT_ONLY_INSTRUCTIONS_ENGLISH = (
     "character_episode, and active_arc_update_suggestion. "
     "In the input, user_profile, relationship_memory, and active_arc are long-term memory: user_profile holds the user's stable facts, stable preferences, and long-term goals; relationship_memory holds the names, agreements, shared jokes, and open threads between you and the user; active_arc holds at most 1-2 ongoing storylines that you maintain via active_arc_update_suggestion (keep, update, or archive). "
     "Image generation is currently disabled; do not output scene_card and do not design extra image descriptions. "
-    "You must output JSON."
+        "The inbound mail may carry attachments, but you cannot see their contents, only the file names; if the user refers to one, say naturally that you cannot see it instead of pretending you did. "
+"You must output JSON."
 )
 
 CHARACTER_PROFILE_INSTRUCTIONS = (

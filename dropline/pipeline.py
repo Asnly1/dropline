@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .config import Settings, load_settings, validate_live_settings
-from .documents import load_json_file, read_optional_text, read_required_text
+from .documents import load_json_file, read_required_text
 from .llm import AIClient, build_ai_client
 from .llm_contracts import ENGLISH_OUTPUT_LANGUAGE
 from .mail import (
@@ -221,6 +221,7 @@ class PipelineService:
                 now=context.now,
                 source_message_ids=[item.message_id for item in context.inbound_messages],
                 source_dates=[item.received_at[:10] for item in context.inbound_messages if item.received_at],
+                inbound_texts=[f"{item.subject}\n{item.body_text}" for item in context.inbound_messages],
             )
         return stage1_result
 
@@ -489,9 +490,9 @@ class PipelineService:
             "docs": {
                 "memory_promotion_rules": read_required_text(self._memory_promotion_rules_path()),
                 "relationship": read_required_text(docs.relationship),
-                "user_profile": read_optional_text(docs.user_profile),
-                "relationship_memory": read_optional_text(docs.relationship_memory),
-                "active_arc": read_optional_text(docs.active_arc),
+                "user_profile": self.dependencies.memory_manager.active_entries_text(docs.user_profile),
+                "relationship_memory": self.dependencies.memory_manager.active_entries_text(docs.relationship_memory),
+                "active_arc": self.dependencies.memory_manager.active_entries_text(docs.active_arc),
             },
             "recent_user_episodes": self.dependencies.memory_manager.recent_user_episodes(
                 days=RECENT_EPISODE_LOOKBACK_DAYS,
@@ -535,9 +536,9 @@ class PipelineService:
                 "cast_pool": read_required_text(docs.cast_pool),
                 "relationship": read_required_text(docs.relationship),
                 "translation_layer": read_required_text(docs.translation_layer),
-                "user_profile": read_optional_text(docs.user_profile),
-                "relationship_memory": read_optional_text(docs.relationship_memory),
-                "active_arc": read_optional_text(docs.active_arc),
+                "user_profile": self.dependencies.memory_manager.active_entries_text(docs.user_profile),
+                "relationship_memory": self.dependencies.memory_manager.active_entries_text(docs.relationship_memory),
+                "active_arc": self.dependencies.memory_manager.active_entries_text(docs.active_arc),
             },
             "recent_user_episodes": self.dependencies.memory_manager.recent_user_episodes(
                 days=RECENT_EPISODE_LOOKBACK_DAYS,

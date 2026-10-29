@@ -252,10 +252,19 @@ session 的记忆分 6 类,Stage 1 只负责**提议**,代码负责**裁决**是
 | `episodes/user/*.json`            | 用户短期   | 日常心情、临时烦恼(只有最近 7 天会进入提示词,没有自动降权) |
 | `episodes/character/*.json`       | 角色短期   | 角色本次处理的事务                       |
 | `memory/conflict_notes.json`      | 冲突记录   | 新信息与旧记忆冲突,先入此处等待二次确认  |
+| `memory/suppressed.json`          | 删除记录   | 你手动删除过的记忆,模型不得再写回        |
 
-这四个记忆文件和 episode 都是纯 JSON 数组,UTF-8 纯文本,可直接打开手工编辑;pipeline 每次运行后会重写它们。
+这些记忆文件和 episode 都是纯 JSON 数组,UTF-8 纯文本,可直接打开手工编辑;pipeline 每次运行后会重写它们。
 
-晋升门槛严格:一次性情绪、未证实的推测、角色自行补充的细节**不得**晋升。完整规则见 [docs/memory_promotion_rules.md](docs/memory_promotion_rules.md)。
+晋升门槛由代码执行,不信任模型的自评分数:
+
+- 候选记忆的 `evidence` 必须能在来信正文里逐字找到;找不到的候选只留在 episode,不进长期记忆。
+- 用户在信里明确说"记住"、"别忘了"、"以后叫我……"的内容当封即可写入;其余内容必须在至少 2 个不同的来信日期出现过(按邮件 Date 头算,同一天多封不算)。
+- 每封信最多新增 2 条 user_profile、1 条 relationship_memory、1 条 active_arc;content 带"今天、这周"之类措辞的不进 user_profile。
+- 与旧记忆相反的说法先进 conflict_notes。用户在信里明确更正("我说错了"、"其实……")会立即覆盖;否则要在第 2 个不同日期再次出现才覆盖。被覆盖的旧条目保留在文件里并标记 `status: superseded`,不再进入提示词。
+- 你手动删除的记忆会记入 `memory/suppressed.json`,模型之后再提出同样内容也不会写回。
+
+完整规则见 [docs/memory_promotion_rules.md](docs/memory_promotion_rules.md)。
 
 ---
 
