@@ -6,6 +6,7 @@ import logging
 import re
 import smtplib
 import ssl
+from collections.abc import Collection
 from datetime import date
 from email import policy
 from email.header import decode_header, make_header
@@ -23,14 +24,30 @@ from .utils import retry_call
 LOGGER = logging.getLogger(__name__)
 FROM_HEADER_SECTION = "(BODY.PEEK[HEADER.FIELDS (FROM)])"
 MAIL_SOCKET_TIMEOUT_SECONDS = 60.0
+UIDVALIDITY_RESPONSE_CODE = "UIDVALIDITY"
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 SCRIPT_STYLE_RE = re.compile(r"<(script|style).*?</\1>", re.IGNORECASE | re.DOTALL)
+HTML_ELEMENT_TAG_RE = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9-]*)(\s[^>]*|)>", re.DOTALL)
+HTML_CLASS_ID_ATTR_RE = re.compile(r"""(?<![\w-])(?:class|id)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""", re.IGNORECASE)
+HTML_QUOTE_CONTAINER_MARKER = "quote"
 STOP_PATTERNS = (
     re.compile(r"^>"),
     re.compile(r"^On .+wrote:$"),
     re.compile(r"^-{2,}\s*Original Message\s*-{2,}$", re.IGNORECASE),
     re.compile(r"^From:\s", re.IGNORECASE),
+    # QQ 邮箱 / Foxmail: ------------------ 原始邮件 ------------------ ; Outlook: -----原始邮件-----
+    re.compile(r"^-{2,}\s*原始邮件\s*-{2,}$"),
+    # 中文 Outlook / QQ 邮箱引用头: 发件人: ...
+    re.compile(r"^发件人[:：]"),
+    # 163 / Apple Mail / Thunderbird: 在 2026-03-31 21:42:10，"刻晴" <keqing@163.com> 写道：
+    re.compile(r"^在\s?.*[0-9@].*写道[:：]$"),
+    # 中文 Gmail: 刻晴 <keqing@gmail.com> 于2026年3月31日周二 21:42写道：
+    re.compile(r"^.+\s?于.*[0-9].*写道[:：]$"),
+    # Outlook / Exchange 分隔线
+    re.compile(r"^_{10,}$"),
 )
+KNOWN_PARAGRAPH_MIN_LENGTH = 8
+PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n")
 SIGNATURE_PATTERNS = (
     re.compile(r"^--\s*$"),
     re.compile(r"^Sent from my ", re.IGNORECASE),
@@ -75,7 +92,8 @@ class InboundMailClient(Protocol):
         limit: int,
         allowlist_senders: tuple[str, ...] = (),
         received_since: date | None = None,
-    ) -> tuple[list[RawInboundMessage], int]:
+    ) -> tuple[list[RawInboundMessage], int, int]:
+        """Return (messages, highest_seen_uid, uidvalidity); uidvalidity is 0 when the server does not report it."""
         ...
 
 
@@ -94,7 +112,7 @@ class IMAPInboundClient:
         limit: int,
         allowlist_senders: tuple[str, ...] = (),
         received_since: date | None = None,
-    ) -> tuple[list[RawInboundMessage], int]:
+    ) -> tuple[list[RawInboundMessage], int, int]:
         try:
             return retry_call(
                 lambda: self._fetch_since_once(
@@ -117,14 +135,17 @@ class IMAPInboundClient:
         limit: int,
         allowlist_senders: tuple[str, ...],
         received_since: date | None,
-    ) -> tuple[list[RawInboundMessage], int]:
+    ) -> tuple[list[RawInboundMessage], int, int]:
         if not self.endpoint.folder:
             raise RuntimeError("IMAP folder configuration is required.")
         with self._connect() as client:
             client.login(self.endpoint.username, self.endpoint.password)
             client.select(self.endpoint.folder)
+            uidvalidity = self._read_uidvalidity(client)
             base_criteria = self._build_search_criteria(since_uid=since_uid, received_since=received_since)
-            uids = self._search_uids(client, base_criteria)
+            # RFC 3501: "UID n:*" always matches the highest UID in the mailbox even when it is below n,
+            # so the already-seen cursor message must be dropped here rather than re-fetched every run.
+            uids = [uid for uid in self._search_uids(client, base_criteria) if uid > since_uid]
             selected_uids = uids[:limit] if limit > 0 else uids
             highest_seen_uid = max(selected_uids, default=0)
             LOGGER.info(
@@ -145,7 +166,21 @@ class IMAPInboundClient:
             for uid in matched_uids:
                 raw_bytes = self._fetch_section(client, uid, "BODY.PEEK[]")
                 messages.append(RawInboundMessage(imap_uid=uid, raw_bytes=raw_bytes))
-            return messages, highest_seen_uid
+            return messages, highest_seen_uid, uidvalidity
+
+    def _read_uidvalidity(self, client: imaplib.IMAP4) -> int:
+        """Return the UIDVALIDITY reported by the last SELECT, or 0 when the server omitted it."""
+        _, data = client.response(UIDVALIDITY_RESPONSE_CODE)
+        for item in data or []:
+            if isinstance(item, (bytes, bytearray)):
+                item = item.decode("ascii", errors="ignore")
+            if isinstance(item, str) and item.strip().isdigit():
+                return int(item.strip())
+        LOGGER.warning(
+            "IMAP server did not report UIDVALIDITY for folder %s; UID cursor changes cannot be detected.",
+            self.endpoint.folder,
+        )
+        return 0
 
     def _connect(self) -> imaplib.IMAP4:
         if self.endpoint.ssl:
@@ -269,7 +304,7 @@ class SMTPOutboundClient:
         return message_id
 
 
-def normalize_inbound_message(raw_message: RawInboundMessage) -> NormalizedInboundMessage:
+def normalize_inbound_message(raw_message: RawInboundMessage, *, uidvalidity: int = 0) -> NormalizedInboundMessage:
     message = BytesParser(policy=policy.default).parsebytes(raw_message.raw_bytes)
     from_email = parseaddr(message.get("From", ""))[1].lower()
     subject = _decode_header_value(message.get("Subject", ""))
@@ -289,7 +324,49 @@ def normalize_inbound_message(raw_message: RawInboundMessage) -> NormalizedInbou
         body_html_present=bool(html_body),
         attachments=attachments,
         thread_message_id=thread_message_id,
+        uidvalidity=uidvalidity,
     )
+
+
+def extract_plain_body(raw_bytes: bytes) -> str:
+    """Return the text body of an archived .eml (plain part preferred) without quote stripping."""
+    message = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+    plain_body, html_body = _extract_body(message)
+    return plain_body or html_body
+
+
+def paragraph_keys(text: str) -> set[str]:
+    """Normalized keys for every paragraph of ``text`` that is long enough to identify quoted prose."""
+    keys: set[str] = set()
+    for paragraph in _split_paragraphs(text):
+        key = _paragraph_key(paragraph)
+        if len(key) >= KNOWN_PARAGRAPH_MIN_LENGTH:
+            keys.add(key)
+    return keys
+
+
+def strip_known_paragraphs(body_text: str, known_keys: Collection[str]) -> str:
+    """Drop paragraphs of ``body_text`` that repeat a known paragraph verbatim (whitespace-insensitive).
+
+    Mail clients that quote the previous letter without any recognizable marker leave the
+    character's own prose inside the user's reply; comparing paragraphs against the character's
+    recent outbound letters removes it so it is never attributed to the user.
+    """
+    if not body_text or not known_keys:
+        return body_text
+    paragraphs = _split_paragraphs(body_text)
+    kept = [paragraph for paragraph in paragraphs if _paragraph_key(paragraph) not in known_keys]
+    if len(kept) == len(paragraphs):
+        return body_text
+    return "\n\n".join(kept).strip()
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    return [segment.strip() for segment in PARAGRAPH_BREAK_RE.split(text) if segment.strip()]
+
+
+def _paragraph_key(paragraph: str) -> str:
+    return "".join(paragraph.split()).lower()
 
 
 def _parse_from_header(header_bytes: bytes) -> str:
@@ -396,9 +473,17 @@ def _get_part_text(part: EmailMessage) -> str:
 
 
 def _extract_attachments(message: EmailMessage) -> list[AttachmentMeta]:
+    """Collect attachment metadata only; payloads are measured for size and never kept."""
     attachments: list[AttachmentMeta] = []
     for part in message.walk():
-        if part.get_content_disposition() != "attachment":
+        if part.is_multipart():
+            continue
+        disposition = part.get_content_disposition()
+        if disposition == "attachment":
+            inline = False
+        elif _is_inline_attachment(part, disposition):
+            inline = True
+        else:
             continue
         payload = part.get_payload(decode=True) or b""
         attachments.append(
@@ -406,15 +491,66 @@ def _extract_attachments(message: EmailMessage) -> list[AttachmentMeta]:
                 filename=part.get_filename() or "",
                 content_type=part.get_content_type(),
                 size=len(payload),
+                inline=inline,
             )
         )
     return attachments
 
 
+def _is_inline_attachment(part: EmailMessage, disposition: str | None) -> bool:
+    maintype = part.get_content_maintype()
+    if maintype == "image" and (disposition == "inline" or part.get("Content-ID") is not None):
+        return True
+    return disposition == "inline" and maintype != "text" and bool(part.get_filename())
+
+
 def _html_to_text(value: str) -> str:
     cleaned = SCRIPT_STYLE_RE.sub("", value)
+    cleaned = _strip_quoted_html(cleaned)
     cleaned = HTML_TAG_RE.sub("\n", cleaned)
     return html.unescape(cleaned)
+
+
+def _strip_quoted_html(value: str) -> str:
+    """Remove quoted-reply containers (<blockquote>, gmail_quote, any *quote* id/class) as whole elements.
+
+    Nested containers are tracked by tag name so a quote that itself contains quotes is removed in one
+    piece; an unterminated container swallows the rest of the document, which is where quotes live.
+    """
+    kept: list[str] = []
+    cursor = 0
+    depth = 0
+    container_tag = ""
+    for match in HTML_ELEMENT_TAG_RE.finditer(value):
+        closing = match.group(1) == "/"
+        tag_name = match.group(2).lower()
+        attributes = match.group(3)
+        self_closing = attributes.rstrip().endswith("/")
+        if depth == 0:
+            if closing or self_closing or not _is_quoted_html_container(tag_name, attributes):
+                continue
+            kept.append(value[cursor:match.start()])
+            container_tag = tag_name
+            depth = 1
+            continue
+        if tag_name != container_tag or self_closing:
+            continue
+        depth += -1 if closing else 1
+        if depth == 0:
+            cursor = match.end()
+    if depth == 0:
+        kept.append(value[cursor:])
+    return "".join(kept)
+
+
+def _is_quoted_html_container(tag_name: str, attributes: str) -> bool:
+    if tag_name == "blockquote":
+        return True
+    for match in HTML_CLASS_ID_ATTR_RE.finditer(attributes):
+        attribute_value = next(group for group in match.groups() if group is not None)
+        if HTML_QUOTE_CONTAINER_MARKER in attribute_value.lower():
+            return True
+    return False
 
 
 def _cleanup_body(body_text: str) -> str:

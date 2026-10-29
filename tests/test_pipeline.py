@@ -11,6 +11,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from dropline.documents import load_entries, load_json_file
+from dropline.mail import compose_email
 from dropline.memory import MemoryManager
 from dropline.models import GeneratedImage, ModelValidationError, NormalizedInboundMessage, RawInboundMessage, Stage1Result, Stage2Result
 from dropline.pipeline import PipelineDependencies, PipelineService, RunContext
@@ -37,8 +38,9 @@ LONG_BODY = (
 
 
 class FakeInboundClient:
-    def __init__(self, messages: list[RawInboundMessage]) -> None:
+    def __init__(self, messages: list[RawInboundMessage], *, uidvalidity: int = 0) -> None:
         self.messages = messages
+        self.uidvalidity = uidvalidity
         self.calls: list[dict] = []
 
     def fetch_since(
@@ -47,7 +49,7 @@ class FakeInboundClient:
         limit: int,
         allowlist_senders: tuple[str, ...] = (),
         received_since=None,
-    ) -> tuple[list[RawInboundMessage], int]:
+    ) -> tuple[list[RawInboundMessage], int, int]:
         self.calls.append(
             {
                 "since_uid": since_uid,
@@ -56,10 +58,11 @@ class FakeInboundClient:
                 "received_since": received_since,
             }
         )
-        filtered = [item for item in self.messages if item.imap_uid > since_uid]
-        selected = filtered[:limit] if limit > 0 else filtered
-        highest_seen_uid = max((item.imap_uid for item in filtered), default=0)
-        return selected, highest_seen_uid
+        # Deliberately no "> since_uid" pre-filter: the fake behaves like a server that hands back
+        # everything it has, so the pipeline must prove it never re-processes an already-stored letter.
+        selected = self.messages[:limit] if limit > 0 else list(self.messages)
+        highest_seen_uid = max((item.imap_uid for item in self.messages), default=0)
+        return selected, highest_seen_uid, self.uidvalidity
 
 
 class FakeOutboundClient:
@@ -165,6 +168,7 @@ def build_raw_email(
     from_email: str,
     message_id: str,
     date_header: str = "Tue, 31 Mar 2026 21:42:10 +0800",
+    body: str | None = None,
 ) -> RawInboundMessage:
     raw = f"""From: Sender <{from_email}>
 To: keqing@example.com
@@ -173,9 +177,28 @@ Date: {date_header}
 Message-ID: <{message_id}>
 Content-Type: text/plain; charset="utf-8"
 
-测试邮件 {uid}
+{body if body is not None else f"测试邮件 {uid}"}
 """.encode("utf-8")
     return RawInboundMessage(imap_uid=uid, raw_bytes=raw)
+
+
+def build_raw_email_with_attachments(*, uid: int, message_id: str) -> RawInboundMessage:
+    message = EmailMessage()
+    message["From"] = "Sender <user@example.com>"
+    message["To"] = "keqing@example.com"
+    message["Subject"] = f"files-{uid}"
+    message["Date"] = "Tue, 31 Mar 2026 21:42:10 +0800"
+    message["Message-ID"] = f"<{message_id}>"
+    message.set_content(f"带附件的测试邮件 {uid}")
+    message.add_alternative(f"<p>带附件的测试邮件 {uid}</p>", subtype="html")
+    message.add_attachment(b"%PDF-1.4", maintype="application", subtype="pdf", filename="notes.pdf")
+    message.add_attachment(b"PNG!", maintype="image", subtype="png", filename="photo.png", disposition="inline")
+    return RawInboundMessage(imap_uid=uid, raw_bytes=message.as_bytes())
+
+
+def _count_inbound_rows(store: StateStore) -> int:
+    with store._connect() as conn:
+        return int(conn.execute("SELECT COUNT(*) FROM inbound_messages").fetchone()[0])
 
 
 def _set_config_language(root: Path, language: str) -> None:
@@ -852,6 +875,244 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(store.get_last_seen_imap_uid(), 2)
             self.assertEqual(store.get_last_consumed_imap_uid(), 2)
             self.assertEqual(store.list_unconsumed_inbound(), [])
+
+    def test_uidvalidity_change_resets_seen_cursor_and_rescans_without_replying_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, outbound_client = self._build_pipeline(root)
+            pipeline.dependencies.inbound_client = FakeInboundClient(
+                [build_raw_email(uid=5, from_email="user@example.com", message_id="first@example.com")],
+                uidvalidity=100,
+            )
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                first_outcome = pipeline.run_once()
+
+            self.assertTrue(first_outcome.success)
+            self.assertEqual(first_outcome.mode, "reply")
+            self.assertEqual(store.get_last_seen_imap_uid(), 5)
+            self.assertEqual(store.get_imap_uidvalidity(), 100)
+
+            # The mailbox was rebuilt: the answered letter now carries UID 1 and a new letter UID 2.
+            rebuilt_client = FakeInboundClient(
+                [
+                    build_raw_email(uid=1, from_email="user@example.com", message_id="first@example.com"),
+                    build_raw_email(uid=2, from_email="user@example.com", message_id="second@example.com"),
+                ],
+                uidvalidity=200,
+            )
+            pipeline.dependencies.inbound_client = rebuilt_client
+            second_now = self.fixed_now + timedelta(days=1)
+            with patch("dropline.pipeline.now_in_timezone", return_value=second_now), self.assertLogs(
+                "dropline.pipeline", level="ERROR"
+            ) as logs:
+                second_outcome = pipeline.run_once()
+
+            self.assertTrue(second_outcome.success)
+            self.assertEqual(second_outcome.mode, "reply")
+            self.assertTrue(any("UIDVALIDITY changed from 100 to 200" in line for line in logs.output))
+            self.assertEqual([call["since_uid"] for call in rebuilt_client.calls], [5, 0])
+            self.assertIsNone(rebuilt_client.calls[0]["received_since"])
+            self.assertEqual(rebuilt_client.calls[1]["received_since"], (self.fixed_now - timedelta(days=1)).date())
+            self.assertEqual(store.get_imap_uidvalidity(), 200)
+            self.assertEqual(store.get_last_seen_imap_uid(), 2)
+            inbound_payload = pipeline.dependencies.ai_client.stage1_payloads[-1]["inbound_messages"]
+            self.assertEqual([item["message_id"] for item in inbound_payload], ["<second@example.com>"])
+            self.assertEqual([item["uidvalidity"] for item in inbound_payload], [200])
+            self.assertEqual(len(outbound_client.sent_messages), 2)
+            self.assertEqual(store.list_unconsumed_inbound(), [])
+            self.assertEqual(_count_inbound_rows(store), 2)
+
+    def test_unknown_uidvalidity_keeps_cursor_and_recorded_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, _ = self._build_pipeline(root)
+            pipeline.dependencies.inbound_client = FakeInboundClient(
+                [build_raw_email(uid=5, from_email="user@example.com", message_id="first@example.com")],
+                uidvalidity=100,
+            )
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                self.assertTrue(pipeline.run_once().success)
+
+            silent_client = FakeInboundClient([], uidvalidity=0)
+            pipeline.dependencies.inbound_client = silent_client
+            with patch(
+                "dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(minutes=5)
+            ), self.assertNoLogs("dropline.pipeline", level="ERROR"):
+                outcome = pipeline.run_once()
+
+            self.assertTrue(outcome.success)
+            self.assertEqual([call["since_uid"] for call in silent_client.calls], [5])
+            self.assertEqual(store.get_imap_uidvalidity(), 100)
+            self.assertEqual(store.get_last_seen_imap_uid(), 5)
+
+    def test_server_returning_already_processed_uid_does_not_reprocess_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, outbound_client = self._build_pipeline(root)
+            inbound_client = pipeline.dependencies.inbound_client
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                first_outcome = pipeline.run_once()
+
+            self.assertTrue(first_outcome.success)
+            self.assertEqual(first_outcome.mode, "reply")
+            self.assertEqual(store.get_last_seen_imap_uid(), 1)
+
+            # The fake keeps handing back UID 1 (like a server answering "UID 2:*" with the highest UID).
+            second_now = self.fixed_now + timedelta(minutes=5)
+            with patch("dropline.pipeline.now_in_timezone", return_value=second_now), self.assertLogs(
+                "dropline.pipeline", level="INFO"
+            ) as logs:
+                second_outcome = pipeline.run_once()
+
+            self.assertTrue(second_outcome.success)
+            self.assertEqual(second_outcome.mode, "initiative")
+            self.assertEqual(inbound_client.calls[1]["since_uid"], 1)
+            self.assertTrue(any("Message-ID is already stored" in line for line in logs.output))
+            self.assertEqual(pipeline.dependencies.ai_client.stage1_payloads[1]["inbound_messages"], [])
+            self.assertEqual(_count_inbound_rows(store), 1)
+            self.assertEqual(store.list_unconsumed_inbound(), [])
+            second_run_dir = pipeline.settings.documents.session_archive_dir / "2026-03-31" / second_outcome.run_id
+            self.assertFalse((second_run_dir / "inbox_raw").exists())
+            self.assertEqual(len(outbound_client.sent_messages), 2)
+
+    def test_message_moved_back_to_inbox_with_new_uid_is_not_replied_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, outbound_client = self._build_pipeline(root)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                self.assertTrue(pipeline.run_once().success)
+
+            pipeline.dependencies.inbound_client = FakeInboundClient([RawInboundMessage(imap_uid=9, raw_bytes=RAW_EMAIL)])
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(minutes=5)):
+                outcome = pipeline.run_once()
+
+            self.assertTrue(outcome.success)
+            self.assertEqual(outcome.mode, "initiative")
+            self.assertEqual(store.get_last_seen_imap_uid(), 9)
+            self.assertEqual(store.get_last_consumed_imap_uid(), 1)
+            self.assertEqual(_count_inbound_rows(store), 1)
+            self.assertEqual(len(outbound_client.sent_messages), 2)
+
+    def test_character_paragraphs_quoted_without_markers_are_stripped_from_inbound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, _ = self._build_pipeline(root)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                self.assertTrue(pipeline.run_once().success)
+
+            quoted_reply = build_raw_email(
+                uid=2,
+                from_email="user@example.com",
+                message_id="quoted@example.com",
+                body="我看完了，谢谢你。\n\n" + LONG_BODY + "\n\n下周再写。",
+            )
+            pipeline.dependencies.inbound_client = FakeInboundClient([quoted_reply])
+            with patch(
+                "dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(hours=1)
+            ), self.assertLogs("dropline.pipeline", level="INFO") as logs:
+                outcome = pipeline.run_once()
+
+            self.assertTrue(outcome.success)
+            self.assertEqual(outcome.mode, "reply")
+            self.assertTrue(any("quoted verbatim" in line for line in logs.output))
+            inbound_payload = pipeline.dependencies.ai_client.stage1_payloads[-1]["inbound_messages"]
+            self.assertEqual([item["body_text"] for item in inbound_payload], ["我看完了，谢谢你。\n\n下周再写。"])
+            with store._connect() as conn:
+                stored_body = conn.execute("SELECT body_text FROM inbound_messages WHERE imap_uid = 2").fetchone()[0]
+            self.assertEqual(stored_body, "我看完了，谢谢你。\n\n下周再写。")
+
+    def test_quote_stripping_falls_back_to_archived_outbound_eml_when_stage2_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, _ = self._build_pipeline(root)
+            letter = "角色写的第一段，用来验证能从归档邮件里恢复正文。\n\n第二段也足够长，可以当作已知文本来比对。"
+            archived = compose_email(
+                pipeline.settings,
+                subject="旧信",
+                body_text=letter,
+                image_path=None,
+                reply_to_message_id=None,
+                mode="initiative",
+            )
+            raw_path = pipeline.settings.documents.session_archive_dir / "old-letter.eml"
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_path.write_bytes(archived.as_bytes())
+            store.record_outbound_message(
+                message_id="<old-letter@example.com>",
+                sent_at=(self.fixed_now - timedelta(hours=1)).isoformat(),
+                to_email="user@example.com",
+                subject="旧信",
+                raw_path=raw_path,
+                image_path=None,
+                run_id="run-without-stage2",
+                batch_id="batch-old-letter",
+            )
+            pipeline.dependencies.inbound_client = FakeInboundClient(
+                [
+                    build_raw_email(
+                        uid=2,
+                        from_email="user@example.com",
+                        message_id="quoted-eml@example.com",
+                        body="收到。\n\n角色写的第一段，用来验证能从归档邮件里恢复正文。\n\n我这边一切都好。",
+                    )
+                ]
+            )
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                outcome = pipeline.run_once()
+
+            self.assertTrue(outcome.success)
+            inbound_payload = pipeline.dependencies.ai_client.stage1_payloads[-1]["inbound_messages"]
+            self.assertEqual([item["body_text"] for item in inbound_payload], ["收到。\n\n我这边一切都好。"])
+
+    def test_retry_restores_attachment_metadata_and_html_flag_from_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, _ = self._build_pipeline(root, stage2_should_fail=True)
+            pipeline.dependencies.inbound_client = FakeInboundClient(
+                [build_raw_email_with_attachments(uid=3, message_id="files@example.com")]
+            )
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                first_outcome = pipeline.run_once()
+
+            self.assertFalse(first_outcome.success)
+            self.assertEqual(first_outcome.error_stage, "stage2")
+            first_payload = pipeline.dependencies.ai_client.stage1_payloads[0]["inbound_messages"][0]
+            self.assertTrue(first_payload["body_html_present"])
+            self.assertEqual(
+                first_payload["attachments"],
+                [
+                    {"filename": "notes.pdf", "content_type": "application/pdf", "size": 8, "inline": False},
+                    {"filename": "photo.png", "content_type": "image/png", "size": 4, "inline": True},
+                ],
+            )
+
+            retry_pipeline, _, _ = self._build_pipeline(root)
+            retry_pipeline.dependencies.state_store = store
+            retry_pipeline.dependencies.inbound_client = FakeInboundClient([])
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(minutes=5)):
+                retry_outcome = retry_pipeline.run_once()
+
+            self.assertTrue(retry_outcome.success)
+            self.assertEqual(retry_outcome.mode, "reply")
+            # The retry reuses the archived stage1.json, so Stage 1 is not called again; the message
+            # restored from the store (attachment metadata, HTML flag) must still reach Stage 2 unchanged.
+            self.assertEqual(retry_pipeline.dependencies.ai_client.stage1_payloads, [])
+            second_payload = retry_pipeline.dependencies.ai_client.stage2_payloads[0]["inbound_messages"][0]
+            self.assertEqual(second_payload, first_payload)
 
     def test_missing_stage1_required_document_fails_before_ai_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

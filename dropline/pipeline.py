@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
@@ -19,11 +19,14 @@ from .mail import (
     OutboundMailClient,
     SMTPOutboundClient,
     compose_email,
+    extract_plain_body,
     normalize_inbound_message,
+    paragraph_keys,
+    strip_known_paragraphs,
 )
 from .memory import MemoryManager
-from .models import ModelValidationError, NormalizedInboundMessage, RunOutcome, Stage1Result, Stage2Result
-from .models import StoredOutboundMessage, StoredRun
+from .models import ModelValidationError, NormalizedInboundMessage, RawInboundMessage, RunOutcome, Stage1Result, Stage2Result
+from .models import StoredInboundMessage, StoredOutboundMessage, StoredRun
 from .storage import OUTBOUND_PENDING, StateStore
 from .utils import hash_text, new_run_id, now_in_timezone
 
@@ -36,6 +39,7 @@ RECENT_SCENE_CARD_LIMIT = 7
 INBOUND_FAILURE_STAGES = ("stage1", "stage2", "validation", "image")
 # A batch that keeps failing Stage 2 validation is quarantined sooner than other failures.
 VALIDATION_MAX_BATCH_ATTEMPTS = 2
+RECENT_OUTBOUND_QUOTE_LIMIT = 2
 
 
 @dataclass(slots=True)
@@ -481,12 +485,12 @@ class PipelineService:
         return quarantined_uids
 
     def _mark_inbound_consumed(self, context: RunContext) -> None:
-        consumed_uids = [item.imap_uid for item in context.inbound_messages]
+        consumed_keys = [(item.uidvalidity, item.imap_uid) for item in context.inbound_messages]
         self.dependencies.state_store.mark_inbound_consumed(
-            consumed_uids,
+            consumed_keys,
             batch_id=context.batch_id,
         )
-        highest_consumed_uid = max(consumed_uids, default=0)
+        highest_consumed_uid = max((imap_uid for _, imap_uid in consumed_keys), default=0)
         if highest_consumed_uid > 0:
             current_uid = self.dependencies.state_store.get_last_consumed_imap_uid()
             self.dependencies.state_store.set_last_consumed_imap_uid(max(current_uid, highest_consumed_uid))
@@ -498,22 +502,20 @@ class PipelineService:
         LOGGER.info("[%s] [%s/%s] %s%s", run_id, step, total, message, suffix)
 
     def _pull_and_store_inbound(self, *, run_id: str, now: datetime) -> tuple[list[NormalizedInboundMessage], int]:
-        since_uid = self.dependencies.state_store.get_last_seen_imap_uid()
-        received_since = None
-        first_outbound_sent_at = None
-        if since_uid <= 0:
-            first_outbound_sent_at = self.dependencies.state_store.get_first_outbound_sent_at()
-            if first_outbound_sent_at is not None:
-                received_since = first_outbound_sent_at.date()
-        raw_messages, highest_seen_uid = self.dependencies.inbound_client.fetch_since(
-            since_uid,
-            0,
-            self.settings.mail.allowlist_senders,
-            received_since,
-        )
-        fresh_messages_by_uid: dict[int, NormalizedInboundMessage] = {}
+        store = self.dependencies.state_store
+        since_uid = store.get_last_seen_imap_uid()
+        received_since, first_outbound_sent_at = self._inbound_scan_cutoff(since_uid)
+        raw_messages, highest_seen_uid, uidvalidity = self._fetch_inbound(since_uid, received_since)
+        if self._reconcile_uidvalidity(run_id, uidvalidity):
+            # The UID space was renumbered, so everything fetched against the stale cursor is meaningless;
+            # rescan from the first outbound date and rely on Message-ID dedup to skip stored letters.
+            since_uid = 0
+            received_since, first_outbound_sent_at = self._inbound_scan_cutoff(since_uid)
+            raw_messages, highest_seen_uid, uidvalidity = self._fetch_inbound(since_uid, received_since)
+        known_paragraphs = self._recent_outbound_paragraph_keys(run_id) if raw_messages else set()
+        fresh_messages_by_key: dict[tuple[int, int], NormalizedInboundMessage] = {}
         for raw_message in raw_messages:
-            normalized = normalize_inbound_message(raw_message)
+            normalized = normalize_inbound_message(raw_message, uidvalidity=uidvalidity)
             if self.settings.mail.allowlist_senders and normalized.from_email not in self.settings.mail.allowlist_senders:
                 LOGGER.info(
                     "[%s] Skipping inbound message from non-allowlisted sender: %s",
@@ -529,34 +531,107 @@ class PipelineService:
                     normalized.received_at,
                 )
                 continue
-            raw_path = self.dependencies.state_store.save_inbound_artifacts(run_id, now, normalized, raw_message.raw_bytes)
-            self.dependencies.state_store.upsert_inbound_message(
+            if store.has_inbound_message_id(normalized.message_id):
+                LOGGER.info(
+                    "[%s] Skipping inbound message whose Message-ID is already stored (moved or re-fetched): "
+                    "uid=%s message_id=%s",
+                    run_id,
+                    normalized.imap_uid,
+                    normalized.message_id,
+                )
+                continue
+            stripped_body = strip_known_paragraphs(normalized.body_text, known_paragraphs)
+            if stripped_body != normalized.body_text:
+                LOGGER.info(
+                    "[%s] Removed paragraph(s) quoted verbatim from the character's recent letters: uid=%s",
+                    run_id,
+                    normalized.imap_uid,
+                )
+                normalized.body_text = stripped_body
+            raw_path = store.save_inbound_artifacts(run_id, now, normalized, raw_message.raw_bytes)
+            store.upsert_inbound_message(
                 normalized,
                 raw_path=raw_path,
             )
-            fresh_messages_by_uid[normalized.imap_uid] = normalized
+            fresh_messages_by_key[(normalized.uidvalidity, normalized.imap_uid)] = normalized
         if highest_seen_uid > 0:
-            current_seen_uid = self.dependencies.state_store.get_last_seen_imap_uid()
-            self.dependencies.state_store.set_last_seen_imap_uid(max(current_seen_uid, highest_seen_uid))
-        stored = self.dependencies.state_store.list_unconsumed_inbound()
+            current_seen_uid = store.get_last_seen_imap_uid()
+            store.set_last_seen_imap_uid(max(current_seen_uid, highest_seen_uid))
+        stored = store.list_unconsumed_inbound()
         messages = [
-            fresh_messages_by_uid.get(
-                item.imap_uid,
-                NormalizedInboundMessage(
-                    message_id=item.message_id,
-                    imap_uid=item.imap_uid,
-                    from_email=item.from_email,
-                    subject=item.subject,
-                    received_at=item.received_at,
-                    body_text=item.body_text,
-                    body_html_present=False,
-                    attachments=[],
-                    thread_message_id=item.thread_message_id,
-                ),
-            )
+            fresh_messages_by_key.get((item.uidvalidity, item.imap_uid), _stored_inbound_to_normalized(item))
             for item in stored
         ]
         return self._select_next_sender_batch(run_id, messages), highest_seen_uid
+
+    def _inbound_scan_cutoff(self, since_uid: int) -> tuple[date | None, datetime | None]:
+        """Without a UID cursor, scan from the first outbound letter's date and drop anything sent before it."""
+        if since_uid > 0:
+            return None, None
+        first_outbound_sent_at = self.dependencies.state_store.get_first_outbound_sent_at()
+        if first_outbound_sent_at is None:
+            return None, None
+        return first_outbound_sent_at.date(), first_outbound_sent_at
+
+    def _fetch_inbound(self, since_uid: int, received_since: date | None) -> tuple[list[RawInboundMessage], int, int]:
+        return self.dependencies.inbound_client.fetch_since(
+            since_uid,
+            0,
+            self.settings.mail.allowlist_senders,
+            received_since,
+        )
+
+    def _reconcile_uidvalidity(self, run_id: str, uidvalidity: int) -> bool:
+        """Persist the mailbox UIDVALIDITY; return True when it changed and the UID cursor was reset."""
+        if uidvalidity <= 0:
+            return False
+        store = self.dependencies.state_store
+        stored_uidvalidity = store.get_imap_uidvalidity()
+        if stored_uidvalidity == uidvalidity:
+            return False
+        changed = stored_uidvalidity > 0
+        if changed:
+            LOGGER.error(
+                "[%s] IMAP UIDVALIDITY changed from %s to %s: the mailbox was rebuilt or migrated and UIDs were "
+                "renumbered. Resetting last_seen_imap_uid from %s to 0 and rescanning since the first outbound date.",
+                run_id,
+                stored_uidvalidity,
+                uidvalidity,
+                store.get_last_seen_imap_uid(),
+            )
+            store.set_last_seen_imap_uid(0)
+        store.set_imap_uidvalidity(uidvalidity)
+        return changed
+
+    def _recent_outbound_paragraph_keys(self, run_id: str) -> set[str]:
+        """Paragraph keys of the character's latest letters, used to strip unmarked quotes from replies."""
+        keys: set[str] = set()
+        for outbound in self.dependencies.state_store.list_recent_outbound_messages(limit=RECENT_OUTBOUND_QUOTE_LIMIT):
+            keys.update(paragraph_keys(self._load_outbound_body(run_id, outbound)))
+        return keys
+
+    def _load_outbound_body(self, run_id: str, outbound: StoredOutboundMessage) -> str:
+        stored_run = self.dependencies.state_store.get_run(outbound.run_id)
+        if stored_run is not None and stored_run.stage2_path:
+            try:
+                payload = load_json_file(Path(stored_run.stage2_path), default=None)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and isinstance(payload.get("body"), str):
+                return payload["body"]
+        raw_path = Path(outbound.raw_path)
+        if not raw_path.is_file():
+            return ""
+        try:
+            return extract_plain_body(raw_path.read_bytes())
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "[%s] Could not read archived outbound email %s for quote stripping: %s",
+                run_id,
+                raw_path,
+                exc,
+            )
+            return ""
 
     def _select_next_sender_batch(
         self,
@@ -815,6 +890,21 @@ def _classify_error(exc: Exception, *, current_stage: str) -> str:
     if "smtp" in message or "send" in message:
         return "smtp"
     return "pipeline"
+
+
+def _stored_inbound_to_normalized(item: StoredInboundMessage) -> NormalizedInboundMessage:
+    return NormalizedInboundMessage(
+        message_id=item.message_id,
+        imap_uid=item.imap_uid,
+        from_email=item.from_email,
+        subject=item.subject,
+        received_at=item.received_at,
+        body_text=item.body_text,
+        body_html_present=item.body_html_present,
+        attachments=list(item.attachments),
+        thread_message_id=item.thread_message_id,
+        uidvalidity=item.uidvalidity,
+    )
 
 
 def _is_at_or_before_cutoff(received_at: str, cutoff: datetime | None) -> bool:

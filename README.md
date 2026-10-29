@@ -173,6 +173,14 @@ mail:
 
 If you see `CERTIFICATE_VERIFY_FAILED`: dropline checks certificates against the system trust store and falls back to the `certifi` bundle when the Python build has no system CAs (common with python.org installers on macOS). A self-signed mail server needs its CA added to the system trust store, and `host` must be the name on the certificate, not an IP address.
 
+#### Inbox cursor, quoted replies, and attachments
+
+None of this is configurable; it is how the inbox pull always behaves:
+
+- **UIDVALIDITY changes**: every inbox scan reads the IMAP folder's `UIDVALIDITY` and stores it in `state.db`. When the mailbox is rebuilt or migrated its UIDs are renumbered; dropline then logs an ERROR, resets the `last_seen_imap_uid` cursor to 0, and rescans the inbox from the date of the first outbound letter. Letters already stored are deduplicated by `Message-ID`, so none of them is answered twice; likewise, moving a letter out of INBOX and back (which assigns a new UID) never triggers a second reply.
+- **Quote stripping**: before a letter reaches Stage 1, the quoted previous letter is removed so only what the user wrote remains. Plain text recognizes `>` quote lines, `On … wrote:`, `-----Original Message-----`, `From:`, plus QQ Mail / Foxmail's `------------------ 原始邮件 ------------------`, Chinese Outlook / QQ Mail's `发件人:`, 163 / Apple Mail's `在 … 写道:`, Chinese Gmail's `… 于 … 写道:`, and Outlook's `________________` separator; HTML bodies first drop `<blockquote>`, `gmail_quote`, and any element whose id/class contains `quote` as a whole. On top of that, any paragraph that repeats a paragraph of the character's two most recent letters verbatim is removed, so the character's own words are never attributed to the user.
+- **Attachments**: only metadata is recorded (file name, type, size, inline flag), inline images included; attachment contents are never read, archived, or sent to the model. The character only knows that "a file of this kind arrived".
+
 To pin the language used by model outputs, add `language` under `llm`:
 
 ```yaml

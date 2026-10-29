@@ -59,6 +59,18 @@ class AttachmentMeta:
     filename: str
     content_type: str
     size: int
+    inline: bool = False
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> AttachmentMeta:
+        payload = _expect_object(payload, "attachments[]")
+        size = payload.get("size", 0)
+        return cls(
+            filename=str(payload.get("filename", "")),
+            content_type=str(payload.get("content_type", "")),
+            size=int(size) if isinstance(size, (int, float)) and not isinstance(size, bool) else 0,
+            inline=bool(payload.get("inline", False)),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -81,6 +93,7 @@ class NormalizedInboundMessage:
     body_html_present: bool
     attachments: list[AttachmentMeta]
     thread_message_id: str | None = None
+    uidvalidity: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -551,6 +564,9 @@ class StoredInboundMessage:
     relationship_slug: str
     consumed_batch_id: str | None = None
     thread_message_id: str | None = None
+    uidvalidity: int = 0
+    body_html_present: bool = False
+    attachments: list[AttachmentMeta] = field(default_factory=list)
     attempt_count: int = 0
     last_error: str | None = None
     last_attempt_at: str | None = None
