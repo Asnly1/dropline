@@ -15,7 +15,7 @@ from email.utils import formataddr, make_msgid, parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import Protocol
 
-from .config import CharacterMailboxConfig, MailEndpointConfig, Settings, current_character_name
+from .config import SUPPORTED_SMTP_SECURITY, CharacterMailboxConfig, MailEndpointConfig, Settings, current_character_name
 from .models import AttachmentMeta, NormalizedInboundMessage, RawInboundMessage
 from .utils import retry_call
 
@@ -38,12 +38,34 @@ SIGNATURE_PATTERNS = (
 
 
 def build_tls_context() -> ssl.SSLContext:
-    """Return a TLS context that verifies server certificates against the system trust store.
+    """Return a TLS context that verifies server certificates.
 
     The standard library's IMAP4_SSL / SMTP_SSL / starttls() default to an *unverified*
     context when none is passed, so every TLS connection must go through this helper.
+    Certificates are checked against the system trust store; when the Python build has no
+    system CAs (python.org installers on macOS are a common case) the certifi bundle that
+    the LLM SDKs already depend on is loaded instead.
     """
-    return ssl.create_default_context()
+    context = ssl.create_default_context()
+    if context.cert_store_stats().get("x509_ca", 0) == 0:
+        try:
+            import certifi
+        except ImportError:  # pragma: no cover - certifi is pulled in by httpx/requests
+            return context
+        context.load_verify_locations(cafile=certifi.where())
+    return context
+
+
+def _log_certificate_failure(protocol: str, host: str, port: int, exc: BaseException) -> None:
+    LOGGER.error(
+        "%s TLS certificate verification failed for %s:%s: %s. dropline verifies server certificates against "
+        "the system trust store (falling back to the certifi bundle). A self-signed mail server needs its CA "
+        "added to the system trust store, and the host must be the name on the certificate, not an IP address.",
+        protocol,
+        host,
+        port,
+        exc,
+    )
 
 
 class InboundMailClient(Protocol):
@@ -73,16 +95,20 @@ class IMAPInboundClient:
         allowlist_senders: tuple[str, ...] = (),
         received_since: date | None = None,
     ) -> tuple[list[RawInboundMessage], int]:
-        return retry_call(
-            lambda: self._fetch_since_once(
-                since_uid=since_uid,
-                limit=limit,
-                allowlist_senders=allowlist_senders,
-                received_since=received_since,
-            ),
-            operation_name="IMAP fetch",
-            logger=LOGGER,
-        )
+        try:
+            return retry_call(
+                lambda: self._fetch_since_once(
+                    since_uid=since_uid,
+                    limit=limit,
+                    allowlist_senders=allowlist_senders,
+                    received_since=received_since,
+                ),
+                operation_name="IMAP fetch",
+                logger=LOGGER,
+            )
+        except ssl.SSLCertVerificationError as exc:
+            _log_certificate_failure("IMAP", self.endpoint.host, self.endpoint.port, exc)
+            raise
 
     def _fetch_since_once(
         self,
@@ -129,12 +155,13 @@ class IMAPInboundClient:
                 ssl_context=build_tls_context(),
                 timeout=MAIL_SOCKET_TIMEOUT_SECONDS,
             )
+        client = imaplib.IMAP4(self.endpoint.host, self.endpoint.port, timeout=MAIL_SOCKET_TIMEOUT_SECONDS)
         LOGGER.warning(
             "IMAP connection to %s:%s is unencrypted (imap.ssl=false); credentials and mail are sent in cleartext.",
             self.endpoint.host,
             self.endpoint.port,
         )
-        return imaplib.IMAP4(self.endpoint.host, self.endpoint.port, timeout=MAIL_SOCKET_TIMEOUT_SECONDS)
+        return client
 
     def _filter_allowlist_by_from_header(
         self,
@@ -193,15 +220,21 @@ class SMTPOutboundClient:
         if not message_id:
             message_id = make_msgid(domain=self.mailbox.address.split("@", 1)[-1])
             message["Message-ID"] = message_id
-        return retry_call(
-            lambda: self._send_once(message),
-            operation_name="SMTP send",
-            logger=LOGGER,
-        )
+        try:
+            return retry_call(
+                lambda: self._send_once(message),
+                operation_name="SMTP send",
+                logger=LOGGER,
+            )
+        except ssl.SSLCertVerificationError as exc:
+            _log_certificate_failure("SMTP", self.mailbox.smtp.host, self.mailbox.smtp.port, exc)
+            raise
 
     def _send_once(self, message: EmailMessage) -> str:
         endpoint = self.mailbox.smtp
         message_id = message.get("Message-ID")
+        if endpoint.security not in SUPPORTED_SMTP_SECURITY:
+            raise ValueError(f"Unsupported smtp.security value: {endpoint.security!r}")
         if endpoint.security == "ssl":
             client = smtplib.SMTP_SSL(
                 endpoint.host,
@@ -214,7 +247,7 @@ class SMTPOutboundClient:
         try:
             if endpoint.security == "starttls":
                 client.starttls(context=build_tls_context())
-            elif endpoint.security == "none":
+            else:
                 LOGGER.warning(
                     "SMTP connection to %s:%s is unencrypted (smtp.security=none); credentials are sent in cleartext.",
                     endpoint.host,

@@ -74,6 +74,7 @@ Examples:
 
 - Same-day events, short-term emotions, one-off complaints, and temporary arrangements all go into `episode` first.
 - `episode` may be somewhat detailed, but it should be downweighted, archived, or deleted after 14-30 days.
+- Current implementation: only the last 7 days of `episode` files are read into the prompts; there is no automatic downweighting, archiving, or deletion.
 
 ## 5. Content Explicitly Forbidden From Long-Term Promotion
 
@@ -122,7 +123,7 @@ Examples:
 - Short-term preferences not mentioned again for 30 days should be downweighted.
 - Long-term memories explicitly negated by the user should immediately be marked as `superseded`.
 - Deduplicate weekly: merge semantically similar memories and keep the one that is more specific, newer, and better supported by evidence.
-- Current implementation: the rules in this section are not automated yet. The code only merges entries that are identical after normalization (or substrings of each other) at write time; there is no 30-day downweighting, no `superseded` marker, and no weekly deduplication. Resolved `active_arc` entries are removed from the file when Stage 2 suggests `archive`.
+- Current implementation: only the first rule is automated. When the reply stage suggests `archive`, the matching `active_arc` entry is deleted from the file (nothing is archived elsewhere). 30-day downweighting, the `superseded` marker, and weekly deduplication are not automated. Write-time deduplication only merges entries that are identical after normalization, or where one contains the other and the contained one is at least 8 characters long.
 
 ## 10. Final Judgment Question
 

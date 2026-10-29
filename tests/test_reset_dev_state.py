@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -59,6 +61,10 @@ class ResetDevStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             create_test_repo(root)
+            session_meta_path = root / "profiles" / "characters" / "keqing" / "sessions" / "childhood-friends" / "meta.json"
+            meta_payload = json.loads(session_meta_path.read_text(encoding="utf-8"))
+            meta_payload["created_at"] = "2026-01-01T00:00:00+00:00"
+            session_meta_path.write_text(json.dumps(meta_payload, ensure_ascii=False), encoding="utf-8")
             settings = load_test_settings(root)
 
             archive_file = settings.documents.session_archive_dir / "2026-04-05" / "run-1" / "stage1.json"
@@ -93,10 +99,10 @@ class ResetDevStateTests(unittest.TestCase):
             self.assertFalse(pycache_dir.exists())
             self.assertTrue(settings.storage.sqlite_path.exists())
             self.assertTrue((root / "profiles" / "characters" / "keqing" / "sessions").exists())
-            session_meta = root / "profiles" / "characters" / "keqing" / "sessions" / "childhood-friends" / "meta.json"
-            self.assertTrue(session_meta.exists())
+            self.assertTrue(session_meta_path.exists())
             reloaded = load_settings(root / "config.yaml")
             self.assertIsNotNone(reloaded.active_profile)
+            self.assertEqual(reloaded.active_profile.session.created_at, "2026-01-01T00:00:00+00:00")
             self.assertTrue(settings.documents.user_episode_dir.exists())
             self.assertTrue(settings.documents.character_episode_dir.exists())
             self.assertEqual(list(settings.documents.user_episode_dir.glob("*.json")), [])
@@ -153,6 +159,24 @@ class ResetDevStateTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             rendered = output.getvalue()
             self.assertIn("Reset complete. State reinitialized at", rendered)
+
+    def test_reset_dev_state_command_repairs_session_removed_by_older_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            shutil.rmtree(root / "profiles" / "characters" / "keqing" / "sessions")
+            self.assertIsNone(load_settings(root / "config.yaml", require_active_profile=False).active_profile)
+
+            with patch("dropline.reset_dev_state.uninstall_scheduler", return_value=(False, False)):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    exit_code = reset_dev_state_command(str(root / "config.yaml"))
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("Reset complete. State reinitialized at", output.getvalue())
+            session_meta = root / "profiles" / "characters" / "keqing" / "sessions" / "childhood-friends" / "meta.json"
+            self.assertTrue(session_meta.exists())
+            self.assertIsNotNone(load_settings(root / "config.yaml").active_profile)
 
     def test_reset_dev_state_command_reports_no_active_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -74,7 +74,7 @@ flowchart LR
 
 - `profiles/active.json` points to the currently active character + relationship.
 - A **session** is uniquely identified by `character × relationship` — switching relationship gives you a brand-new memory space.
-- The CLI matches characters and relationships by name (the character name, optionally with its work title, and the relationship name); slugs are accepted too. The relationship description is not used for matching.
+- The CLI matches a character by name, by `name / work title` (for example `刻晴 / 原神`) or by slug, and a relationship by name or slug. The relationship description is not used for matching.
 
 ---
 
@@ -171,6 +171,8 @@ mail:
 
 `ssl` means direct `SMTP_SSL`, `starttls` means plain SMTP followed by STARTTLS, and `none` means no transport encryption. Both `ssl` and `starttls` verify the server certificate against the system trust store; `none` sends the password in cleartext and logs a warning on every send. IMAP is controlled by `imap.ssl` and verifies certificates the same way. Every mail socket has a 60-second timeout.
 
+If you see `CERTIFICATE_VERIFY_FAILED`: dropline checks certificates against the system trust store and falls back to the `certifi` bundle when the Python build has no system CAs (common with python.org installers on macOS). A self-signed mail server needs its CA added to the system trust store, and `host` must be the name on the certificate, not an IP address.
+
 To pin the language used by model outputs, add `language` under `llm`:
 
 ```yaml
@@ -249,7 +251,7 @@ A session's memory is split into six kinds. Stage 1 only **proposes**; code **de
 | `memory/user_profile.json`        | Stable facts             | User's long-term goals and core preferences (highest bar)          |
 | `memory/relationship_memory.json` | Relationship conventions | Nicknames, shared in-jokes, the relationship definition            |
 | `memory/active_arc.json`          | In-progress arc          | Recurring, unresolved themes within the last 7 days (max 1–2)      |
-| `episodes/user/*.json`            | User short-term          | Daily mood, temporary worries (weight decays after 14–30 days)     |
+| `episodes/user/*.json`            | User short-term          | Daily mood, temporary worries (only the last 7 days are fed to the prompts; no automatic decay) |
 | `episodes/character/*.json`       | Character short-term     | What the character handled this turn                               |
 | `memory/conflict_notes.json`      | Conflicts                | New info contradicting old memory — parked here until re-confirmed |
 
@@ -270,7 +272,7 @@ python3 -m dropline install-scheduler --config /absolute/path/config.yaml --yes
 python3 -m dropline uninstall-scheduler --config /absolute/path/config.yaml --yes
 ```
 
-Both commands ask for confirmation unless `--yes` is given; without it, an unattended run exits with `Cancelled.`.
+Both commands ask for confirmation unless `--yes` is given; without it, an unattended run stops at the prompt and exits with code 1.
 
 Optional flags:
 

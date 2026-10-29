@@ -74,7 +74,7 @@ flowchart LR
 
 - `profiles/active.json` 指向当前生效的角色 + 关系
 - 每个 **session = 角色 × 关系**,切换不同关系就是一个全新记忆空间
-- CLI 按角色名(可带作品名)和关系名匹配,也接受 slug;关系描述不参与匹配
+- CLI 按名字、`名字 / 作品名`(如 `刻晴 / 原神`)或 slug 匹配角色,按名字或 slug 匹配关系;关系描述不参与匹配
 
 ---
 
@@ -171,6 +171,8 @@ mail:
 
 `ssl` 表示直连 SMTP_SSL,`starttls` 表示普通 SMTP 连接后升级 STARTTLS,`none` 表示不启用传输层加密。`ssl` 与 `starttls` 都会按系统信任库校验服务器证书;`none` 会把授权码明文发送,每次发信都会在日志里打出警告。IMAP 侧由 `imap.ssl` 控制,同样校验证书。所有邮件连接都有 60 秒超时。
 
+如果日志里出现 `CERTIFICATE_VERIFY_FAILED`:dropline 按系统信任库校验证书,当 Python 自身没有系统 CA 时(macOS 上 python.org 安装包常见)会退回到 `certifi` 自带的证书包。自建邮件服务器用自签名证书时,需要把它的 CA 加进系统信任库;`host` 必须填证书上的域名,不能填 IP。
+
 如果你想统一控制模型输出的文本语言,可以在 `llm` 下增加 `language`:
 
 ```yaml
@@ -247,7 +249,7 @@ session 的记忆分 6 类,Stage 1 只负责**提议**,代码负责**裁决**是
 | `memory/user_profile.json`        | 稳定事实   | 用户长期目标、核心偏好(门槛最高)         |
 | `memory/relationship_memory.json` | 关系约定   | 称呼、共同梗、关系定义                   |
 | `memory/active_arc.json`          | 进行中主线 | 最近 7 天内反复出现、未解决(最多 1~2 条) |
-| `episodes/user/*.json`            | 用户短期   | 日常心情、临时烦恼(14~30 天后降权)       |
+| `episodes/user/*.json`            | 用户短期   | 日常心情、临时烦恼(只有最近 7 天会进入提示词,没有自动降权) |
 | `episodes/character/*.json`       | 角色短期   | 角色本次处理的事务                       |
 | `memory/conflict_notes.json`      | 冲突记录   | 新信息与旧记忆冲突,先入此处等待二次确认  |
 
@@ -268,7 +270,7 @@ python3 -m dropline install-scheduler --config /绝对/路径/config.yaml --yes
 python3 -m dropline uninstall-scheduler --config /绝对/路径/config.yaml --yes
 ```
 
-两个命令都会要求确认,加 `--yes` 跳过;无人值守时不加会直接以 `Cancelled.` 退出。
+两个命令都会要求确认,加 `--yes` 跳过;无人值守时不加会停在确认提示并以退出码 1 取消。
 
 可选参数:
 

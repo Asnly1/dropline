@@ -336,9 +336,10 @@ Content-Type: text/plain; charset="utf-8"
             password="secret",
             folder="INBOX",
         )
-        with patch("dropline.mail.imaplib.IMAP4_SSL", return_value=fake_client) as imap_ssl, patch(
+        with patch("dropline.mail.imaplib.IMAP4_SSL", autospec=True, return_value=fake_client) as imap_ssl, patch(
             "dropline.mail.imaplib.IMAP4",
-        ) as imap_plain:
+            autospec=True,
+        ) as imap_plain, self.assertNoLogs("dropline.mail", level="WARNING"):
             messages, highest_seen_uid = IMAPInboundClient(endpoint).fetch_since(0, 0, ())
 
         self.assertEqual(messages, [])
@@ -360,13 +361,47 @@ Content-Type: text/plain; charset="utf-8"
             password="secret",
             folder="INBOX",
         )
-        with patch("dropline.mail.imaplib.IMAP4", return_value=fake_client) as imap_plain, patch(
+        with patch("dropline.mail.imaplib.IMAP4", autospec=True, return_value=fake_client) as imap_plain, patch(
             "dropline.mail.imaplib.IMAP4_SSL",
-        ) as imap_ssl:
+            autospec=True,
+        ) as imap_ssl, self.assertLogs("dropline.mail", level="WARNING") as logs:
             IMAPInboundClient(endpoint).fetch_since(0, 0, ())
 
         imap_plain.assert_called_once_with("imap.example.com", 143, timeout=mail_module.MAIL_SOCKET_TIMEOUT_SECONDS)
         imap_ssl.assert_not_called()
+        self.assertTrue(any("unencrypted" in line for line in logs.output))
+
+    def test_imap_certificate_failure_is_not_retried_and_logs_hint(self) -> None:
+        endpoint = MailEndpointConfig(
+            host="imap.qq.com",
+            port=993,
+            ssl=True,
+            username="keqing@qq.com",
+            password="secret",
+            folder="INBOX",
+        )
+        with patch(
+            "dropline.mail.imaplib.IMAP4_SSL",
+            autospec=True,
+            side_effect=ssl.SSLCertVerificationError("certificate verify failed: self-signed certificate"),
+        ) as imap_ssl, patch("dropline.utils.time.sleep") as sleep, self.assertLogs(
+            "dropline.mail", level="ERROR"
+        ) as logs, self.assertRaises(ssl.SSLCertVerificationError):
+            IMAPInboundClient(endpoint).fetch_since(0, 0, ())
+
+        self.assertEqual(imap_ssl.call_count, 1)
+        sleep.assert_not_called()
+        self.assertTrue(any("certificate verification failed" in line for line in logs.output))
+
+    def test_build_tls_context_falls_back_to_certifi_without_system_cas(self) -> None:
+        empty_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        self.assertEqual(empty_context.cert_store_stats()["x509_ca"], 0)
+
+        with patch("dropline.mail.ssl.create_default_context", return_value=empty_context):
+            context = mail_module.build_tls_context()
+
+        self.assertIs(context, empty_context)
+        _assert_verified_tls_context(self, context)
 
     def test_smtp_send_retries_transient_disconnect(self) -> None:
         endpoint = _smtp_endpoint(
@@ -462,9 +497,10 @@ Content-Type: text/plain; charset="utf-8"
         with patch("dropline.mail.smtplib.SMTP_SSL") as smtp_ssl, patch(
             "dropline.mail.smtplib.SMTP",
             return_value=fake_client,
-        ) as smtp:
+        ) as smtp, self.assertLogs("dropline.mail", level="WARNING") as logs:
             SMTPOutboundClient(mailbox).send(message)
 
+        self.assertTrue(any("unencrypted" in line for line in logs.output))
         smtp.assert_called_once_with("smtp.example.com", 25, timeout=mail_module.MAIL_SOCKET_TIMEOUT_SECONDS)
         smtp_ssl.assert_not_called()
         self.assertEqual(fake_client.starttls_calls, 0)
@@ -544,6 +580,7 @@ def _assert_verified_tls_context(test_case: unittest.TestCase, context: object) 
     test_case.assertIsInstance(context, ssl.SSLContext)
     test_case.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
     test_case.assertTrue(context.check_hostname)
+    test_case.assertGreater(context.cert_store_stats()["x509_ca"], 0)
 
 
 def _smtp_endpoint(*, host: str, port: int, security: str, username: str, password: str):
