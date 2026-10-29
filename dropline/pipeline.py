@@ -8,7 +8,8 @@ from email.parser import BytesParser
 from pathlib import Path
 from typing import Sequence
 
-from .config import Settings, load_settings, validate_live_settings
+from .alerts import notify_run_failure
+from .config import IMAGE_ON_FAILURE_TEXT_ONLY, Settings, load_settings, validate_live_settings
 from .documents import load_json_file, read_required_text
 from .llm import AIClient, build_ai_client
 from .llm_contracts import ENGLISH_OUTPUT_LANGUAGE
@@ -22,7 +23,7 @@ from .mail import (
 )
 from .memory import MemoryManager
 from .models import ModelValidationError, NormalizedInboundMessage, RunOutcome, Stage1Result, Stage2Result
-from .models import StoredOutboundMessage
+from .models import StoredOutboundMessage, StoredRun
 from .storage import OUTBOUND_PENDING, StateStore
 from .utils import hash_text, new_run_id, now_in_timezone
 
@@ -31,6 +32,10 @@ LOGGER = logging.getLogger(__name__)
 
 RECENT_EPISODE_LOOKBACK_DAYS = 7
 RECENT_SCENE_CARD_LIMIT = 7
+# Failures in these stages count against the inbound batch that was being processed.
+INBOUND_FAILURE_STAGES = ("stage1", "stage2", "validation", "image")
+# A batch that keeps failing Stage 2 validation is quarantined sooner than other failures.
+VALIDATION_MAX_BATCH_ATTEMPTS = 2
 
 
 @dataclass(slots=True)
@@ -54,8 +59,10 @@ class RunContext:
     stage1_path: Path | None = None
     stage2_path: Path | None = None
     image_generated: bool = False
+    image_degraded: bool = False
     image_path: Path | None = None
     outbound_message_id: str | None = None
+    reused_run_id: str | None = None
 
 
 class PipelineService:
@@ -89,8 +96,11 @@ class PipelineService:
                         return self._retry_pending_outbound_run(context, existing_outbound)
                     return self._finish_existing_outbound_run(context, existing_outbound)
 
-                stage1_result = self._run_stage1(context)
-                stage2_result = self._run_stage2(context, stage1_result)
+                stage1_result, stage2_result = self._load_reusable_stage_results(context)
+                if stage1_result is None and stage2_result is None:
+                    stage1_result = self._run_stage1(context)
+                if stage2_result is None:
+                    stage2_result = self._run_stage2(context, stage1_result)
                 self._maybe_generate_image(context, stage2_result)
                 self._send_outbound(context, stage2_result)
                 return self._finish_successful_run(context, stage2_result)
@@ -166,6 +176,7 @@ class PipelineService:
             status="success",
             finished_at=context.now.isoformat(),
         )
+        self.dependencies.state_store.reset_run_failures()
         return RunOutcome(
             success=True,
             run_id=context.run_id,
@@ -253,18 +264,46 @@ class PipelineService:
             return
         context.current_stage = "image"
         self._log_step(context.run_id, 6, 8, "Generating image from scene card.")
-        generated_image = self.dependencies.ai_client.generate_image(stage2_result.scene_card)
-        context.image_path = self.dependencies.state_store.save_generated_image(context.run_id, context.now, generated_image)
-        self.dependencies.state_store.record_asset(
-            asset_id=hash_text(context.run_id, prefix="asset-"),
-            run_id=context.run_id,
-            image_path=context.image_path,
-            scene_card=stage2_result.scene_card.to_dict(),
-            prompt_text=generated_image.prompt_text,
-            created_at=context.now.isoformat(),
-        )
+        try:
+            generated_image = self.dependencies.ai_client.generate_image(stage2_result.scene_card)
+            image_path = self.dependencies.state_store.save_generated_image(context.run_id, context.now, generated_image)
+            self.dependencies.state_store.record_asset(
+                asset_id=hash_text(context.run_id, prefix="asset-"),
+                run_id=context.run_id,
+                image_path=image_path,
+                scene_card=stage2_result.scene_card.to_dict(),
+                prompt_text=generated_image.prompt_text,
+                created_at=context.now.isoformat(),
+            )
+        except Exception as exc:
+            if self.settings.llm.image.on_failure != IMAGE_ON_FAILURE_TEXT_ONLY:
+                raise
+            self._degrade_to_text_only(context, exc)
+            return
+        context.image_path = image_path
         context.image_generated = True
         self._log_step(context.run_id, 6, 8, "Image generation completed.", image_path=context.image_path.name)
+
+    def _degrade_to_text_only(self, context: RunContext, exc: Exception) -> None:
+        LOGGER.warning(
+            "[%s] Image generation failed; continuing with a text-only email because llm.image.on_failure=text_only: %s",
+            context.run_id,
+            exc,
+        )
+        context.image_degraded = True
+        context.image_generated = False
+        context.image_path = None
+        self.dependencies.state_store.save_stage_json(
+            context.run_id,
+            context.now,
+            "image_failure.json",
+            {
+                "on_failure": IMAGE_ON_FAILURE_TEXT_ONLY,
+                "error": str(exc),
+                "failed_at": now_in_timezone(self.settings.project.timezone).isoformat(),
+            },
+        )
+        self._log_step(context.run_id, 6, 8, "Image generation degraded to text-only email.", image_degraded=True)
 
     def _send_outbound(self, context: RunContext, stage2_result: Stage2Result) -> None:
         reply_to_message_id = context.inbound_messages[-1].message_id if context.inbound_messages else None
@@ -320,12 +359,16 @@ class PipelineService:
             stage1_path=str(context.stage1_path) if context.stage1_path else None,
             stage2_path=str(context.stage2_path) if context.stage2_path else None,
         )
+        self.dependencies.state_store.reset_run_failures()
         self._log_step(
             context.run_id,
             8,
             8,
             "Pipeline run succeeded.",
             archive_dir=self.settings.documents.session_archive_dir / context.now.date().isoformat() / context.run_id,
+            image_generated=context.image_generated,
+            image_degraded=context.image_degraded,
+            reused_run_id=context.reused_run_id or "-",
         )
         return RunOutcome(
             success=True,
@@ -339,15 +382,17 @@ class PipelineService:
     def _finish_failed_run(self, context: RunContext, exc: Exception) -> RunOutcome:
         LOGGER.exception("Pipeline run failed")
         error_stage = _classify_error(exc, current_stage=context.current_stage)
-        finished_at = now_in_timezone(self.settings.project.timezone).isoformat()
+        failed_at = now_in_timezone(self.settings.project.timezone)
         self.dependencies.state_store.finish_run(
             context.run_id,
             status="failed",
-            finished_at=finished_at,
+            finished_at=failed_at.isoformat(),
             error_stage=error_stage,
+            error_message=str(exc),
             stage1_path=str(context.stage1_path) if context.stage1_path else None,
             stage2_path=str(context.stage2_path) if context.stage2_path else None,
         )
+        self._record_failure_bookkeeping(context, error_stage=error_stage, message=str(exc), failed_at=failed_at)
         return RunOutcome(
             success=False,
             run_id=context.run_id,
@@ -358,6 +403,82 @@ class PipelineService:
             outbound_message_id=context.outbound_message_id,
             image_generated=context.image_generated,
         )
+
+    def _record_failure_bookkeeping(
+        self,
+        context: RunContext,
+        *,
+        error_stage: str,
+        message: str,
+        failed_at: datetime,
+    ) -> None:
+        """Track attempts per inbound batch and consecutive failures, then alert if thresholds are reached.
+
+        Bookkeeping problems are logged but never mask the original pipeline failure.
+        """
+        store = self.dependencies.state_store
+        try:
+            quarantined_uids = self._record_inbound_attempt(
+                context,
+                error_stage=error_stage,
+                message=message,
+                failed_at=failed_at,
+            )
+            consecutive_failures = store.record_run_failure(failed_at=failed_at.isoformat())
+        except Exception:
+            LOGGER.exception("[%s] Failed to record failure bookkeeping", context.run_id)
+            return
+        LOGGER.warning("[%s] Consecutive pipeline failures: %s", context.run_id, consecutive_failures)
+        notify_run_failure(
+            self.settings,
+            store,
+            run_id=context.run_id,
+            mode=context.mode,
+            batch_id=context.batch_id,
+            error_stage=error_stage,
+            message=message,
+            consecutive_failures=consecutive_failures,
+            quarantined_uids=quarantined_uids,
+            now=failed_at,
+            outbound_client=self.dependencies.outbound_client,
+        )
+
+    def _record_inbound_attempt(
+        self,
+        context: RunContext,
+        *,
+        error_stage: str,
+        message: str,
+        failed_at: datetime,
+    ) -> list[int]:
+        if context.mode != "reply" or not context.inbound_messages or error_stage not in INBOUND_FAILURE_STAGES:
+            return []
+        max_attempts = self.settings.schedule.max_batch_attempts
+        if error_stage == "validation":
+            max_attempts = min(max_attempts, VALIDATION_MAX_BATCH_ATTEMPTS)
+        imap_uids = [item.imap_uid for item in context.inbound_messages]
+        quarantined_uids = self.dependencies.state_store.record_inbound_attempt_failure(
+            imap_uids,
+            error_stage=error_stage,
+            message=message,
+            attempted_at=failed_at.isoformat(),
+            max_attempts=max_attempts,
+        )
+        LOGGER.warning(
+            "[%s] Recorded failed attempt at stage %s for inbound uid(s) %s (max_attempts=%s).",
+            context.run_id,
+            error_stage,
+            imap_uids,
+            max_attempts,
+        )
+        if quarantined_uids:
+            LOGGER.warning(
+                "[%s] Quarantined inbound uid(s) %s after repeated failures; "
+                "they stay out of future batches until `requeue-inbound` is run.",
+                context.run_id,
+                quarantined_uids,
+            )
+        return quarantined_uids
 
     def _mark_inbound_consumed(self, context: RunContext) -> None:
         consumed_uids = [item.imap_uid for item in context.inbound_messages]
@@ -472,6 +593,87 @@ class PipelineService:
         if not isinstance(payload, dict):
             raise RuntimeError("Archived stage2 metadata is missing or malformed.")
         return Stage2Result.from_dict(payload)
+
+    def _load_reusable_stage_results(self, context: RunContext) -> tuple[Stage1Result | None, Stage2Result | None]:
+        """Reuse archived Stage 1 / Stage 2 output from the latest failed run of the same batch.
+
+        A retry then skips the paid LLM calls that already produced a usable
+        artifact instead of generating a different letter. With a reusable
+        stage1.json the user-side memory was already written by that run, so
+        only Stage 2 is executed again.
+        """
+        failed_run = self.dependencies.state_store.get_latest_failed_run_for_batch(context.batch_id)
+        if failed_run is None:
+            return None, None
+        stage2_result = self._load_archived_stage2(failed_run)
+        if stage2_result is not None:
+            context.reused_run_id = failed_run.run_id
+            context.stage1_path = Path(failed_run.stage1_path) if failed_run.stage1_path else None
+            context.stage2_path = Path(failed_run.stage2_path) if failed_run.stage2_path else None
+            self._log_step(
+                context.run_id,
+                4,
+                8,
+                "Reusing archived Stage 1 and Stage 2 output from failed run; skipping both LLM calls.",
+                reused_run_id=failed_run.run_id,
+                stage2_path=failed_run.stage2_path,
+            )
+            return None, stage2_result
+        stage1_result = self._load_archived_stage1(failed_run)
+        if stage1_result is not None:
+            context.reused_run_id = failed_run.run_id
+            context.stage1_path = Path(failed_run.stage1_path) if failed_run.stage1_path else None
+            self._log_step(
+                context.run_id,
+                4,
+                8,
+                "Reusing archived Stage 1 output from failed run; skipping the Stage 1 call and user-side memory write.",
+                reused_run_id=failed_run.run_id,
+                stage1_path=failed_run.stage1_path,
+            )
+            return stage1_result, None
+        return None, None
+
+    def _load_archived_stage1(self, failed_run: StoredRun) -> Stage1Result | None:
+        # A failure classified as "stage1" after stage1.json was written means the
+        # user-side memory write did not complete, so Stage 1 must run again.
+        if not failed_run.stage1_path or failed_run.error_stage == "stage1":
+            return None
+        payload = self._load_archived_payload(Path(failed_run.stage1_path), failed_run.run_id, "stage1.json")
+        if payload is None:
+            return None
+        try:
+            return Stage1Result.from_dict(payload)
+        except ModelValidationError as exc:
+            LOGGER.warning("Archived stage1.json from failed run %s is not reusable: %s", failed_run.run_id, exc)
+            return None
+
+    def _load_archived_stage2(self, failed_run: StoredRun) -> Stage2Result | None:
+        if not failed_run.stage2_path:
+            return None
+        payload = self._load_archived_payload(Path(failed_run.stage2_path), failed_run.run_id, "stage2.json")
+        if payload is None:
+            return None
+        try:
+            stage2_result = Stage2Result.from_dict(payload)
+            self._validate_stage2(stage2_result)
+        except ModelValidationError as exc:
+            LOGGER.warning("Archived stage2.json from failed run %s is not reusable: %s", failed_run.run_id, exc)
+            return None
+        return stage2_result
+
+    def _load_archived_payload(self, path: Path, run_id: str, label: str) -> dict | None:
+        if not path.exists():
+            return None
+        try:
+            payload = load_json_file(path, default=None)
+        except (OSError, ValueError) as exc:
+            LOGGER.warning("Archived %s from failed run %s could not be read: %s", label, run_id, exc)
+            return None
+        if not isinstance(payload, dict):
+            LOGGER.warning("Archived %s from failed run %s is malformed; ignoring it.", label, run_id)
+            return None
+        return payload
 
     def _is_first_run_bootstrap(self) -> bool:
         return self.dependencies.state_store.get_last_consumed_imap_uid() == 0 and not self.dependencies.state_store.has_outbound_messages()

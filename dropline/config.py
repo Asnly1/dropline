@@ -30,6 +30,14 @@ PLACEHOLDER_VALUE_PATTERN = re.compile(r"^(?:REPLACE_ME(?:_[A-Z0-9_]+)?|YOUR_[A-
 HHMM_PATTERN = re.compile(r"^\d{2}:\d{2}$")
 SUPPORTED_LLM_LANGUAGES = ("简体中文", "English")
 SUPPORTED_SMTP_SECURITY = ("ssl", "starttls", "none")
+IMAGE_ON_FAILURE_ABORT = "abort"
+IMAGE_ON_FAILURE_TEXT_ONLY = "text_only"
+SUPPORTED_IMAGE_ON_FAILURE = (IMAGE_ON_FAILURE_ABORT, IMAGE_ON_FAILURE_TEXT_ONLY)
+DEFAULT_IMAGE_ON_FAILURE = IMAGE_ON_FAILURE_ABORT
+DEFAULT_RETRY_AFTER_MINUTES = 120
+DEFAULT_MAX_RUNS_PER_DAY = 3
+DEFAULT_MAX_BATCH_ATTEMPTS = 3
+DEFAULT_ALERT_AFTER_FAILURES = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +53,9 @@ class ScheduleConfig:
     window_end: str
     daily_target_pick_time: str
     check_every_minutes: int
+    retry_after_minutes: int = DEFAULT_RETRY_AFTER_MINUTES
+    max_runs_per_day: int = DEFAULT_MAX_RUNS_PER_DAY
+    max_batch_attempts: int = DEFAULT_MAX_BATCH_ATTEMPTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,10 +85,18 @@ class CharacterMailboxConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class MailAlertsConfig:
+    enabled: bool
+    recipient: str
+    after_failures: int
+
+
+@dataclass(frozen=True, slots=True)
 class MailConfig:
     allowlist_senders: tuple[str, ...]
     primary_user_recipient: str
     character_mailbox: CharacterMailboxConfig
+    alerts: MailAlertsConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +113,7 @@ class LLMStageConfig:
 class LLMImageConfig:
     enabled: bool
     provider: str
+    on_failure: str = DEFAULT_IMAGE_ON_FAILURE
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +276,26 @@ def _optional_string(payload: dict[str, Any], key: str, path: str) -> str | None
     return value.strip()
 
 
+def _optional_bool(payload: dict[str, Any], key: str, path: str, *, default: bool) -> bool:
+    if payload.get(key) is None:
+        return default
+    return _require_bool(payload, key, path)
+
+
+def _optional_positive_int(payload: dict[str, Any], key: str, path: str, *, default: int) -> int:
+    if payload.get(key) is None:
+        return default
+    return _require_positive_int(payload, key, path)
+
+
+def _require_image_on_failure(payload: dict[str, Any], key: str, path: str) -> str:
+    value = (_optional_string(payload, key, path) or DEFAULT_IMAGE_ON_FAILURE).lower()
+    if value not in SUPPORTED_IMAGE_ON_FAILURE:
+        supported = ", ".join(repr(item) for item in SUPPORTED_IMAGE_ON_FAILURE)
+        raise ValueError(f"Invalid string config for '{path}': expected one of {supported}")
+    return value
+
+
 def _require_supported_llm_language(payload: dict[str, Any], key: str, path: str) -> str:
     value = _require_string(payload, key, path)
     if value not in SUPPORTED_LLM_LANGUAGES:
@@ -310,6 +350,24 @@ def _load_schedule_config(payload: dict[str, Any]) -> ScheduleConfig:
             "check_every_minutes",
             "schedule.check_every_minutes",
         ),
+        retry_after_minutes=_optional_positive_int(
+            payload,
+            "retry_after_minutes",
+            "schedule.retry_after_minutes",
+            default=DEFAULT_RETRY_AFTER_MINUTES,
+        ),
+        max_runs_per_day=_optional_positive_int(
+            payload,
+            "max_runs_per_day",
+            "schedule.max_runs_per_day",
+            default=DEFAULT_MAX_RUNS_PER_DAY,
+        ),
+        max_batch_attempts=_optional_positive_int(
+            payload,
+            "max_batch_attempts",
+            "schedule.max_batch_attempts",
+            default=DEFAULT_MAX_BATCH_ATTEMPTS,
+        ),
     )
 
 
@@ -325,7 +383,11 @@ def _load_image_config(payload: dict[str, Any], path: str) -> LLMImageConfig:
         provider = _require_string(payload, "provider", f"{path}.provider").lower()
     else:
         provider = (_optional_string(payload, "provider", f"{path}.provider") or "").lower()
-    return LLMImageConfig(enabled=enabled, provider=provider)
+    return LLMImageConfig(
+        enabled=enabled,
+        provider=provider,
+        on_failure=_require_image_on_failure(payload, "on_failure", f"{path}.on_failure"),
+    )
 
 
 def _load_provider_settings(
@@ -368,6 +430,24 @@ def _load_smtp_endpoint(payload: dict[str, Any], path: str) -> SMTPEndpointConfi
         security=_require_smtp_security(payload, "security", f"{path}.security"),
         username=_require_string(payload, "username", f"{path}.username"),
         password=_require_string(payload, "password", f"{path}.password"),
+    )
+
+
+def _load_mail_alerts_config(payload: dict[str, Any], *, default_recipient: str) -> MailAlertsConfig:
+    alerts_payload: dict[str, Any]
+    if payload.get("alerts") is None:
+        alerts_payload = {}
+    else:
+        alerts_payload = _require_mapping(payload, "alerts", "mail.alerts")
+    return MailAlertsConfig(
+        enabled=_optional_bool(alerts_payload, "enabled", "mail.alerts.enabled", default=True),
+        recipient=_optional_string(alerts_payload, "recipient", "mail.alerts.recipient") or default_recipient,
+        after_failures=_optional_positive_int(
+            alerts_payload,
+            "after_failures",
+            "mail.alerts.after_failures",
+            default=DEFAULT_ALERT_AFTER_FAILURES,
+        ),
     )
 
 
@@ -510,6 +590,8 @@ def validate_live_settings(settings: Settings) -> None:
     require("mail.character_mailbox.smtp.host", settings.mail.character_mailbox.smtp.host)
     require("mail.character_mailbox.smtp.username", settings.mail.character_mailbox.smtp.username)
     require("mail.character_mailbox.smtp.password", settings.mail.character_mailbox.smtp.password)
+    if settings.mail.alerts.enabled:
+        require("mail.alerts.recipient", settings.mail.alerts.recipient)
     require_stage("llm.stage1", settings.llm.stage1.provider, capability=TEXT_CAPABILITY)
     require_stage("llm.stage2", settings.llm.stage2.provider, capability=TEXT_CAPABILITY)
     if settings.llm.image.enabled:
@@ -554,6 +636,11 @@ def load_settings(config_path: str | Path = "config.yaml", *, require_active_pro
     _validate_stage_provider_names(llm)
     providers = _load_provider_settings_for_llm(payload, llm)
     documents = _build_document_paths(repo_root, active_profile)
+    primary_user_recipient = _require_string(
+        mail_payload,
+        "primary_user_recipient",
+        "mail.primary_user_recipient",
+    )
     return Settings(
         repo_root=repo_root,
         project=ProjectConfig(
@@ -565,11 +652,7 @@ def load_settings(config_path: str | Path = "config.yaml", *, require_active_pro
             allowlist_senders=tuple(
                 item.lower() for item in _require_string_list(mail_payload, "allowlist_senders", "mail.allowlist_senders")
             ),
-            primary_user_recipient=_require_string(
-                mail_payload,
-                "primary_user_recipient",
-                "mail.primary_user_recipient",
-            ),
+            primary_user_recipient=primary_user_recipient,
             character_mailbox=CharacterMailboxConfig(
                 address=_require_string(character_mailbox_payload, "address", "mail.character_mailbox.address"),
                 imap=_load_mail_endpoint(
@@ -582,6 +665,7 @@ def load_settings(config_path: str | Path = "config.yaml", *, require_active_pro
                     "mail.character_mailbox.smtp",
                 ),
             ),
+            alerts=_load_mail_alerts_config(mail_payload, default_recipient=primary_user_recipient),
         ),
         storage=StorageConfig(
             sqlite_path=_resolve_path(repo_root, _require_string(storage_payload, "sqlite_path", "storage.sqlite_path")),

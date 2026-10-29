@@ -7,13 +7,15 @@ import tempfile
 import unittest
 from collections.abc import Iterable
 from contextlib import redirect_stdout
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from dropline import cli
-from dropline.storage import StateStore
+from dropline.models import NormalizedInboundMessage
+from dropline.scheduler import SCHEDULED_FOR_DATE_KEY, TARGET_SEND_TIME_KEY
+from dropline.storage import LAST_ALERT_AT_KEY, StateStore
 
 from tests.helpers import create_test_repo, load_test_settings
 
@@ -510,6 +512,256 @@ class InteractiveCLITests(unittest.TestCase):
             updated_run = store.list_recent_runs(limit=1)[0]
             self.assertEqual(updated_run.status, "failed")
             self.assertEqual(updated_run.error_stage, "stale_running")
+
+    def _store_inbound(self, store: StateStore, root: Path, uid: int, subject: str) -> None:
+        store.upsert_inbound_message(
+            NormalizedInboundMessage(
+                message_id=f"<uid-{uid}@example.com>",
+                imap_uid=uid,
+                from_email="user@example.com",
+                subject=subject,
+                received_at="2026-04-02T12:00:00-07:00",
+                body_text=subject,
+                body_html_present=False,
+                attachments=[],
+            ),
+            raw_path=root / f"uid-{uid}.eml",
+        )
+
+    def test_help_lists_status_and_requeue_inbound(self) -> None:
+        output = io.StringIO()
+        exit_code = cli.main(["help"], output=output)
+
+        self.assertEqual(exit_code, 0)
+        rendered = output.getvalue()
+        self.assertIn("  status ", rendered)
+        self.assertIn("  requeue-inbound ", rendered)
+
+    def test_status_command_prints_session_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            store.start_run("run-ok", "2026-04-01T13:00:00-07:00")
+            store.update_run_context("run-ok", "initiative", "initiative-2026-04-01")
+            store.finish_run("run-ok", "success", "2026-04-01T13:01:00-07:00")
+            store.start_run("run-bad", "2026-04-02T13:00:00-07:00")
+            store.update_run_context("run-bad", "reply", "batch-bad")
+            store.finish_run(
+                "run-bad",
+                "failed",
+                "2026-04-02T13:01:00-07:00",
+                error_stage="stage2",
+                error_message="boom",
+            )
+            store.record_run_failure(failed_at="2026-04-02T13:01:00-07:00")
+            self._store_inbound(store, root, 3, "third")
+            self._store_inbound(store, root, 4, "fourth")
+            store.record_inbound_attempt_failure(
+                [3],
+                error_stage="stage2",
+                message="boom",
+                attempted_at="2026-04-02T13:01:00-07:00",
+                max_attempts=1,
+            )
+            store.record_pending_outbound_message(
+                message_id="<pending@example.com>",
+                sent_at="2026-04-02T13:00:30-07:00",
+                to_email="user@example.com",
+                subject="pending",
+                raw_path=root / "pending.eml",
+                image_path=None,
+                run_id="run-bad",
+                batch_id="batch-bad",
+            )
+            store.set_last_seen_imap_uid(9)
+            store.set_last_consumed_imap_uid(4)
+            store.set_kv("imap_uidvalidity", "777")
+            store.set_kv(SCHEDULED_FOR_DATE_KEY, "2026-04-02")
+            store.set_kv(TARGET_SEND_TIME_KEY, "2026-04-02T21:15:00-07:00")
+            store.increment_runs_today(date(2026, 4, 2))
+            store.set_kv(LAST_ALERT_AT_KEY, "2026-04-02T13:02:00-07:00")
+            fixed_now = datetime(2026, 4, 2, 14, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+            stdout = io.StringIO()
+            with patch("dropline.recovery.now_in_timezone", return_value=fixed_now), redirect_stdout(stdout):
+                exit_code = cli.main(["status", "--config", str(root / "config.yaml")], output=io.StringIO())
+
+            self.assertEqual(exit_code, 0)
+            rendered = stdout.getvalue()
+            self.assertIn("Session: keqing / childhood-friends", rendered)
+            self.assertIn("Now: 2026-04-02T14:00:00-07:00", rendered)
+            self.assertIn(
+                "Last successful run: run_id=run-ok mode=initiative batch_id=initiative-2026-04-01 "
+                "finished_at=2026-04-01T13:01:00-07:00",
+                rendered,
+            )
+            self.assertIn(
+                "Last failed run: run_id=run-bad error_stage=stage2 finished_at=2026-04-02T13:01:00-07:00 error=boom",
+                rendered,
+            )
+            self.assertIn("Consecutive failures: 1 last_failed_at=2026-04-02T13:01:00-07:00", rendered)
+            self.assertIn("Inbound: unconsumed=1 quarantined=1", rendered)
+            self.assertIn(
+                "  - quarantined uid=3 attempts=1 quarantined_at=2026-04-02T13:01:00-07:00 last_error=stage2: boom",
+                rendered,
+            )
+            self.assertIn("Pending outbound: 1", rendered)
+            self.assertIn("IMAP: last_seen_uid=9 last_consumed_uid=4 uidvalidity=777", rendered)
+            self.assertIn(
+                "Schedule: scheduled_for_date=2026-04-02 target_send_time=2026-04-02T21:15:00-07:00 sent_time=- runs_today=1",
+                rendered,
+            )
+            self.assertIn("Last alert: 2026-04-02T13:02:00-07:00", rendered)
+
+    def test_status_command_without_history_prints_none_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            fixed_now = datetime(2026, 4, 2, 14, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+            stdout = io.StringIO()
+            with patch("dropline.recovery.now_in_timezone", return_value=fixed_now), redirect_stdout(stdout):
+                exit_code = cli.main(["status", "--config", str(root / "config.yaml")], output=io.StringIO())
+
+            self.assertEqual(exit_code, 0)
+            rendered = stdout.getvalue()
+            self.assertIn("Last successful run: none", rendered)
+            self.assertIn("Last failed run: none", rendered)
+            self.assertIn("Consecutive failures: 0 last_failed_at=-", rendered)
+            self.assertIn("Inbound: unconsumed=0 quarantined=0", rendered)
+            self.assertIn("Pending outbound: 0", rendered)
+            self.assertIn("IMAP: last_seen_uid=0 last_consumed_uid=0\n", rendered)
+            self.assertNotIn("uidvalidity", rendered)
+            self.assertIn("Schedule: scheduled_for_date=- target_send_time=- sent_time=- runs_today=0", rendered)
+            self.assertIn("Last alert: none", rendered)
+
+    def test_requeue_inbound_command_clears_quarantine(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            self._store_inbound(store, root, 3, "third")
+            store.record_inbound_attempt_failure(
+                [3],
+                error_stage="stage2",
+                message="boom",
+                attempted_at="2026-04-02T13:01:00-07:00",
+                max_attempts=1,
+            )
+            self.assertEqual(store.list_unconsumed_inbound(), [])
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(
+                    ["requeue-inbound", "--config", str(root / "config.yaml"), "--uid", "3"],
+                    output=io.StringIO(),
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("Requeued inbound message: uid=3", stdout.getvalue())
+            self.assertIn("Session: keqing / childhood-friends", stdout.getvalue())
+            messages = store.list_unconsumed_inbound()
+            self.assertEqual([item.imap_uid for item in messages], [3])
+            self.assertEqual(messages[0].attempt_count, 0)
+            self.assertIsNone(messages[0].last_error)
+            self.assertIsNone(messages[0].quarantined_at)
+            self.assertEqual(store.count_quarantined_inbound(), 0)
+
+            missing_stdout = io.StringIO()
+            with redirect_stdout(missing_stdout):
+                missing_exit_code = cli.main(
+                    ["requeue-inbound", "--config", str(root / "config.yaml"), "--uid", "99"],
+                    output=io.StringIO(),
+                )
+
+            self.assertEqual(missing_exit_code, 1)
+            self.assertIn("Inbound message not found: uid=99", missing_stdout.getvalue())
+
+    def test_requeue_inbound_rejects_invalid_or_missing_uid(self) -> None:
+        for argv in (["requeue-inbound", "--uid", "0"], ["requeue-inbound", "--uid", "abc"]):
+            with self.subTest(argv=argv):
+                output = io.StringIO()
+                with patch("dropline.cli.recovery.requeue_inbound_command", return_value=0) as handler:
+                    exit_code = cli.main(argv, output=output)
+
+                self.assertEqual(exit_code, 1)
+                handler.assert_not_called()
+                self.assertIn("--uid must be a positive integer", output.getvalue())
+
+        output = io.StringIO()
+        with patch("dropline.cli.recovery.requeue_inbound_command", return_value=0) as handler:
+            exit_code = cli.main(["requeue-inbound"], input_fn=_input_sequence([]), output=output)
+
+        self.assertEqual(exit_code, 1)
+        handler.assert_not_called()
+        self.assertIn("missing required arguments: --uid", output.getvalue())
+
+    def test_requeue_inbound_prompts_for_uid_in_interactive_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            output = io.StringIO()
+            with patch("dropline.cli.recovery.requeue_inbound_command", return_value=0) as handler:
+                exit_code = cli.main(
+                    [],
+                    input_fn=_input_sequence(
+                        [
+                            f"requeue-inbound --config {shlex.quote(str(root / 'config.yaml'))}",
+                            "12",
+                            "exit",
+                        ]
+                    ),
+                    output=output,
+                )
+
+            self.assertEqual(exit_code, 0)
+            handler.assert_called_once_with(str(root / "config.yaml"), imap_uid=12)
+
+    def test_show_inbox_marks_quarantined_messages_and_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            self._store_inbound(store, root, 3, "third")
+            self._store_inbound(store, root, 4, "fourth")
+            self._store_inbound(store, root, 5, "fifth")
+            store.record_inbound_attempt_failure(
+                [3],
+                error_stage="stage2",
+                message="boom",
+                attempted_at="2026-04-02T13:01:00-07:00",
+                max_attempts=1,
+            )
+            store.record_inbound_attempt_failure(
+                [4],
+                error_stage="image",
+                message="no image",
+                attempted_at="2026-04-02T13:05:00-07:00",
+                max_attempts=3,
+            )
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(["show-inbox", "--config", str(root / "config.yaml")], output=io.StringIO())
+
+            self.assertEqual(exit_code, 0)
+            rendered = stdout.getvalue()
+            self.assertIn("Unconsumed inbound: 2", rendered)
+            self.assertIn("Quarantined inbound: 1", rendered)
+            self.assertIn(
+                "subject=third attempts=1 QUARANTINED quarantined_at=2026-04-02T13:01:00-07:00 last_error=stage2: boom",
+                rendered,
+            )
+            self.assertIn("subject=fourth attempts=1 last_error=image: no image", rendered)
+            self.assertNotIn("subject=fourth attempts=1 QUARANTINED", rendered)
+            self.assertIn("subject=fifth\n", rendered)
 
 
 if __name__ == "__main__":

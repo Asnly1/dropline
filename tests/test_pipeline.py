@@ -14,7 +14,7 @@ from dropline.documents import load_entries, load_json_file
 from dropline.memory import MemoryManager
 from dropline.models import GeneratedImage, ModelValidationError, NormalizedInboundMessage, RawInboundMessage, Stage1Result, Stage2Result
 from dropline.pipeline import PipelineDependencies, PipelineService, RunContext
-from dropline.storage import StateStore
+from dropline.storage import LAST_ALERT_AT_KEY, RUNS_TODAY_KEY, StateStore
 
 from tests.helpers import create_test_repo, load_test_settings
 
@@ -121,6 +121,11 @@ class FailingCharacterMemoryManager(MemoryManager):
         raise RuntimeError("character memory write failed")
 
 
+class FailingUserMemoryManager(MemoryManager):
+    def write_user_side(self, **kwargs: object) -> None:
+        raise RuntimeError("user memory write failed")
+
+
 class FailingOutboundRecordStore(StateStore):
     def __init__(self, settings) -> None:
         super().__init__(settings)
@@ -177,6 +182,38 @@ def _set_config_language(root: Path, language: str) -> None:
     config_path = root / "config.yaml"
     config_text = config_path.read_text(encoding="utf-8")
     config_path.write_text(config_text.replace('language: "简体中文"', f'language: "{language}"'), encoding="utf-8")
+
+
+def _replace_config_text(root: Path, old: str, new: str) -> None:
+    config_path = root / "config.yaml"
+    config_text = config_path.read_text(encoding="utf-8")
+    if old not in config_text:
+        raise AssertionError(f"config snippet not found: {old!r}")
+    config_path.write_text(config_text.replace(old, new, 1), encoding="utf-8")
+
+
+def _set_image_on_failure(root: Path, value: str) -> None:
+    _replace_config_text(
+        root,
+        '    provider: "openai"\n\nopenai:',
+        f'    provider: "openai"\n    on_failure: "{value}"\n\nopenai:',
+    )
+
+
+def _set_max_batch_attempts(root: Path, value: int) -> None:
+    _replace_config_text(root, "  check_every_minutes: 10\n", f"  check_every_minutes: 10\n  max_batch_attempts: {value}\n")
+
+
+def _disable_alerts(root: Path) -> None:
+    _replace_config_text(
+        root,
+        '  primary_user_recipient: "user@example.com"\n',
+        '  primary_user_recipient: "user@example.com"\n  alerts:\n    enabled: false\n',
+    )
+
+
+def _attachment_maintypes(message: EmailMessage) -> list[str]:
+    return [part.get_content_maintype() for part in message.walk() if part.get_content_disposition() == "attachment"]
 
 
 class PipelineTests(unittest.TestCase):
@@ -1205,6 +1242,356 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(outcome.error_stage, "prepare")
             self.assertIn("initialize failed", outcome.message)
             self.assertEqual(pipeline.dependencies.ai_client.stage1_calls, 0)
+
+    def test_stage2_failure_records_attempt_and_failure_bookkeeping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, outbound_client = self._build_pipeline(root, stage2_should_fail=True)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                outcome = pipeline.run_once()
+
+            self.assertFalse(outcome.success)
+            self.assertEqual(outcome.error_stage, "stage2")
+            message = store.list_unconsumed_inbound()[0]
+            self.assertEqual(message.attempt_count, 1)
+            self.assertEqual(message.last_error, "stage2: stage2 network failure")
+            self.assertEqual(message.last_attempt_at, self.fixed_now.isoformat())
+            self.assertIsNone(message.quarantined_at)
+            self.assertEqual(store.get_consecutive_failures(), 1)
+            self.assertEqual(store.get_last_failed_at(), self.fixed_now.isoformat())
+            stored_run = store.get_run(outcome.run_id)
+            self.assertEqual(stored_run.status, "failed")
+            self.assertEqual(stored_run.error_message, "stage2 network failure")
+            self.assertEqual(outbound_client.sent_messages, [])
+            self.assertIsNone(store.get_kv(RUNS_TODAY_KEY))
+
+    def test_repeated_failures_quarantine_inbound_alert_and_fall_back_to_initiative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, outbound_client = self._build_pipeline(root, stage2_should_fail=True)
+            ai_client = pipeline.dependencies.ai_client
+
+            for day in range(3):
+                with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(days=day)):
+                    outcome = pipeline.run_once()
+                self.assertFalse(outcome.success)
+                self.assertEqual(outcome.mode, "reply")
+
+            self.assertEqual(store.list_unconsumed_inbound(), [])
+            quarantined = store.list_quarantined_inbound()
+            self.assertEqual([item.imap_uid for item in quarantined], [1])
+            self.assertEqual(quarantined[0].attempt_count, 3)
+            self.assertEqual(quarantined[0].quarantined_at, (self.fixed_now + timedelta(days=2)).isoformat())
+            self.assertEqual(store.get_consecutive_failures(), 3)
+            self.assertEqual(ai_client.stage1_calls, 1)
+            self.assertEqual(ai_client.stage2_calls, 3)
+            self.assertEqual(
+                [item["Subject"] for item in outbound_client.sent_messages],
+                ["[dropline] 已连续失败 2 次（阶段 stage2）", "[dropline] 来信已被隔离：uid 1（阶段 stage2）"],
+            )
+            for alert in outbound_client.sent_messages:
+                self.assertEqual(alert["From"], "dropline <character@example.com>")
+                self.assertEqual(alert["To"], "user@example.com")
+                self.assertIn("系统通知，不是角色来信", alert.get_content())
+            self.assertIn("已隔离的来信 UID：1", outbound_client.sent_messages[1].get_content())
+            self.assertEqual(store.get_kv(LAST_ALERT_AT_KEY), (self.fixed_now + timedelta(days=2)).isoformat())
+
+            ai_client.stage2_should_fail = False
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(days=3)):
+                recovered = pipeline.run_once()
+
+            self.assertTrue(recovered.success)
+            self.assertEqual(recovered.mode, "initiative")
+            self.assertEqual(recovered.batch_id, "initiative-2026-04-03")
+            self.assertEqual(len(outbound_client.sent_messages), 3)
+            self.assertNotIn("[dropline]", outbound_client.sent_messages[2]["Subject"])
+            self.assertEqual(store.get_consecutive_failures(), 0)
+            self.assertIsNone(store.get_last_failed_at())
+            self.assertEqual([item.imap_uid for item in store.list_quarantined_inbound()], [1])
+
+    def test_validation_failures_quarantine_after_two_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, outbound_client = self._build_pipeline(root, scene_card_location="")
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                first = pipeline.run_once()
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(hours=1)):
+                second = pipeline.run_once()
+
+            self.assertEqual(first.error_stage, "validation")
+            self.assertEqual(second.error_stage, "validation")
+            self.assertEqual(store.list_unconsumed_inbound(), [])
+            quarantined = store.list_quarantined_inbound()
+            self.assertEqual([item.imap_uid for item in quarantined], [1])
+            self.assertEqual(quarantined[0].attempt_count, 2)
+            self.assertTrue(quarantined[0].last_error.startswith("validation: "))
+            self.assertEqual(pipeline.dependencies.ai_client.stage1_calls, 1)
+            self.assertEqual(
+                [item["Subject"] for item in outbound_client.sent_messages],
+                ["[dropline] 来信已被隔离：uid 1（阶段 validation）"],
+            )
+
+    def test_max_batch_attempts_config_controls_quarantine_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            _set_max_batch_attempts(root, 1)
+            pipeline, store, _outbound_client = self._build_pipeline(root, stage2_should_fail=True)
+            self.assertEqual(pipeline.settings.schedule.max_batch_attempts, 1)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                outcome = pipeline.run_once()
+
+            self.assertFalse(outcome.success)
+            self.assertEqual([item.imap_uid for item in store.list_quarantined_inbound()], [1])
+            self.assertEqual(store.list_unconsumed_inbound(), [])
+
+    def test_smtp_failure_does_not_count_against_inbound_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, _outbound_client = self._build_pipeline(root)
+            pipeline.dependencies.outbound_client = FakeOutboundClient(should_fail=True)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                outcome = pipeline.run_once()
+
+            self.assertFalse(outcome.success)
+            self.assertEqual(outcome.error_stage, "smtp")
+            message = store.list_unconsumed_inbound()[0]
+            self.assertEqual(message.attempt_count, 0)
+            self.assertIsNone(message.last_error)
+            self.assertEqual(store.get_consecutive_failures(), 1)
+
+    def test_alerts_disabled_suppresses_failure_emails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            _disable_alerts(root)
+            pipeline, store, outbound_client = self._build_pipeline(root, stage2_should_fail=True)
+            self.assertFalse(pipeline.settings.mail.alerts.enabled)
+
+            for day in range(3):
+                with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(days=day)):
+                    pipeline.run_once()
+
+            self.assertEqual([item.imap_uid for item in store.list_quarantined_inbound()], [1])
+            self.assertEqual(outbound_client.sent_messages, [])
+            self.assertIsNone(store.get_kv(LAST_ALERT_AT_KEY))
+
+    def test_retry_reuses_archived_stage2_after_image_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            failing_pipeline, store, outbound_client = self._build_pipeline(root, image_should_fail=True)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                first_outcome = failing_pipeline.run_once()
+
+            self.assertFalse(first_outcome.success)
+            self.assertEqual(first_outcome.error_stage, "image")
+            failed_run = store.get_run(first_outcome.run_id)
+            self.assertTrue(failed_run.stage1_path.endswith("stage1.json"))
+            self.assertTrue(failed_run.stage2_path.endswith("stage2.json"))
+
+            retry_pipeline, _, _ = self._build_pipeline(root, stage1_should_fail=True, stage2_should_fail=True)
+            retry_pipeline.dependencies.state_store = store
+            retry_pipeline.dependencies.outbound_client = outbound_client
+            retry_ai_client = retry_pipeline.dependencies.ai_client
+
+            with patch(
+                "dropline.pipeline.now_in_timezone",
+                return_value=self.fixed_now + timedelta(minutes=5),
+            ), self.assertLogs("dropline.pipeline", level="INFO") as captured:
+                retry_outcome = retry_pipeline.run_once()
+
+            self.assertTrue(retry_outcome.success)
+            self.assertEqual(retry_outcome.batch_id, first_outcome.batch_id)
+            self.assertTrue(retry_outcome.image_generated)
+            self.assertEqual(retry_ai_client.stage1_calls, 0)
+            self.assertEqual(retry_ai_client.stage2_calls, 0)
+            self.assertEqual(retry_ai_client.image_calls, 1)
+            self.assertEqual(len(outbound_client.sent_messages), 1)
+            self.assertEqual(_attachment_maintypes(outbound_client.sent_messages[0]), ["image"])
+            retry_run = store.get_run(retry_outcome.run_id)
+            self.assertEqual(retry_run.stage1_path, failed_run.stage1_path)
+            self.assertEqual(retry_run.stage2_path, failed_run.stage2_path)
+            self.assertEqual(store.list_unconsumed_inbound(include_quarantined=True), [])
+            self.assertEqual(store.get_consecutive_failures(), 0)
+            user_episode_entries = load_json_file(
+                retry_pipeline.settings.documents.user_episode_dir / "2026-03-31.json",
+                default=[],
+            )
+            character_episode_entries = load_json_file(
+                retry_pipeline.settings.documents.character_episode_dir / "2026-03-31.json",
+                default=[],
+            )
+            self.assertEqual(len(user_episode_entries), 1)
+            self.assertEqual(len(character_episode_entries), 1)
+            output = "\n".join(captured.output)
+            self.assertIn("Reusing archived Stage 1 and Stage 2 output from failed run", output)
+            self.assertIn(f"reused_run_id={first_outcome.run_id}", output)
+
+    def test_retry_reuses_archived_stage1_and_reruns_stage2_without_duplicate_user_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            failing_pipeline, store, outbound_client = self._build_pipeline(root, stage2_should_fail=True)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                first_outcome = failing_pipeline.run_once()
+
+            self.assertEqual(first_outcome.error_stage, "stage2")
+            self.assertIsNone(store.get_run(first_outcome.run_id).stage2_path)
+
+            retry_pipeline, _, _ = self._build_pipeline(root, stage1_should_fail=True)
+            retry_pipeline.dependencies.state_store = store
+            retry_pipeline.dependencies.outbound_client = outbound_client
+            retry_ai_client = retry_pipeline.dependencies.ai_client
+
+            with patch(
+                "dropline.pipeline.now_in_timezone",
+                return_value=self.fixed_now + timedelta(minutes=5),
+            ), self.assertLogs("dropline.pipeline", level="INFO") as captured:
+                retry_outcome = retry_pipeline.run_once()
+
+            self.assertTrue(retry_outcome.success)
+            self.assertEqual(retry_ai_client.stage1_calls, 0)
+            self.assertEqual(retry_ai_client.stage2_calls, 1)
+            self.assertEqual(len(outbound_client.sent_messages), 1)
+            user_episode_entries = load_json_file(
+                retry_pipeline.settings.documents.user_episode_dir / "2026-03-31.json",
+                default=[],
+            )
+            self.assertEqual(len(user_episode_entries), 1)
+            retry_run = store.get_run(retry_outcome.run_id)
+            self.assertEqual(retry_run.stage1_path, store.get_run(first_outcome.run_id).stage1_path)
+            self.assertTrue(retry_run.stage2_path.endswith(f"{retry_outcome.run_id}/stage2.json"))
+            self.assertIn("Reusing archived Stage 1 output from failed run", "\n".join(captured.output))
+
+    def test_retry_does_not_reuse_stage1_when_user_memory_write_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            failing_pipeline, store, outbound_client = self._build_pipeline(root)
+            failing_pipeline.dependencies.memory_manager = FailingUserMemoryManager(failing_pipeline.settings)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                first_outcome = failing_pipeline.run_once()
+
+            self.assertFalse(first_outcome.success)
+            self.assertEqual(first_outcome.error_stage, "stage1")
+            self.assertTrue(store.get_run(first_outcome.run_id).stage1_path.endswith("stage1.json"))
+
+            retry_pipeline, _, _ = self._build_pipeline(root)
+            retry_pipeline.dependencies.state_store = store
+            retry_pipeline.dependencies.outbound_client = outbound_client
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(minutes=5)):
+                retry_outcome = retry_pipeline.run_once()
+
+            self.assertTrue(retry_outcome.success)
+            self.assertEqual(retry_pipeline.dependencies.ai_client.stage1_calls, 1)
+            self.assertEqual(retry_pipeline.dependencies.ai_client.stage2_calls, 1)
+            user_episode_entries = load_json_file(
+                retry_pipeline.settings.documents.user_episode_dir / "2026-03-31.json",
+                default=[],
+            )
+            self.assertEqual(len(user_episode_entries), 1)
+
+    def test_retry_ignores_unparsable_archived_stage2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            failing_pipeline, store, outbound_client = self._build_pipeline(root, image_should_fail=True)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                first_outcome = failing_pipeline.run_once()
+
+            Path(store.get_run(first_outcome.run_id).stage2_path).write_text("{not json", encoding="utf-8")
+            retry_pipeline, _, _ = self._build_pipeline(root, stage1_should_fail=True)
+            retry_pipeline.dependencies.state_store = store
+            retry_pipeline.dependencies.outbound_client = outbound_client
+
+            with patch(
+                "dropline.pipeline.now_in_timezone",
+                return_value=self.fixed_now + timedelta(minutes=5),
+            ), self.assertLogs("dropline.pipeline", level="WARNING") as captured:
+                retry_outcome = retry_pipeline.run_once()
+
+            self.assertTrue(retry_outcome.success)
+            self.assertEqual(retry_pipeline.dependencies.ai_client.stage1_calls, 0)
+            self.assertEqual(retry_pipeline.dependencies.ai_client.stage2_calls, 1)
+            self.assertIn("could not be read", "\n".join(captured.output))
+
+    def test_image_failure_with_text_only_fallback_sends_plain_email(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            _set_image_on_failure(root, "text_only")
+            pipeline, store, outbound_client = self._build_pipeline(root, image_should_fail=True)
+            self.assertEqual(pipeline.settings.llm.image.on_failure, "text_only")
+
+            with patch(
+                "dropline.pipeline.now_in_timezone",
+                return_value=self.fixed_now,
+            ), self.assertLogs("dropline.pipeline", level="INFO") as captured:
+                outcome = pipeline.run_once()
+
+            self.assertTrue(outcome.success)
+            self.assertFalse(outcome.image_generated)
+            self.assertEqual(len(outbound_client.sent_messages), 1)
+            self.assertEqual(_attachment_maintypes(outbound_client.sent_messages[0]), [])
+            self.assertEqual(store.list_unconsumed_inbound(), [])
+            self.assertEqual(store.list_recent_assets(), [])
+            self.assertEqual(store.get_consecutive_failures(), 0)
+            run_dir = pipeline.settings.documents.session_archive_dir / "2026-03-31" / outcome.run_id
+            self.assertFalse((run_dir / "scene.png").exists())
+            image_failure = load_json_file(run_dir / "image_failure.json", default={})
+            self.assertEqual(image_failure["on_failure"], "text_only")
+            self.assertEqual(image_failure["error"], "image failure")
+            output = "\n".join(captured.output)
+            self.assertIn("WARNING:dropline.pipeline:", output)
+            self.assertIn("continuing with a text-only email", output)
+            self.assertIn("Image generation degraded to text-only email. image_degraded=True", output)
+            self.assertIn("Pipeline run succeeded.", output)
+            self.assertIn("image_generated=False, image_degraded=True", output)
+
+    def test_image_failure_with_default_abort_still_fails_the_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            _set_image_on_failure(root, "abort")
+            pipeline, store, outbound_client = self._build_pipeline(root, image_should_fail=True)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                outcome = pipeline.run_once()
+
+            self.assertFalse(outcome.success)
+            self.assertEqual(outcome.error_stage, "image")
+            self.assertEqual(outbound_client.sent_messages, [])
+            self.assertEqual(store.list_unconsumed_inbound()[0].attempt_count, 1)
+
+    def test_successful_run_resets_consecutive_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, _outbound_client = self._build_pipeline(root)
+            store.record_run_failure(failed_at="2026-03-30T22:00:00-07:00")
+            store.record_run_failure(failed_at="2026-03-31T20:00:00-07:00")
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                outcome = pipeline.run_once()
+
+            self.assertTrue(outcome.success)
+            self.assertEqual(store.get_consecutive_failures(), 0)
+            self.assertIsNone(store.get_last_failed_at())
+            self.assertIsNone(store.get_kv(RUNS_TODAY_KEY))
 
 
 if __name__ == "__main__":

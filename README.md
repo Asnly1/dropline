@@ -47,7 +47,7 @@ flowchart TD
 Key design choices:
 
 - **LLM proposes, code decides** — Stage 1 only emits _candidate_ memories. The decision of what gets written, and to which file, is made by local code following [docs/memory_promotion_rules.en.md](docs/memory_promotion_rules.en.md).
-- **Image is a hard gate** — if image generation is enabled and fails, the run aborts and no email is sent. The user-side memory Stage 1 already wrote is kept; the character-side episode is not written.
+- **Image is a hard gate** — if image generation is enabled and fails, the run aborts and no email is sent (set `llm.image.on_failure=text_only` to fall back to a text-only email instead). The user-side memory Stage 1 already wrote is kept; the character-side episode is not written.
 - **Everything is archived** — inputs, Stage 1/2 outputs, and the generated image for each run are saved under `archive/YYYY-MM-DD/run-*/`.
 
 > 📬 **See a real run:** [**examples/conversation_keqing.en.md**](examples/conversation_keqing.en.md) walks through the opening letter Keqing sends on the first `run-once` and the first round of back-and-forth — with the real generated images, and a collapsible look at the Stage 1 memory candidates behind each reply. ([中文版](examples/conversation_keqing.cn.md))
@@ -348,6 +348,51 @@ schtasks /Delete /TN "dropline" /F
 
 ---
 
+## 🛠️ Failure handling & alerts
+
+When nobody is watching, dropline contains the common failures by itself and emails you when a human is needed.
+
+### How retries work
+
+- **Back off, then retry** — after a failed run the scheduler waits at least `schedule.retry_after_minutes` before trying again (tick log event `skipped_backoff`); scheduler-triggered runs are capped at `schedule.max_runs_per_day` per day (`skipped_daily_limit`), while a manual `run-once` is never limited; the "catch up yesterday's missed send" path is attempted only once (`catch_up_succeeded` / `catch_up_failed`). One success resets the consecutive-failure counter.
+- **Retries reuse archived output** — when the same batch (same `batch_id`) is retried and the failed run already archived `stage2.json`, Stage 1 and Stage 2 are skipped and the run goes straight to image generation and sending; with only `stage1.json`, just Stage 2 runs again and the user-side episode is not written twice. The log names the run whose artifacts were reused (`reused_run_id=...`).
+- **Inbound quarantine** — when a reply-mode run fails in the stage1 / stage2 / validation / image stage, every inbound message in that batch gets `attempt_count` +1 and its `last_error` recorded; after `schedule.max_batch_attempts` attempts (only 2 for Stage 2 validation failures) the message is **quarantined** (`quarantined_at`). Quarantined mail leaves the batch, so the next run falls back to an initiative letter instead of letting one bad message block the character. `show-inbox` marks them as `QUARANTINED` with their `last_error`; once the cause is fixed, `requeue-inbound --uid N` puts a message back in the queue, and `delete-inbound --uid N` can delete it outright.
+- **Image fallback** — `llm.image.on_failure` defaults to `abort` (image stays a hard gate); with `text_only`, an image generation error is logged as a WARNING, `image_failure.json` is written to the run archive, and the email goes out as plain text.
+- **Zombie runs get closed** — at the start of every `scheduler-tick`, runs still `running` with a `started_at` older than 6 hours are marked `failed` (`error_stage=stale_running`); `mark-stale-runs-failed` remains available for older records.
+
+### Inspect the state
+
+```bash
+python3 -m dropline status --config /absolute/path/config.yaml
+```
+
+Prints, for the active session: the most recent successful and failed run (run_id, stage, error message), the consecutive-failure count, unconsumed and quarantined inbound counts, pending outbound count, the IMAP cursors (`last_seen_uid` / `last_consumed_uid`, plus `uidvalidity` when the kv store has it), today's schedule (`scheduled_for_date` / `target_send_time` / `sent_time` / `runs_today`) and the time of the last alert.
+
+### Alert emails
+
+When the consecutive-failure count reaches `mail.alerts.after_failures`, or inbound mail gets quarantined, dropline sends a **plain-text system notification** from the character mailbox to `mail.alerts.recipient`: the sender display name is always `dropline` (never the character name), the subject starts with `[dropline] `, and the body states that it is a system notice rather than a letter, with the failed stage, the error message and the suggested next steps (`runtime_logs/`, `dropline status`, `requeue-inbound`). At most one alert is sent per day; a failure to send the alert itself is only logged and never affects the run.
+
+Related keys (all optional, defaults shown):
+
+```yaml
+schedule:
+  retry_after_minutes: 120 # minimum wait after a failed run before retrying
+  max_runs_per_day: 3 # max scheduler-triggered runs per day (run-once does not count)
+  max_batch_attempts: 3 # attempts per inbound batch before quarantine (2 for validation failures)
+
+mail:
+  alerts:
+    enabled: true # master switch for alert emails
+    recipient: "you@example.com" # defaults to primary_user_recipient
+    after_failures: 2 # alert after this many consecutive failures
+
+llm:
+  image:
+    on_failure: "abort" # abort | text_only
+```
+
+---
+
 ## 🔌 Supported LLM providers
 
 | Provider  | Default text model             | Default image model          |
@@ -396,10 +441,12 @@ python3 -m dropline
 | `delete-session`                            | Delete the target session's memory / episodes / archive; `--yes` skips confirmation                 |
 | `delete-inbound`                            | Delete a single inbound (`--uid`) or clear the inbox (`--all`); `--yes` skips confirmation          |
 | `delete-outbound`                           | Delete a single outbound (`--message-id`) or clear the outbox (`--all`); `--yes` skips confirmation |
+| `requeue-inbound`                           | Clear the quarantine flag and failed-attempt count of one inbound message (`--uid`)                 |
 | `init-state`                                | Initialize the active session's memory and `state.db`                                               |
 | `run-once`                                  | Run one full pipeline immediately                                                                   |
 | `scheduler-tick`                            | One scheduling check — runs the pipeline only if it's time                                          |
 | `mark-stale-runs-failed`                    | Mark stale `running` runs as `failed` for the active session                                        |
+| `status`                                    | Show recent runs, failure counters, inbox / outbox state and today's schedule for the session       |
 | `install-scheduler` / `uninstall-scheduler` | Install / uninstall the OS-level timer                                                              |
 | `reset-dev-state`                           | Wipe all sessions / logs / DB, then recreate an empty session for the active profile; `--yes` skips confirmation |
 

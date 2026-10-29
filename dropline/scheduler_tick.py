@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import timedelta
 
 from .config import load_settings
-from .models import RunOutcome
 from .pipeline import PipelineService
 from .power import read_power_context
 from .scheduler import (
@@ -13,8 +11,9 @@ from .scheduler import (
     SENT_TIME_KEY,
     TARGET_PICKED_AT_KEY,
     TARGET_SEND_TIME_KEY,
-    run_scheduler_tick,
+    execute_scheduler_tick,
 )
+from .storage import CONSECUTIVE_FAILURES_KEY, RUNS_TODAY_KEY
 from .utils import now_in_timezone
 
 
@@ -24,6 +23,8 @@ SCHEDULE_STATE_KEYS = (
     TARGET_PICKED_AT_KEY,
     TARGET_SEND_TIME_KEY,
     SENT_TIME_KEY,
+    RUNS_TODAY_KEY,
+    CONSECUTIVE_FAILURES_KEY,
 )
 
 
@@ -37,34 +38,10 @@ def _format_schedule_state(state: dict[str, str]) -> str:
         f"scheduled_for_date={state[SCHEDULED_FOR_DATE_KEY] or '-'} "
         f"target_picked_at={state[TARGET_PICKED_AT_KEY] or '-'} "
         f"target_send_time={state[TARGET_SEND_TIME_KEY] or '-'} "
-        f"sent_time={state[SENT_TIME_KEY] or '-'}"
+        f"sent_time={state[SENT_TIME_KEY] or '-'} "
+        f"runs_today={state[RUNS_TODAY_KEY] or '-'} "
+        f"consecutive_failures={state[CONSECUTIVE_FAILURES_KEY] or '0'}"
     )
-
-
-def _classify_tick_event(
-    *,
-    started_at,
-    before_state: dict[str, str],
-    after_state: dict[str, str],
-    outcome: RunOutcome | None,
-) -> str:
-    if outcome is not None:
-        yesterday = (started_at.date() - timedelta(days=1)).isoformat()
-        if (
-            before_state[SCHEDULED_FOR_DATE_KEY] == yesterday
-            and before_state[TARGET_SEND_TIME_KEY]
-            and not before_state[SENT_TIME_KEY]
-        ):
-            return "catch_up_yesterday"
-        return "run_succeeded" if outcome.success else "run_failed"
-
-    if (
-        not before_state[TARGET_SEND_TIME_KEY]
-        and after_state[SCHEDULED_FOR_DATE_KEY] == started_at.date().isoformat()
-        and after_state[TARGET_SEND_TIME_KEY]
-    ):
-        return "picked_today_target"
-    return "skipped"
 
 
 def scheduler_tick_command(config_path: str = "config.yaml") -> int:
@@ -112,16 +89,12 @@ def scheduler_tick_command(config_path: str = "config.yaml") -> int:
     before_state = _read_schedule_state(pipeline)
     LOGGER.info("tick_state tick_id=%s state_before=%s", tick_id, _format_schedule_state(before_state))
 
-    outcome = run_scheduler_tick(settings, pipeline)
+    result = execute_scheduler_tick(settings, pipeline)
     after_state = _read_schedule_state(pipeline)
     finished_at = now_in_timezone(settings.project.timezone)
     duration_ms = int((time.perf_counter() - started_perf) * 1000)
-    event = _classify_tick_event(
-        started_at=started_at,
-        before_state=before_state,
-        after_state=after_state,
-        outcome=outcome,
-    )
+    event = result.event
+    outcome = result.outcome
     if outcome is None:
         LOGGER.info(
             "tick_finished tick_id=%s finished_at=%s duration_ms=%s event=%s state_after=%s",

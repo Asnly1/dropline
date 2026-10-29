@@ -10,7 +10,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence, TextIO
 
-from . import init_state, install_scheduler, profiles, reset_dev_state, run_once, scheduler_tick, stale_runs, uninstall_scheduler
+from . import (
+    init_state,
+    install_scheduler,
+    profiles,
+    recovery,
+    reset_dev_state,
+    run_once,
+    scheduler_tick,
+    stale_runs,
+    uninstall_scheduler,
+)
 from .config import load_settings, resolve_repo_root_from_config
 from .scheduler_support import DEFAULT_SCHEDULER_TASK_NAME
 from .profile_manager import (
@@ -265,6 +275,14 @@ def _handle_mark_stale_runs_failed(args: argparse.Namespace) -> int:
     )
 
 
+def _handle_status(args: argparse.Namespace) -> int:
+    return recovery.status_command(args.config)
+
+
+def _handle_requeue_inbound(args: argparse.Namespace) -> int:
+    return recovery.requeue_inbound_command(args.config, imap_uid=int(args.uid))
+
+
 def _validate_delete_inbound_args(args: argparse.Namespace) -> None:
     has_uid = not _is_blank(getattr(args, "uid", None))
     has_all = bool(getattr(args, "all", False))
@@ -285,6 +303,16 @@ def _validate_delete_outbound_args(args: argparse.Namespace) -> None:
     has_all = bool(getattr(args, "all", False))
     if has_message_id == has_all:
         raise CLIArgumentError("exactly one of --message-id or --all is required")
+
+
+def _validate_requeue_inbound_args(args: argparse.Namespace) -> None:
+    try:
+        parsed = int(str(args.uid))
+    except ValueError as exc:
+        raise CLIArgumentError("--uid must be a positive integer") from exc
+    if parsed <= 0:
+        raise CLIArgumentError("--uid must be a positive integer")
+    args.uid = str(parsed)
 
 
 def _validate_mark_stale_runs_failed_args(args: argparse.Namespace) -> None:
@@ -555,6 +583,16 @@ COMMAND_SPECS = (
         validator=_validate_delete_outbound_args,
     ),
     CommandSpec(
+        name="requeue-inbound",
+        help="Clear quarantine and reset the failed-attempt count for one inbound message in the active session.",
+        handler=_handle_requeue_inbound,
+        options=(
+            OptionSpec(("--config",), "config", "Path to config.yaml", default="config.yaml", metavar="PATH"),
+            OptionSpec(("--uid",), "uid", "Inbound IMAP UID", prompt="Inbound IMAP UID", required=True, metavar="UID"),
+        ),
+        validator=_validate_requeue_inbound_args,
+    ),
+    CommandSpec(
         name="init-state",
         help="Initialize SQLite state and memory files for the active profile.",
         handler=_handle_init_state,
@@ -600,6 +638,14 @@ COMMAND_SPECS = (
             ),
         ),
         validator=_validate_mark_stale_runs_failed_args,
+    ),
+    CommandSpec(
+        name="status",
+        help="Show recent runs, failure counters, inbox/outbox state, and today's schedule for the active session.",
+        handler=_handle_status,
+        options=(
+            OptionSpec(("--config",), "config", "Path to config.yaml", default="config.yaml", metavar="PATH"),
+        ),
     ),
     CommandSpec(
         name="install-scheduler",
