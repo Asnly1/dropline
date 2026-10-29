@@ -397,6 +397,22 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.schedule.window_start, "23:00")
         self.assertEqual(settings.schedule.window_end, "02:00")
 
+    def test_load_settings_rejects_retry_after_minutes_of_a_day_or_more(self) -> None:
+        # A back-off of 24 hours or more would also block the catch-up of yesterday's missed send.
+        for value, accepted in ((1439, True), (1440, False), (2880, False)):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp_dir:
+                root = Path(tmp_dir).resolve()
+                create_test_repo(root)
+                config_path = root / "config.yaml"
+                payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                payload["schedule"]["retry_after_minutes"] = value
+                config_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+                if accepted:
+                    self.assertEqual(load_settings(config_path).schedule.retry_after_minutes, value)
+                else:
+                    with self.assertRaisesRegex(ValueError, r"schedule\.retry_after_minutes.*< 1440"):
+                        load_settings(config_path)
+
     def test_load_settings_rejects_non_positive_check_interval(self) -> None:
         for value in (0, -1):
             with self.subTest(value=value):

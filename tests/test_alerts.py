@@ -13,15 +13,21 @@ from zoneinfo import ZoneInfo
 import yaml
 
 from dropline.alerts import (
+    ALERT_KIND_FAILURES,
+    ALERT_KIND_QUARANTINE,
     ALERT_SUBJECT_PREFIX,
     alert_already_sent_today,
     build_alert_email,
+    last_alert_at_key,
     notify_run_failure,
     send_alert,
 )
 from dropline.config import Settings, load_settings
 from dropline.storage import LAST_ALERT_AT_KEY, StateStore
 from tests.helpers import create_test_repo, load_test_settings
+
+FAILURES_ALERT_KEY = last_alert_at_key(ALERT_KIND_FAILURES)
+QUARANTINE_ALERT_KEY = last_alert_at_key(ALERT_KIND_QUARANTINE)
 
 
 class _RecordingOutboundClient:
@@ -110,7 +116,8 @@ class AlertTests(unittest.TestCase):
 
             first = send_alert(settings, store, subject="first", body="b", now=self.fixed_now, outbound_client=client)
             self.assertTrue(first)
-            self.assertEqual(store.get_kv(LAST_ALERT_AT_KEY), self.fixed_now.isoformat())
+            self.assertEqual(store.get_kv(FAILURES_ALERT_KEY), self.fixed_now.isoformat())
+            self.assertIsNone(store.get_kv(QUARANTINE_ALERT_KEY))
 
             same_day = send_alert(
                 settings,
@@ -123,6 +130,20 @@ class AlertTests(unittest.TestCase):
             self.assertFalse(same_day)
             self.assertEqual(len(client.sent_messages), 1)
 
+            # The throttle is per kind: a quarantine notice still goes out on a day that saw a failure notice.
+            other_kind = send_alert(
+                settings,
+                store,
+                subject="quarantine",
+                body="b",
+                now=self.fixed_now + timedelta(hours=1),
+                outbound_client=client,
+                kind=ALERT_KIND_QUARANTINE,
+            )
+            self.assertTrue(other_kind)
+            self.assertEqual(store.get_kv(QUARANTINE_ALERT_KEY), (self.fixed_now + timedelta(hours=1)).isoformat())
+            self.assertEqual(store.get_kv(FAILURES_ALERT_KEY), self.fixed_now.isoformat())
+
             next_day = send_alert(
                 settings,
                 store,
@@ -132,7 +153,10 @@ class AlertTests(unittest.TestCase):
                 outbound_client=client,
             )
             self.assertTrue(next_day)
-            self.assertEqual([item["Subject"] for item in client.sent_messages], ["[dropline] first", "[dropline] third"])
+            self.assertEqual(
+                [item["Subject"] for item in client.sent_messages],
+                ["[dropline] first", "[dropline] quarantine", "[dropline] third"],
+            )
 
     def test_send_alert_respects_disabled_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -148,7 +172,7 @@ class AlertTests(unittest.TestCase):
 
             self.assertFalse(sent)
             self.assertEqual(client.sent_messages, [])
-            self.assertIsNone(store.get_kv(LAST_ALERT_AT_KEY))
+            self.assertIsNone(store.get_kv(FAILURES_ALERT_KEY))
 
     def test_send_alert_failure_is_logged_and_swallowed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -161,7 +185,7 @@ class AlertTests(unittest.TestCase):
                 sent = send_alert(settings, store, subject="x", body="b", now=self.fixed_now, outbound_client=client)
 
             self.assertFalse(sent)
-            self.assertIsNone(store.get_kv(LAST_ALERT_AT_KEY))
+            self.assertIsNone(store.get_kv(FAILURES_ALERT_KEY))
             self.assertIn("Failed to send alert email", "\n".join(captured.output))
 
     def test_send_alert_defaults_to_smtp_client_of_character_mailbox(self) -> None:
@@ -191,7 +215,7 @@ class AlertTests(unittest.TestCase):
 
             self.assertFalse(sent)
             self.assertEqual(client.sent_messages, [])
-            self.assertIsNone(store.get_kv(LAST_ALERT_AT_KEY))
+            self.assertIsNone(store.get_kv(FAILURES_ALERT_KEY))
 
     def test_notify_run_failure_at_threshold_sends_chinese_system_notice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -255,17 +279,45 @@ class AlertTests(unittest.TestCase):
             _settings, store = self._build(root)
 
             self.assertFalse(alert_already_sent_today(store, self.fixed_now))
-            store.set_kv(LAST_ALERT_AT_KEY, "")
+            store.set_kv(FAILURES_ALERT_KEY, "")
             self.assertFalse(alert_already_sent_today(store, self.fixed_now))
-            store.set_kv(LAST_ALERT_AT_KEY, "not-a-timestamp")
+            store.set_kv(FAILURES_ALERT_KEY, "not-a-timestamp")
             self.assertFalse(alert_already_sent_today(store, self.fixed_now))
-            store.set_kv(LAST_ALERT_AT_KEY, "2026-04-05T08:00:00")
+            store.set_kv(FAILURES_ALERT_KEY, "2026-04-05T08:00:00")
             self.assertTrue(alert_already_sent_today(store, self.fixed_now))
+            self.assertTrue(alert_already_sent_today(store, self.fixed_now, kind=ALERT_KIND_FAILURES))
+            self.assertFalse(alert_already_sent_today(store, self.fixed_now, kind=ALERT_KIND_QUARANTINE))
             # 2026-04-06T05:00:00+00:00 is still 2026-04-05 22:00 in Los Angeles.
-            store.set_kv(LAST_ALERT_AT_KEY, "2026-04-06T05:00:00+00:00")
+            store.set_kv(FAILURES_ALERT_KEY, "2026-04-06T05:00:00+00:00")
             self.assertTrue(alert_already_sent_today(store, self.fixed_now))
-            store.set_kv(LAST_ALERT_AT_KEY, "2026-04-04T23:59:00-07:00")
+            store.set_kv(FAILURES_ALERT_KEY, "2026-04-04T23:59:00-07:00")
             self.assertFalse(alert_already_sent_today(store, self.fixed_now))
+
+    def test_last_alert_at_key_is_per_kind_and_rejects_unknown_kinds(self) -> None:
+        self.assertEqual(FAILURES_ALERT_KEY, f"{LAST_ALERT_AT_KEY}:failures")
+        self.assertEqual(QUARANTINE_ALERT_KEY, f"{LAST_ALERT_AT_KEY}:quarantine")
+        with self.assertRaises(ValueError):
+            last_alert_at_key("other")
+
+    def test_quarantine_alert_is_not_throttled_by_same_day_failure_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings, store = self._build(root)
+            client = _RecordingOutboundClient()
+
+            self.assertTrue(self._notify(settings, store, client, consecutive_failures=2, quarantined_uids=[]))
+            self.assertTrue(self._notify(settings, store, client, consecutive_failures=3, quarantined_uids=[1]))
+            # One more of each kind on the same day is throttled.
+            self.assertFalse(self._notify(settings, store, client, consecutive_failures=4, quarantined_uids=[]))
+            self.assertFalse(self._notify(settings, store, client, consecutive_failures=5, quarantined_uids=[2]))
+
+            self.assertEqual(
+                [item["Subject"] for item in client.sent_messages],
+                ["[dropline] 已连续失败 2 次（阶段 stage2）", "[dropline] 来信已被隔离：uid 1（阶段 stage2）"],
+            )
+            self.assertEqual(store.get_kv(FAILURES_ALERT_KEY), self.fixed_now.isoformat())
+            self.assertEqual(store.get_kv(QUARANTINE_ALERT_KEY), self.fixed_now.isoformat())
 
 
 if __name__ == "__main__":

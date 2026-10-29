@@ -13,9 +13,10 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from dropline import cli
+from dropline.alerts import ALERT_KIND_FAILURES, ALERT_KIND_QUARANTINE, last_alert_at_key
 from dropline.models import NormalizedInboundMessage
 from dropline.scheduler import SCHEDULED_FOR_DATE_KEY, TARGET_SEND_TIME_KEY
-from dropline.storage import LAST_ALERT_AT_KEY, StateStore
+from dropline.storage import StateStore
 
 from tests.helpers import create_test_repo, load_test_settings
 
@@ -560,7 +561,7 @@ class InteractiveCLITests(unittest.TestCase):
             self._store_inbound(store, root, 3, "third")
             self._store_inbound(store, root, 4, "fourth")
             store.record_inbound_attempt_failure(
-                [3],
+                [(0, 3)],
                 error_stage="stage2",
                 message="boom",
                 attempted_at="2026-04-02T13:01:00-07:00",
@@ -582,7 +583,8 @@ class InteractiveCLITests(unittest.TestCase):
             store.set_kv(SCHEDULED_FOR_DATE_KEY, "2026-04-02")
             store.set_kv(TARGET_SEND_TIME_KEY, "2026-04-02T21:15:00-07:00")
             store.increment_runs_today(date(2026, 4, 2))
-            store.set_kv(LAST_ALERT_AT_KEY, "2026-04-02T13:02:00-07:00")
+            store.set_kv(last_alert_at_key(ALERT_KIND_FAILURES), "2026-04-02T13:02:00-07:00")
+            store.set_kv(last_alert_at_key(ALERT_KIND_QUARANTINE), "2026-04-02T13:03:00-07:00")
             fixed_now = datetime(2026, 4, 2, 14, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
 
             stdout = io.StringIO()
@@ -614,7 +616,10 @@ class InteractiveCLITests(unittest.TestCase):
                 "Schedule: scheduled_for_date=2026-04-02 target_send_time=2026-04-02T21:15:00-07:00 sent_time=- runs_today=1",
                 rendered,
             )
-            self.assertIn("Last alert: 2026-04-02T13:02:00-07:00", rendered)
+            self.assertIn(
+                "Last alert: failures=2026-04-02T13:02:00-07:00 quarantine=2026-04-02T13:03:00-07:00",
+                rendered,
+            )
 
     def test_status_command_without_history_prints_none_markers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -636,7 +641,7 @@ class InteractiveCLITests(unittest.TestCase):
             self.assertIn("IMAP: last_seen_uid=0 last_consumed_uid=0\n", rendered)
             self.assertNotIn("uidvalidity", rendered)
             self.assertIn("Schedule: scheduled_for_date=- target_send_time=- sent_time=- runs_today=0", rendered)
-            self.assertIn("Last alert: none", rendered)
+            self.assertIn("Last alert: failures=none quarantine=none", rendered)
 
     def test_requeue_inbound_command_clears_quarantine(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -647,7 +652,7 @@ class InteractiveCLITests(unittest.TestCase):
             store.initialize()
             self._store_inbound(store, root, 3, "third")
             store.record_inbound_attempt_failure(
-                [3],
+                [(0, 3)],
                 error_stage="stage2",
                 message="boom",
                 attempted_at="2026-04-02T13:01:00-07:00",
@@ -663,7 +668,7 @@ class InteractiveCLITests(unittest.TestCase):
                 )
 
             self.assertEqual(exit_code, 0)
-            self.assertIn("Requeued inbound message: uid=3", stdout.getvalue())
+            self.assertIn("Requeued inbound message: uid=3 uidvalidity=0", stdout.getvalue())
             self.assertIn("Session: keqing / childhood-friends", stdout.getvalue())
             messages = store.list_unconsumed_inbound()
             self.assertEqual([item.imap_uid for item in messages], [3])
@@ -681,6 +686,34 @@ class InteractiveCLITests(unittest.TestCase):
 
             self.assertEqual(missing_exit_code, 1)
             self.assertIn("Inbound message not found: uid=99", missing_stdout.getvalue())
+
+            # A UID that exists but is not quarantined is reported for what it is, not as "not found".
+            self._store_inbound(store, root, 4, "fourth")
+            self._store_inbound(store, root, 5, "fifth")
+            store.mark_inbound_consumed([(0, 4)], batch_id="batch-answered")
+            store.record_inbound_attempt_failure(
+                [(0, 5)],
+                error_stage="stage2",
+                message="boom",
+                attempted_at="2026-04-02T13:02:00-07:00",
+                max_attempts=3,
+            )
+            expected_notes = {
+                4: "uid=4 uidvalidity=0 was already answered (batch batch-answered); nothing to requeue.",
+                5: "uid=5 uidvalidity=0 is still waiting in the queue (attempts=1); nothing to requeue.",
+            }
+            for uid, note in expected_notes.items():
+                with self.subTest(uid=uid):
+                    not_quarantined_stdout = io.StringIO()
+                    with redirect_stdout(not_quarantined_stdout):
+                        not_quarantined_exit_code = cli.main(
+                            ["requeue-inbound", "--config", str(root / "config.yaml"), "--uid", str(uid)],
+                            output=io.StringIO(),
+                        )
+                    self.assertEqual(not_quarantined_exit_code, 1)
+                    self.assertIn(f"Inbound message is not quarantined: {note}", not_quarantined_stdout.getvalue())
+            self.assertEqual(store.get_inbound_message(4).consumed_batch_id, "batch-answered")
+            self.assertEqual(store.get_inbound_message(5).attempt_count, 1)
 
     def test_requeue_inbound_rejects_invalid_or_missing_uid(self) -> None:
         for argv in (["requeue-inbound", "--uid", "0"], ["requeue-inbound", "--uid", "abc"]):
@@ -733,14 +766,14 @@ class InteractiveCLITests(unittest.TestCase):
             self._store_inbound(store, root, 4, "fourth")
             self._store_inbound(store, root, 5, "fifth")
             store.record_inbound_attempt_failure(
-                [3],
+                [(0, 3)],
                 error_stage="stage2",
                 message="boom",
                 attempted_at="2026-04-02T13:01:00-07:00",
                 max_attempts=1,
             )
             store.record_inbound_attempt_failure(
-                [4],
+                [(0, 4)],
                 error_stage="image",
                 message="no image",
                 attempted_at="2026-04-02T13:05:00-07:00",
@@ -755,6 +788,10 @@ class InteractiveCLITests(unittest.TestCase):
             rendered = stdout.getvalue()
             self.assertIn("Unconsumed inbound: 2", rendered)
             self.assertIn("Quarantined inbound: 1", rendered)
+            self.assertIn(
+                "  - uid=3 uidvalidity=0 received_at=2026-04-02T12:00:00-07:00 from=user@example.com subject=third",
+                rendered,
+            )
             self.assertIn(
                 "subject=third attempts=1 QUARANTINED quarantined_at=2026-04-02T13:01:00-07:00 last_error=stage2: boom",
                 rendered,

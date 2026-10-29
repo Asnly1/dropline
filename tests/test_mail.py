@@ -241,6 +241,15 @@ def _message_with_inline_and_regular_attachments() -> bytes:
     return message.as_bytes()
 
 
+def _plain_text_email(body: str, *, message_id: str | None = "<plain@example.com>") -> bytes:
+    """A minimal text/plain letter; ``message_id=None`` leaves the Message-ID header out entirely."""
+    headers = ["From: User <user@example.com>", "To: keqing@example.com", "Subject: plain"]
+    if message_id is not None:
+        headers.append(f"Message-ID: {message_id}")
+    headers.extend(['Content-Type: text/plain; charset="utf-8"', "Content-Transfer-Encoding: 8bit"])
+    return ("\n".join(headers) + "\n\n" + body + "\n").encode()
+
+
 class MailQuoteStrippingTests(unittest.TestCase):
     def test_qq_mail_reply_drops_original_message_block_in_plain_and_html_paths(self) -> None:
         normalized = normalize_inbound_message(RawInboundMessage(imap_uid=11, raw_bytes=QQ_MAIL_REPLY))
@@ -311,6 +320,70 @@ Content-Transfer-Encoding: 8bit
 
         self.assertEqual(normalized.body_text, "在那本书的最后一页，作者写道：\n人要先学会休息。\n我觉得这句话说得很对。")
 
+    def test_user_sentences_resembling_chinese_quote_headers_are_kept(self) -> None:
+        samples = (
+            "在 2026-03-31 写道：\n要多喝水。\n现在看觉得很好笑。",
+            "在3月的日记里我写道：\n要多运动。\n后来没做到。",
+            "我于2024年写道：\n今年要多运动。\n后来没做到。",
+            "你于3月31日写道：\n「先拆成最小的一步去做」\n我试了，确实有用。",
+        )
+        for index, body in enumerate(samples):
+            with self.subTest(body=body):
+                normalized = normalize_inbound_message(
+                    RawInboundMessage(
+                        imap_uid=40 + index,
+                        raw_bytes=_plain_text_email(body, message_id=f"<prose-{index}@example.com>"),
+                    )
+                )
+
+                self.assertEqual(normalized.body_text, body)
+
+    def test_chinese_quote_headers_with_a_time_or_address_still_end_the_body(self) -> None:
+        headers = (
+            "在 2026/3/31 21:42, 刻晴 写道:",  # Thunderbird
+            "在 2026年3月31日，刻晴 <keqing@example.com> 写道：",  # address but no clock time
+            "刻晴 <keqing@gmail.com> 于2026年3月31日周二 21:42写道：",  # Gmail
+        )
+        for index, header in enumerate(headers):
+            with self.subTest(header=header):
+                normalized = normalize_inbound_message(
+                    RawInboundMessage(
+                        imap_uid=50 + index,
+                        raw_bytes=_plain_text_email(f"好的。\n{header}\n旧信内容。", message_id=f"<header-{index}@example.com>"),
+                    )
+                )
+
+                self.assertEqual(normalized.body_text, "好的。")
+
+    def test_underscore_divider_in_user_prose_is_dropped_without_ending_the_body(self) -> None:
+        body = "第一部分：白天的事。\n____________________\n第二部分：晚上的事。\n\n就这样吧。"
+
+        normalized = normalize_inbound_message(
+            RawInboundMessage(imap_uid=60, raw_bytes=_plain_text_email(body, message_id="<divider@example.com>"))
+        )
+
+        self.assertEqual(normalized.body_text, "第一部分：白天的事。\n第二部分：晚上的事。\n\n就这样吧。")
+
+    def test_underscore_separator_followed_by_a_quote_header_ends_the_body(self) -> None:
+        headers = (
+            "寄件者: 刻晴 <keqing@example.com>",
+            "From: 刻晴 <keqing@example.com>",
+            "Von: 刻晴",
+            "De: 刻晴",
+            "发件人：刻晴",
+        )
+        for index, header in enumerate(headers):
+            with self.subTest(header=header):
+                body = f"知道了。\n\n________________________________\n\n{header}\n旧信内容。"
+                normalized = normalize_inbound_message(
+                    RawInboundMessage(
+                        imap_uid=70 + index,
+                        raw_bytes=_plain_text_email(body, message_id=f"<separator-{index}@example.com>"),
+                    )
+                )
+
+                self.assertEqual(normalized.body_text, "知道了。")
+
     def test_html_quote_containers_are_removed_as_whole_elements(self) -> None:
         html_body = (
             '<div class="content">正文第一段。</div>'
@@ -334,6 +407,32 @@ Content-Transfer-Encoding: 8bit
 
         self.assertEqual(text.strip(), "我的话。")
 
+    def test_html_comments_and_void_elements_do_not_affect_quote_container_tracking(self) -> None:
+        html_body = (
+            "<!--[if mso]><blockquote><![endif]-->"
+            "<p>我的话。</p>"
+            '<img class="quote-icon" src="cid:icon">'
+            '<div class="gmail_quote"><p>引用</p><br><img src="cid:photo"><hr></div>'
+            "<p>结尾。</p>"
+        )
+
+        text = mail_module._html_to_text(html_body)
+
+        self.assertIn("我的话。", text)
+        self.assertIn("结尾。", text)
+        self.assertNotIn("引用", text)
+
+    def test_greater_than_inside_quoted_attribute_values_does_not_end_the_tag(self) -> None:
+        html_body = (
+            '<a href="https://example.com/?next=a>b" title="x>y">链接</a>'
+            '<div class="gmail_quote" data-title="a>b"><p>引用</p></div>'
+            "<p>结尾。</p>"
+        )
+
+        text = mail_module._html_to_text(html_body)
+
+        self.assertEqual(text.strip(), "链接\n\n结尾。")
+
 
 class MailAttachmentMetadataTests(unittest.TestCase):
     def test_inline_images_and_regular_attachments_are_recorded_as_metadata_only(self) -> None:
@@ -356,7 +455,7 @@ class MailAttachmentMetadataTests(unittest.TestCase):
         self.assertEqual(payload["attachments"][0]["inline"], True)
         self.assertNotIn("raw_bytes", payload)
 
-    def test_inline_text_parts_are_not_counted_as_attachments(self) -> None:
+    def test_inline_parts_with_file_names_are_attachments_and_stay_out_of_the_body(self) -> None:
         raw_email = """From: User <user@example.com>
 To: keqing@example.com
 Subject: inline text
@@ -369,6 +468,12 @@ Content-Disposition: inline
 Content-Transfer-Encoding: 8bit
 
 正文在这里。
+--MIXED
+Content-Type: text/plain; charset="utf-8"
+Content-Disposition: inline; filename="notes.txt"
+Content-Transfer-Encoding: 8bit
+
+attached text
 --MIXED
 Content-Type: text/calendar; charset="utf-8"
 Content-Disposition: inline; filename="invite.ics"
@@ -386,10 +491,67 @@ JVBERi0xLjQ=
 
         normalized = normalize_inbound_message(RawInboundMessage(imap_uid=31, raw_bytes=raw_email))
 
+        # The unnamed inline text part is the letter; every named inline part is a file the user attached.
         self.assertEqual(normalized.body_text, "正文在这里。")
         self.assertEqual(
             normalized.attachments,
-            [AttachmentMeta(filename="report.pdf", content_type="application/pdf", size=len(b"%PDF-1.4"), inline=True)],
+            [
+                AttachmentMeta(filename="notes.txt", content_type="text/plain", size=len(b"attached text"), inline=True),
+                AttachmentMeta(
+                    filename="invite.ics",
+                    content_type="text/calendar",
+                    size=len(b"BEGIN:VCALENDAR\nEND:VCALENDAR"),
+                    inline=True,
+                ),
+                AttachmentMeta(filename="report.pdf", content_type="application/pdf", size=len(b"%PDF-1.4"), inline=True),
+            ],
+        )
+
+    def test_image_parts_are_attachments_whatever_their_disposition(self) -> None:
+        raw_email = """From: User <user@example.com>
+To: keqing@example.com
+Subject: bare image
+Message-ID: <bare-image@example.com>
+Content-Type: multipart/mixed; boundary="MIXED"
+
+--MIXED
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+正文在这里。
+--MIXED
+Content-Type: image/png; name="bare.png"
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgo=
+--MIXED--
+""".encode()
+
+        normalized = normalize_inbound_message(RawInboundMessage(imap_uid=32, raw_bytes=raw_email))
+
+        # No Content-Disposition and no Content-ID: still an attachment, just not an inline one.
+        self.assertEqual(normalized.body_text, "正文在这里。")
+        self.assertEqual(
+            normalized.attachments,
+            [AttachmentMeta(filename="bare.png", content_type="image/png", size=8, inline=False)],
+        )
+
+        image_only = b"""From: User <user@example.com>
+To: keqing@example.com
+Subject: only an image
+Message-ID: <image-only@example.com>
+Content-Type: image/jpeg
+Content-Transfer-Encoding: base64
+
+/9j/4AAQ
+"""
+
+        normalized = normalize_inbound_message(RawInboundMessage(imap_uid=33, raw_bytes=image_only))
+
+        self.assertEqual(normalized.body_text, "")
+        self.assertEqual(
+            normalized.attachments,
+            [AttachmentMeta(filename="", content_type="image/jpeg", size=6, inline=False)],
         )
 
     def test_attachment_meta_from_dict_tolerates_legacy_payloads(self) -> None:
@@ -422,6 +584,20 @@ class KnownParagraphStrippingTests(unittest.TestCase):
         )
         self.assertEqual(mail_module.paragraph_keys(""), set())
         self.assertEqual(mail_module.paragraph_keys("晚安。\n\n好梦。"), set())
+
+    def test_short_paragraphs_are_never_treated_as_quoted_prose(self) -> None:
+        letter = "这一段只有十九个字，用来验证长度下限。\n\n这一段正好有二十个字，用来验证长度下限。\n\n这周也辛苦了，早点休息。"
+
+        keys = mail_module.paragraph_keys(letter)
+
+        self.assertEqual(mail_module.KNOWN_PARAGRAPH_MIN_LENGTH, 20)
+        self.assertEqual(keys, {"这一段正好有二十个字，用来验证长度下限。"})
+        # A short sentence the user repeats on purpose (or by coincidence) stays in the reply.
+        reply = "收到。\n\n这周也辛苦了，早点休息。\n\n这一段只有十九个字，用来验证长度下限。\n\n这一段正好有二十个字，用来验证长度下限。"
+        self.assertEqual(
+            mail_module.strip_known_paragraphs(reply, keys),
+            "收到。\n\n这周也辛苦了，早点休息。\n\n这一段只有十九个字，用来验证长度下限。",
+        )
 
     def test_strip_known_paragraphs_removes_only_verbatim_character_paragraphs(self) -> None:
         keys = mail_module.paragraph_keys(self.CHARACTER_LETTER)
@@ -470,6 +646,23 @@ class MailNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized.subject, "今天有点累")
         self.assertEqual(normalized.body_text, "今天写了一天作业，有点累。")
         self.assertTrue(normalized.body_html_present)
+
+    def test_missing_message_id_is_synthesized_from_uidvalidity_and_uid(self) -> None:
+        raw_email = _plain_text_email("没有 Message-ID 的信。", message_id=None)
+
+        self.assertEqual(
+            normalize_inbound_message(RawInboundMessage(imap_uid=5, raw_bytes=raw_email)).message_id,
+            "<imap-0-5@dropline.invalid>",
+        )
+        self.assertEqual(
+            normalize_inbound_message(RawInboundMessage(imap_uid=5, raw_bytes=raw_email), uidvalidity=100).message_id,
+            "<imap-100-5@dropline.invalid>",
+        )
+        # After a mailbox rebuild the same UID names a different letter, so the id must differ too.
+        self.assertEqual(
+            normalize_inbound_message(RawInboundMessage(imap_uid=5, raw_bytes=raw_email), uidvalidity=200).message_id,
+            "<imap-200-5@dropline.invalid>",
+        )
 
     def test_normalize_inbound_message_ignores_malformed_date(self) -> None:
         raw_email = """From: User <user@example.com>

@@ -466,6 +466,90 @@ class SchedulerTests(unittest.TestCase):
             self.assertFalse(store.get_kv(SENT_TIME_KEY))
             self.assertIn("Scheduled run failed at stage2: boom", "\n".join(captured.output))
 
+    def test_execute_scheduler_tick_does_not_count_lock_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            now = datetime(2026, 4, 2, 20, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+            self._prime_due_state(store, now)
+            locked = _FakePipeline(
+                store,
+                RunOutcome(
+                    success=False,
+                    run_id="run-locked",
+                    mode="pending",
+                    batch_id="",
+                    error_stage="lock",
+                    message="Another pipeline run is already in progress.",
+                ),
+            )
+
+            with self.assertLogs("dropline.scheduler", level="WARNING") as captured:
+                result = execute_scheduler_tick(settings, locked, now=now)
+
+            self.assertEqual(result.event, "run_failed")
+            self.assertEqual(result.outcome, locked._outcome)
+            self.assertEqual(locked.run_count, 1)
+            # Another run held the lock, so this tick must not use up the daily run budget.
+            self.assertEqual(store.get_runs_today(now.date()), 0)
+            self.assertFalse(store.get_kv(SENT_TIME_KEY))
+            self.assertIn("run run-locked not counted", "\n".join(captured.output))
+
+            unlocked = _FakePipeline(
+                store,
+                RunOutcome(success=True, run_id="run-after-lock", mode="initiative", batch_id="batch-after-lock"),
+            )
+            result = execute_scheduler_tick(settings, unlocked, now=now + timedelta(minutes=10))
+
+            self.assertEqual(result.event, "run_succeeded")
+            self.assertEqual(unlocked.run_count, 1)
+            self.assertEqual(store.get_runs_today(now.date()), 1)
+
+    def test_execute_scheduler_tick_keeps_the_catch_up_attempt_after_a_lock_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            now = datetime(2026, 4, 5, 1, 3, tzinfo=ZoneInfo("America/Los_Angeles"))
+            yesterday = now.date() - timedelta(days=1)
+            store.set_kv(SCHEDULED_FOR_DATE_KEY, yesterday.isoformat())
+            store.set_kv(TARGET_PICKED_AT_KEY, datetime(2026, 4, 4, 0, 28, tzinfo=now.tzinfo).isoformat())
+            store.set_kv(TARGET_SEND_TIME_KEY, datetime(2026, 4, 4, 22, 32, tzinfo=now.tzinfo).isoformat())
+            locked = _FakePipeline(
+                store,
+                RunOutcome(
+                    success=False,
+                    run_id="run-locked",
+                    mode="pending",
+                    batch_id="",
+                    error_stage="lock",
+                    message="Another pipeline run is already in progress.",
+                ),
+            )
+
+            first = execute_scheduler_tick(settings, locked, now=now)
+
+            self.assertEqual(first.event, "catch_up_failed")
+            self.assertEqual(locked.run_count, 1)
+            self.assertFalse(store.get_kv(CATCH_UP_ATTEMPTED_FOR_KEY))
+            self.assertEqual(store.get_runs_today(now.date()), 0)
+
+            unlocked = _FakePipeline(
+                store,
+                RunOutcome(success=True, run_id="run-catch-up-ok", mode="initiative", batch_id="batch-catch-up-ok"),
+            )
+            second = execute_scheduler_tick(settings, unlocked, now=now + timedelta(minutes=30))
+
+            self.assertEqual(second.event, "catch_up_succeeded")
+            self.assertEqual(unlocked.run_count, 1)
+            self.assertEqual(store.get_kv(CATCH_UP_ATTEMPTED_FOR_KEY), yesterday.isoformat())
+            self.assertEqual(store.get_kv(SENT_TIME_KEY), (now + timedelta(minutes=30)).isoformat())
+            self.assertEqual(store.get_runs_today(now.date()), 1)
+
     def test_execute_scheduler_tick_attempts_catch_up_only_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

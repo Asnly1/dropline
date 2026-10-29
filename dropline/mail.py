@@ -25,11 +25,22 @@ LOGGER = logging.getLogger(__name__)
 FROM_HEADER_SECTION = "(BODY.PEEK[HEADER.FIELDS (FROM)])"
 MAIL_SOCKET_TIMEOUT_SECONDS = 60.0
 UIDVALIDITY_RESPONSE_CODE = "UIDVALIDITY"
-HTML_TAG_RE = re.compile(r"<[^>]+>")
+# Tags are matched quote-aware so a ">" inside a quoted attribute value does not end the tag; the plain
+# "<...>" alternative keeps the old behaviour for a tag with an unbalanced quote.
+HTML_TAG_RE = re.compile(r"""<(?:"[^"]*"|'[^']*'|[^>"'])*>|<[^>]+>""")
 SCRIPT_STYLE_RE = re.compile(r"<(script|style).*?</\1>", re.IGNORECASE | re.DOTALL)
-HTML_ELEMENT_TAG_RE = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9-]*)(\s[^>]*|)>", re.DOTALL)
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+HTML_ELEMENT_TAG_RE = re.compile(
+    r"""<(/?)([A-Za-z][A-Za-z0-9-]*)(\s(?:"[^"]*"|'[^']*'|[^>"'])*|\s[^>]*|)>""",
+    re.DOTALL,
+)
 HTML_CLASS_ID_ATTR_RE = re.compile(r"""(?<![\w-])(?:class|id)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""", re.IGNORECASE)
 HTML_QUOTE_CONTAINER_MARKER = "quote"
+# Elements that never have content or a closing tag: they neither open a quote container nor change
+# the nesting depth while one is being skipped.
+HTML_VOID_ELEMENTS = frozenset(
+    {"img", "br", "hr", "input", "meta", "link", "source", "wbr", "area", "base", "col", "embed", "param", "track"}
+)
 STOP_PATTERNS = (
     re.compile(r"^>"),
     re.compile(r"^On .+wrote:$"),
@@ -40,13 +51,18 @@ STOP_PATTERNS = (
     # 中文 Outlook / QQ 邮箱引用头: 发件人: ...
     re.compile(r"^发件人[:：]"),
     # 163 / Apple Mail / Thunderbird: 在 2026-03-31 21:42:10，"刻晴" <keqing@163.com> 写道：
-    re.compile(r"^在\s?.*[0-9@].*写道[:：]$"),
+    # Every such header carries a clock time or an address; a user's own "在 2026-03-31 写道：" has neither.
+    re.compile(r"^在\s?.*(?:\d{1,2}:\d{2}|@).*写道[:：]$"),
     # 中文 Gmail: 刻晴 <keqing@gmail.com> 于2026年3月31日周二 21:42写道：
-    re.compile(r"^.+\s?于.*[0-9].*写道[:：]$"),
-    # Outlook / Exchange 分隔线
-    re.compile(r"^_{10,}$"),
+    # Gmail always names the author as <address>; a user's own "我于2024年写道：" never does.
+    re.compile(r"^(?=.*<[^<>\s]+@[^<>\s]+>).+于.*写道[:：]$"),
 )
-KNOWN_PARAGRAPH_MIN_LENGTH = 8
+# Outlook / Exchange separates the quoted letter with a line of underscores, but users draw such
+# dividers too: the line only ends the body when a quote header follows it and is dropped otherwise.
+OUTLOOK_SEPARATOR_RE = re.compile(r"^_{10,}$")
+QUOTE_HEADER_AFTER_SEPARATOR_RE = re.compile(r"^(发件人|寄件者|From|Von|De)[:：]")
+# Shorter paragraphs (greetings, sign-offs, one-line replies) are too generic to identify quoted prose.
+KNOWN_PARAGRAPH_MIN_LENGTH = 20
 PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n")
 SIGNATURE_PATTERNS = (
     re.compile(r"^--\s*$"),
@@ -313,7 +329,9 @@ def normalize_inbound_message(raw_message: RawInboundMessage, *, uidvalidity: in
     body_text = _cleanup_body(plain_body or html_body)
     attachments = _extract_attachments(message)
     thread_message_id = message.get("In-Reply-To") or None
-    message_id = message.get("Message-ID") or f"<imap-uid-{raw_message.imap_uid}>"
+    # A synthesized id must carry the UIDVALIDITY epoch: after a mailbox rebuild a different letter can
+    # arrive under the same UID, and it must not look like one that is already stored.
+    message_id = message.get("Message-ID") or f"<imap-{uidvalidity}-{raw_message.imap_uid}@dropline.invalid>"
     return NormalizedInboundMessage(
         message_id=message_id,
         imap_uid=raw_message.imap_uid,
@@ -444,14 +462,14 @@ def _extract_body(message: EmailMessage) -> tuple[str, str]:
     html_parts: list[str] = []
     if message.is_multipart():
         for part in message.walk():
-            if part.get_content_disposition() == "attachment":
+            if _attachment_inline_flag(part) is not None:
                 continue
             content_type = part.get_content_type()
             if content_type == "text/plain":
                 plain_parts.append(_get_part_text(part))
             elif content_type == "text/html":
                 html_parts.append(_html_to_text(_get_part_text(part)))
-    else:
+    elif _attachment_inline_flag(message) is None:
         payload = _get_part_text(message)
         if message.get_content_type() == "text/html":
             html_parts.append(_html_to_text(payload))
@@ -476,14 +494,8 @@ def _extract_attachments(message: EmailMessage) -> list[AttachmentMeta]:
     """Collect attachment metadata only; payloads are measured for size and never kept."""
     attachments: list[AttachmentMeta] = []
     for part in message.walk():
-        if part.is_multipart():
-            continue
-        disposition = part.get_content_disposition()
-        if disposition == "attachment":
-            inline = False
-        elif _is_inline_attachment(part, disposition):
-            inline = True
-        else:
+        inline = _attachment_inline_flag(part)
+        if inline is None:
             continue
         payload = part.get_payload(decode=True) or b""
         attachments.append(
@@ -497,11 +509,24 @@ def _extract_attachments(message: EmailMessage) -> list[AttachmentMeta]:
     return attachments
 
 
-def _is_inline_attachment(part: EmailMessage, disposition: str | None) -> bool:
-    maintype = part.get_content_maintype()
-    if maintype == "image" and (disposition == "inline" or part.get("Content-ID") is not None):
+def _attachment_inline_flag(part: EmailMessage) -> bool | None:
+    """Return the ``inline`` flag of a part that counts as an attachment, or ``None`` for a body part.
+
+    ``Content-Disposition: attachment`` always wins. Every ``image/*`` leaf is an attachment whatever its
+    disposition (inline when it has a Content-ID or is declared inline). Any other inline part that
+    carries a file name (a .txt, .ics or .pdf shown "inline") is an inline attachment, so a text file
+    never leaks into the letter's body.
+    """
+    if part.is_multipart():
+        return None
+    disposition = part.get_content_disposition()
+    if disposition == "attachment":
+        return False
+    if part.get_content_maintype() == "image":
+        return disposition == "inline" or part.get("Content-ID") is not None
+    if disposition == "inline" and part.get_filename():
         return True
-    return disposition == "inline" and maintype != "text" and bool(part.get_filename())
+    return None
 
 
 def _html_to_text(value: str) -> str:
@@ -514,9 +539,12 @@ def _html_to_text(value: str) -> str:
 def _strip_quoted_html(value: str) -> str:
     """Remove quoted-reply containers (<blockquote>, gmail_quote, any *quote* id/class) as whole elements.
 
-    Nested containers are tracked by tag name so a quote that itself contains quotes is removed in one
-    piece; an unterminated container swallows the rest of the document, which is where quotes live.
+    Comments are dropped first so commented-out markup cannot open or close a container. Nested
+    containers are tracked by tag name so a quote that itself contains quotes is removed in one piece;
+    void elements never count, and an unterminated container swallows the rest of the document, which
+    is where quotes live.
     """
+    value = HTML_COMMENT_RE.sub("", value)
     kept: list[str] = []
     cursor = 0
     depth = 0
@@ -524,6 +552,8 @@ def _strip_quoted_html(value: str) -> str:
     for match in HTML_ELEMENT_TAG_RE.finditer(value):
         closing = match.group(1) == "/"
         tag_name = match.group(2).lower()
+        if tag_name in HTML_VOID_ELEMENTS:
+            continue
         attributes = match.group(3)
         self_closing = attributes.rstrip().endswith("/")
         if depth == 0:
@@ -555,8 +585,12 @@ def _is_quoted_html_container(tag_name: str, attributes: str) -> bool:
 
 def _cleanup_body(body_text: str) -> str:
     lines: list[str] = []
-    for raw_line in body_text.splitlines():
-        line = raw_line.rstrip()
+    raw_lines = [raw_line.rstrip() for raw_line in body_text.splitlines()]
+    for index, line in enumerate(raw_lines):
+        if OUTLOOK_SEPARATOR_RE.match(line):
+            if _quote_header_follows(raw_lines, index + 1):
+                break
+            continue
         if any(pattern.search(line) for pattern in STOP_PATTERNS):
             break
         if any(pattern.search(line) for pattern in SIGNATURE_PATTERNS):
@@ -565,3 +599,11 @@ def _cleanup_body(body_text: str) -> str:
     cleaned = "\n".join(lines).strip()
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned
+
+
+def _quote_header_follows(lines: list[str], start: int) -> bool:
+    """True when the first non-blank line at or after ``start`` is a quote header (发件人: / From: ...)."""
+    for line in lines[start:]:
+        if line.strip():
+            return QUOTE_HEADER_AFTER_SEPARATOR_RE.match(line.strip()) is not None
+    return False

@@ -10,16 +10,19 @@ from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from dropline.alerts import ALERT_KIND_FAILURES, ALERT_KIND_QUARANTINE, last_alert_at_key
 from dropline.documents import load_entries, load_json_file
 from dropline.mail import compose_email
 from dropline.memory import MemoryManager
 from dropline.models import GeneratedImage, ModelValidationError, NormalizedInboundMessage, RawInboundMessage, Stage1Result, Stage2Result
-from dropline.pipeline import PipelineDependencies, PipelineService, RunContext
-from dropline.storage import LAST_ALERT_AT_KEY, RUNS_TODAY_KEY, StateStore
+from dropline.pipeline import LOCK_ERROR_STAGE, PipelineDependencies, PipelineService, RunContext
+from dropline.storage import RUNS_TODAY_KEY, StateStore
 
 from tests.helpers import create_test_repo, load_test_settings
 
 
+FAILURES_ALERT_KEY = last_alert_at_key(ALERT_KIND_FAILURES)
+QUARANTINE_ALERT_KEY = last_alert_at_key(ALERT_KIND_QUARANTINE)
 PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9lJawAAAAASUVORK5CYII="
 )
@@ -151,6 +154,11 @@ class FailingInitializeStateStore(StateStore):
         raise RuntimeError("initialize failed")
 
 
+class BrokenOutboundIndexStore(StateStore):
+    def list_recent_outbound_messages(self, *, limit: int = 5):
+        raise RuntimeError("outbound index corrupted")
+
+
 RAW_EMAIL = """From: User <user@example.com>
 To: keqing@example.com
 Subject: =?utf-8?b?5LuK5aSp5pyJ54K557Sv?=
@@ -166,16 +174,16 @@ def build_raw_email(
     *,
     uid: int,
     from_email: str,
-    message_id: str,
+    message_id: str | None,
     date_header: str = "Tue, 31 Mar 2026 21:42:10 +0800",
     body: str | None = None,
 ) -> RawInboundMessage:
+    message_id_header = f"Message-ID: <{message_id}>\n" if message_id is not None else ""
     raw = f"""From: Sender <{from_email}>
 To: keqing@example.com
 Subject: test-{uid}
 Date: {date_header}
-Message-ID: <{message_id}>
-Content-Type: text/plain; charset="utf-8"
+{message_id_header}Content-Type: text/plain; charset="utf-8"
 
 {body if body is not None else f"测试邮件 {uid}"}
 """.encode("utf-8")
@@ -1558,7 +1566,8 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(alert["To"], "user@example.com")
                 self.assertIn("系统通知，不是角色来信", alert.get_content())
             self.assertIn("已隔离的来信 UID：1", outbound_client.sent_messages[1].get_content())
-            self.assertEqual(store.get_kv(LAST_ALERT_AT_KEY), (self.fixed_now + timedelta(days=2)).isoformat())
+            self.assertEqual(store.get_kv(FAILURES_ALERT_KEY), (self.fixed_now + timedelta(days=1)).isoformat())
+            self.assertEqual(store.get_kv(QUARANTINE_ALERT_KEY), (self.fixed_now + timedelta(days=2)).isoformat())
 
             ai_client.stage2_should_fail = False
             with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(days=3)):
@@ -1643,7 +1652,8 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual([item.imap_uid for item in store.list_quarantined_inbound()], [1])
             self.assertEqual(outbound_client.sent_messages, [])
-            self.assertIsNone(store.get_kv(LAST_ALERT_AT_KEY))
+            self.assertIsNone(store.get_kv(FAILURES_ALERT_KEY))
+            self.assertIsNone(store.get_kv(QUARANTINE_ALERT_KEY))
 
     def test_retry_reuses_archived_stage2_after_image_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1823,7 +1833,7 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("Pipeline run succeeded.", output)
             self.assertIn("image_generated=False, image_degraded=True", output)
 
-    def test_image_failure_with_default_abort_still_fails_the_run(self) -> None:
+    def test_image_failure_with_default_abort_fails_the_run_without_counting_against_inbound(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             create_test_repo(root)
@@ -1836,7 +1846,11 @@ class PipelineTests(unittest.TestCase):
             self.assertFalse(outcome.success)
             self.assertEqual(outcome.error_stage, "image")
             self.assertEqual(outbound_client.sent_messages, [])
-            self.assertEqual(store.list_unconsumed_inbound()[0].attempt_count, 1)
+            # An image provider failure says nothing about the letter, so it never counts towards quarantine.
+            message = store.list_unconsumed_inbound()[0]
+            self.assertEqual(message.attempt_count, 0)
+            self.assertIsNone(message.last_error)
+            self.assertEqual(store.get_consecutive_failures(), 1)
 
     def test_successful_run_resets_consecutive_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1853,6 +1867,268 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(store.get_consecutive_failures(), 0)
             self.assertIsNone(store.get_last_failed_at())
             self.assertIsNone(store.get_kv(RUNS_TODAY_KEY))
+
+    def test_same_day_failures_send_both_failure_and_quarantine_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, outbound_client = self._build_pipeline(root, stage2_should_fail=True)
+
+            for attempt in range(3):
+                with patch(
+                    "dropline.pipeline.now_in_timezone",
+                    return_value=self.fixed_now + timedelta(minutes=10 * attempt),
+                ):
+                    outcome = pipeline.run_once()
+                self.assertFalse(outcome.success)
+
+            # Second failure: the threshold alert. Third failure: the quarantine alert, which the
+            # failure alert sent earlier the same day must not throttle.
+            self.assertEqual(
+                [item["Subject"] for item in outbound_client.sent_messages],
+                ["[dropline] 已连续失败 2 次（阶段 stage2）", "[dropline] 来信已被隔离：uid 1（阶段 stage2）"],
+            )
+            self.assertEqual([item.imap_uid for item in store.list_quarantined_inbound()], [1])
+            self.assertEqual(store.get_kv(FAILURES_ALERT_KEY), (self.fixed_now + timedelta(minutes=10)).isoformat())
+            self.assertEqual(store.get_kv(QUARANTINE_ALERT_KEY), (self.fixed_now + timedelta(minutes=20)).isoformat())
+
+    def test_attempt_bookkeeping_only_touches_the_batch_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, _ = self._build_pipeline(root, stage2_should_fail=True)
+            legacy_raw = root / "legacy.eml"
+            legacy_raw.write_bytes(b"legacy")
+            # An answered letter kept from before the mailbox was rebuilt shares UID 1 with the new letter.
+            store.upsert_inbound_message(
+                NormalizedInboundMessage(
+                    message_id="<legacy@example.com>",
+                    imap_uid=1,
+                    from_email="user@example.com",
+                    subject="legacy",
+                    received_at="2026-03-01T12:00:00+08:00",
+                    body_text="旧 epoch 的信。",
+                    body_html_present=False,
+                    attachments=[],
+                    uidvalidity=0,
+                ),
+                raw_path=legacy_raw,
+            )
+            store.mark_inbound_consumed([(0, 1)], batch_id="batch-legacy")
+            pipeline.dependencies.inbound_client = FakeInboundClient(
+                [RawInboundMessage(imap_uid=1, raw_bytes=RAW_EMAIL)],
+                uidvalidity=200,
+            )
+
+            for attempt in range(3):
+                with patch(
+                    "dropline.pipeline.now_in_timezone",
+                    return_value=self.fixed_now + timedelta(minutes=10 * attempt),
+                ):
+                    outcome = pipeline.run_once()
+                self.assertEqual(outcome.error_stage, "stage2")
+
+            legacy = store.get_inbound_message(1, uidvalidity=0)
+            self.assertEqual((legacy.consumed_batch_id, legacy.attempt_count, legacy.quarantined_at), ("batch-legacy", 0, None))
+            self.assertEqual(
+                [(item.uidvalidity, item.imap_uid, item.attempt_count) for item in store.list_quarantined_inbound()],
+                [(200, 1, 3)],
+            )
+            requeued = store.requeue_inbound_message(1)
+            self.assertEqual((requeued.uidvalidity, requeued.imap_uid, requeued.attempt_count), (200, 1, 0))
+            self.assertEqual(store.get_inbound_message(1, uidvalidity=0).consumed_batch_id, "batch-legacy")
+
+    def test_finalizing_recorded_outbound_consumes_inbound_first_and_is_not_an_imap_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            _disable_alerts(root)  # two consecutive failures would otherwise add an alert email to the outbox
+            failing_pipeline, store, outbound_client = self._build_pipeline(root)
+            failing_pipeline.dependencies.memory_manager = FailingCharacterMemoryManager(failing_pipeline.settings)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                first_outcome = failing_pipeline.run_once()
+
+            self.assertFalse(first_outcome.success)
+            self.assertEqual(len(outbound_client.sent_messages), 1)
+            self.assertEqual(len(store.list_unconsumed_inbound()), 1)
+
+            retry_pipeline, _, _ = self._build_pipeline(root, stage1_should_fail=True, stage2_should_fail=True)
+            retry_pipeline.dependencies.state_store = store
+            retry_pipeline.dependencies.outbound_client = outbound_client
+            retry_pipeline.dependencies.memory_manager = FailingCharacterMemoryManager(retry_pipeline.settings)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(minutes=5)):
+                retry_outcome = retry_pipeline.run_once()
+
+            # The failure happened while finalizing an already-sent letter, long after the inbox pull.
+            self.assertFalse(retry_outcome.success)
+            self.assertEqual(retry_outcome.error_stage, "pipeline")
+            self.assertEqual(store.get_run(retry_outcome.run_id).error_stage, "pipeline")
+            self.assertEqual(len(outbound_client.sent_messages), 1)
+            # The letter went out, so the batch counts as answered even though the memory write failed.
+            self.assertEqual(store.list_unconsumed_inbound(), [])
+            self.assertEqual(store.get_last_consumed_imap_uid(), 1)
+            self.assertEqual(store.get_inbound_message(1).attempt_count, 0)
+
+    def test_lock_conflict_is_recorded_without_failure_bookkeeping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, outbound_client = self._build_pipeline(root)
+
+            with store.acquire_lock(), patch(
+                "dropline.pipeline.now_in_timezone", return_value=self.fixed_now
+            ), self.assertLogs("dropline.pipeline", level="WARNING") as captured:
+                outcome = pipeline.run_once()
+
+            self.assertFalse(outcome.success)
+            self.assertEqual(outcome.error_stage, LOCK_ERROR_STAGE)
+            self.assertIn("already in progress", outcome.message)
+            stored_run = store.get_run(outcome.run_id)
+            self.assertEqual((stored_run.status, stored_run.error_stage), ("failed", "lock"))
+            self.assertIn("already in progress", stored_run.error_message)
+            # Nothing was attempted: no consecutive failure, no back-off timestamp, no alert.
+            self.assertEqual(store.get_consecutive_failures(), 0)
+            self.assertIsNone(store.get_last_failed_at())
+            self.assertEqual(pipeline.dependencies.ai_client.stage1_calls, 0)
+            self.assertEqual(outbound_client.sent_messages, [])
+            self.assertIsNone(store.get_kv(FAILURES_ALERT_KEY))
+            self.assertIn("Run skipped: Another pipeline run is already in progress.", "\n".join(captured.output))
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(minutes=5)):
+                recovered = pipeline.run_once()
+
+            self.assertTrue(recovered.success)
+            self.assertEqual(recovered.mode, "reply")
+
+    def test_retry_ignores_archived_output_of_a_failed_run_older_than_24_hours(self) -> None:
+        for age, expect_reuse in ((timedelta(hours=23), True), (timedelta(hours=24, minutes=1), False)):
+            with self.subTest(age=age), tempfile.TemporaryDirectory() as tmp_dir:
+                root = Path(tmp_dir)
+                create_test_repo(root)
+                failing_pipeline, store, outbound_client = self._build_pipeline(root, image_should_fail=True)
+
+                with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                    first_outcome = failing_pipeline.run_once()
+
+                self.assertEqual(first_outcome.error_stage, "image")
+                retry_pipeline, _, _ = self._build_pipeline(root)
+                retry_pipeline.dependencies.state_store = store
+                retry_pipeline.dependencies.outbound_client = outbound_client
+                retry_ai_client = retry_pipeline.dependencies.ai_client
+
+                with patch(
+                    "dropline.pipeline.now_in_timezone", return_value=self.fixed_now + age
+                ), self.assertLogs("dropline.pipeline", level="INFO") as captured:
+                    retry_outcome = retry_pipeline.run_once()
+
+                self.assertTrue(retry_outcome.success)
+                self.assertEqual(retry_outcome.batch_id, first_outcome.batch_id)
+                self.assertEqual(len(outbound_client.sent_messages), 1)
+                output = "\n".join(captured.output)
+                if expect_reuse:
+                    self.assertEqual((retry_ai_client.stage1_calls, retry_ai_client.stage2_calls), (0, 0))
+                    self.assertIn("Reusing archived Stage 1 and Stage 2 output", output)
+                else:
+                    self.assertEqual((retry_ai_client.stage1_calls, retry_ai_client.stage2_calls), (1, 1))
+                    self.assertIn("too old to reuse", output)
+                    self.assertIn(f"failed_run_id={first_outcome.run_id}", output)
+                    retry_run = store.get_run(retry_outcome.run_id)
+                    self.assertTrue(retry_run.stage2_path.endswith(f"{retry_outcome.run_id}/stage2.json"))
+
+    def test_letters_without_message_id_are_told_apart_across_uidvalidity_epochs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, outbound_client = self._build_pipeline(root)
+            pipeline.dependencies.inbound_client = FakeInboundClient(
+                [build_raw_email(uid=5, from_email="user@example.com", message_id=None, body="第一封没有 Message-ID 的信。")],
+                uidvalidity=100,
+            )
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                first_outcome = pipeline.run_once()
+
+            self.assertTrue(first_outcome.success)
+            self.assertEqual(first_outcome.mode, "reply")
+            first_payload = pipeline.dependencies.ai_client.stage1_payloads[-1]["inbound_messages"]
+            self.assertEqual([item["message_id"] for item in first_payload], ["<imap-100-5@dropline.invalid>"])
+
+            # The mailbox was rebuilt and a different letter now sits at UID 5.
+            pipeline.dependencies.inbound_client = FakeInboundClient(
+                [build_raw_email(uid=5, from_email="user@example.com", message_id=None, body="重建后同一个 UID 上的新信。")],
+                uidvalidity=200,
+            )
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(days=1)):
+                second_outcome = pipeline.run_once()
+
+            self.assertTrue(second_outcome.success)
+            self.assertEqual(second_outcome.mode, "reply")
+            second_payload = pipeline.dependencies.ai_client.stage1_payloads[-1]["inbound_messages"]
+            self.assertEqual(
+                [(item["message_id"], item["body_text"]) for item in second_payload],
+                [("<imap-200-5@dropline.invalid>", "重建后同一个 UID 上的新信。")],
+            )
+            self.assertEqual(len(outbound_client.sent_messages), 2)
+            self.assertEqual(_count_inbound_rows(store), 2)
+            self.assertEqual(store.list_unconsumed_inbound(), [])
+
+    def test_unreadable_stage2_archive_falls_back_to_archived_email_for_quote_stripping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, store, _ = self._build_pipeline(root)
+
+            with patch("dropline.pipeline.now_in_timezone", return_value=self.fixed_now):
+                first_outcome = pipeline.run_once()
+
+            self.assertTrue(first_outcome.success)
+            stage2_path = Path(store.get_run(first_outcome.run_id).stage2_path)
+            stage2_path.unlink()
+            stage2_path.mkdir()  # still exists, but opening it raises OSError
+            pipeline.dependencies.inbound_client = FakeInboundClient(
+                [
+                    build_raw_email(
+                        uid=2,
+                        from_email="user@example.com",
+                        message_id="quoted@example.com",
+                        body="我看完了，谢谢你。\n\n" + LONG_BODY + "\n\n下周再写。",
+                    )
+                ]
+            )
+
+            with patch(
+                "dropline.pipeline.now_in_timezone", return_value=self.fixed_now + timedelta(hours=1)
+            ), self.assertLogs("dropline.pipeline", level="WARNING") as captured:
+                outcome = pipeline.run_once()
+
+            self.assertTrue(outcome.success)
+            self.assertIn("falling back to the archived email", "\n".join(captured.output))
+            inbound_payload = pipeline.dependencies.ai_client.stage1_payloads[-1]["inbound_messages"]
+            self.assertEqual([item["body_text"] for item in inbound_payload], ["我看完了，谢谢你。\n\n下周再写。"])
+
+    def test_quote_stripping_failure_does_not_block_the_inbound_pull(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            pipeline, _, _ = self._build_pipeline(root)
+            pipeline.dependencies.state_store = BrokenOutboundIndexStore(pipeline.settings)
+            quoted_body = "我看完了，谢谢你。\n\n" + LONG_BODY + "\n\n下周再写。"
+            pipeline.dependencies.inbound_client = FakeInboundClient(
+                [build_raw_email(uid=2, from_email="user@example.com", message_id="unstripped@example.com", body=quoted_body)]
+            )
+
+            with patch(
+                "dropline.pipeline.now_in_timezone", return_value=self.fixed_now
+            ), self.assertLogs("dropline.pipeline", level="WARNING") as captured:
+                outcome = pipeline.run_once()
+
+            self.assertTrue(outcome.success)
+            self.assertEqual(outcome.mode, "reply")
+            self.assertIn("Could not collect the character's recent letters", "\n".join(captured.output))
+            inbound_payload = pipeline.dependencies.ai_client.stage1_payloads[-1]["inbound_messages"]
+            self.assertEqual([item["body_text"] for item in inbound_payload], [quoted_body])
 
 
 if __name__ == "__main__":

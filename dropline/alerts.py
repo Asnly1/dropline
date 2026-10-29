@@ -13,6 +13,18 @@ from .storage import LAST_ALERT_AT_KEY, StateStore
 LOGGER = logging.getLogger(__name__)
 ALERT_SENDER_NAME = "dropline"
 ALERT_SUBJECT_PREFIX = "[dropline] "
+# Alerts are throttled to one per day *per kind*, so the "inbound mail quarantined" notice is never
+# swallowed by the "consecutive failures" notice that usually goes out earlier on the same day.
+ALERT_KIND_FAILURES = "failures"
+ALERT_KIND_QUARANTINE = "quarantine"
+ALERT_KINDS = (ALERT_KIND_FAILURES, ALERT_KIND_QUARANTINE)
+
+
+def last_alert_at_key(kind: str) -> str:
+    """kv key holding when an alert of ``kind`` was last sent (``last_alert_at:<kind>``)."""
+    if kind not in ALERT_KINDS:
+        raise ValueError(f"Unsupported alert kind: {kind!r}")
+    return f"{LAST_ALERT_AT_KEY}:{kind}"
 
 
 def build_alert_email(settings: Settings, *, subject: str, body: str) -> EmailMessage:
@@ -31,8 +43,8 @@ def build_alert_email(settings: Settings, *, subject: str, body: str) -> EmailMe
     return message
 
 
-def alert_already_sent_today(store: StateStore, now: datetime) -> bool:
-    raw_value = (store.get_kv(LAST_ALERT_AT_KEY) or "").strip()
+def alert_already_sent_today(store: StateStore, now: datetime, *, kind: str = ALERT_KIND_FAILURES) -> bool:
+    raw_value = (store.get_kv(last_alert_at_key(kind)) or "").strip()
     if not raw_value:
         return False
     try:
@@ -54,20 +66,21 @@ def send_alert(
     body: str,
     now: datetime,
     outbound_client: OutboundMailClient | None = None,
+    kind: str = ALERT_KIND_FAILURES,
 ) -> bool:
-    """Send one alert email, at most once per day. Never raises: alert failures only get logged."""
+    """Send one alert email, at most once per day per ``kind``. Never raises: alert failures only get logged."""
     alerts = settings.mail.alerts
     if not alerts.enabled:
         LOGGER.info("Alert suppressed: mail.alerts.enabled=false (%s)", subject)
         return False
-    if alert_already_sent_today(store, now):
-        LOGGER.info("Alert suppressed: an alert was already sent today (%s)", subject)
+    if alert_already_sent_today(store, now, kind=kind):
+        LOGGER.info("Alert suppressed: a %s alert was already sent today (%s)", kind, subject)
         return False
     try:
         client = outbound_client or SMTPOutboundClient(settings.mail.character_mailbox)
         message = build_alert_email(settings, subject=subject, body=body)
         client.send(message)
-        store.set_kv(LAST_ALERT_AT_KEY, now.isoformat())
+        store.set_kv(last_alert_at_key(kind), now.isoformat())
     except Exception:
         LOGGER.exception("Failed to send alert email to %s; continuing without the alert", alerts.recipient)
         return False
@@ -89,10 +102,14 @@ def notify_run_failure(
     now: datetime,
     outbound_client: OutboundMailClient | None = None,
 ) -> bool:
-    """Alert when consecutive failures reach the threshold or inbound mail got quarantined."""
+    """Alert when consecutive failures reach the threshold or inbound mail got quarantined.
+
+    A quarantine is its own alert kind: it still goes out on a day that already saw a failure alert.
+    """
     threshold_reached = consecutive_failures >= settings.mail.alerts.after_failures
     if not threshold_reached and not quarantined_uids:
         return False
+    kind = ALERT_KIND_QUARANTINE if quarantined_uids else ALERT_KIND_FAILURES
     english = settings.llm.language == ENGLISH_OUTPUT_LANGUAGE
     subject = _format_subject(
         error_stage=error_stage,
@@ -113,7 +130,15 @@ def notify_run_failure(
         now=now,
         english=english,
     )
-    return send_alert(settings, store, subject=subject, body=body, now=now, outbound_client=outbound_client)
+    return send_alert(
+        settings,
+        store,
+        subject=subject,
+        body=body,
+        now=now,
+        outbound_client=outbound_client,
+        kind=kind,
+    )
 
 
 def _format_uids(quarantined_uids: list[int]) -> str:

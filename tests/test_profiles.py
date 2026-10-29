@@ -509,7 +509,10 @@ class ProfileCLITests(unittest.TestCase):
             with redirect_stdout(inbox_output):
                 show_inbox(str(root / "config.yaml"))
             self.assertIn("Unconsumed inbound: 1", inbox_output.getvalue())
-            self.assertIn("subject=消息摘要", inbox_output.getvalue())
+            self.assertIn(
+                "  - uid=2 uidvalidity=0 received_at=2026-04-01T12:05:00+00:00 from=user@example.com subject=消息摘要",
+                inbox_output.getvalue(),
+            )
 
             outbox_output = io.StringIO()
             with redirect_stdout(outbox_output):
@@ -585,6 +588,79 @@ class ProfileCLITests(unittest.TestCase):
             self.assertIn("Deleted outbound message(s): 1", outbound_output.getvalue())
             self.assertFalse(outbound_raw.exists())
             self.assertEqual(store.list_recent_outbound_messages(), [])
+
+    def test_delete_inbound_removes_legacy_row_by_uid_after_uidvalidity_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            archive = settings.documents.session_archive_dir
+            archive.mkdir(parents=True, exist_ok=True)
+            legacy_raw = archive / "legacy-77.eml"
+            legacy_raw.write_text("legacy", encoding="utf-8")
+            current_raw = archive / "current-77.eml"
+            current_raw.write_text("current", encoding="utf-8")
+            # A row stored before the UIDVALIDITY migration keeps epoch 0; the real epoch is recorded later.
+            store.upsert_inbound_message(
+                NormalizedInboundMessage(
+                    message_id="<legacy-77@example.com>",
+                    imap_uid=77,
+                    from_email="user@example.com",
+                    subject="迁移前的旧行",
+                    received_at="2026-03-01T12:07:00+00:00",
+                    body_text="hello",
+                    body_html_present=False,
+                    attachments=[],
+                ),
+                raw_path=legacy_raw,
+            )
+            store.upsert_inbound_message(
+                NormalizedInboundMessage(
+                    message_id="<current-77@example.com>",
+                    imap_uid=77,
+                    from_email="user@example.com",
+                    subject="当前 epoch 的行",
+                    received_at="2026-04-01T12:07:00+00:00",
+                    body_text="hello",
+                    body_html_present=False,
+                    attachments=[],
+                    uidvalidity=1700000000,
+                ),
+                raw_path=current_raw,
+            )
+            store.set_imap_uidvalidity(1700000000)
+
+            # The current epoch's row goes first; the legacy row stays reachable by UID alone afterwards.
+            for expected_gone, expected_kept in ((current_raw, legacy_raw), (legacy_raw, None)):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    exit_code = delete_inbound(
+                        str(root / "config.yaml"),
+                        character_slug_value="keqing",
+                        relationship_slug_value="childhood-friends",
+                        imap_uid=77,
+                        yes=True,
+                    )
+                self.assertEqual(exit_code, 0)
+                self.assertIn("Deleted inbound message(s): 1", output.getvalue())
+                self.assertFalse(expected_gone.exists())
+                if expected_kept is not None:
+                    self.assertTrue(expected_kept.exists())
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exit_code = delete_inbound(
+                    str(root / "config.yaml"),
+                    character_slug_value="keqing",
+                    relationship_slug_value="childhood-friends",
+                    imap_uid=77,
+                    yes=True,
+                )
+            self.assertEqual(exit_code, 1)
+            self.assertIn("Inbound message not found", output.getvalue())
+            self.assertEqual(store.list_unconsumed_inbound(include_quarantined=True), [])
 
     def test_delete_session_clears_active_profile_and_session_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

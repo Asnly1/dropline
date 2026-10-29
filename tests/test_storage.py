@@ -302,9 +302,10 @@ class StateStoreTests(unittest.TestCase):
             )
 
             self.assertEqual(store.get_imap_uidvalidity(), 0)
-            self.assertFalse(store.delete_inbound_message(5))  # no row in epoch 0
+            self.assertFalse(store.delete_inbound_message(5, uidvalidity=0))  # no row in epoch 0
             store.set_imap_uidvalidity(200)
             self.assertEqual(store.get_imap_uidvalidity(), 200)
+            # Without an explicit epoch the current mailbox epoch wins over the older row with the same UID.
             self.assertTrue(store.delete_inbound_message(5))
             self.assertFalse(new_raw.exists())
             self.assertTrue(old_raw.exists())
@@ -1217,7 +1218,7 @@ class StateStoreTests(unittest.TestCase):
             store.upsert_inbound_message(self._inbound(2, "second"), raw_path=root / "second.eml")
 
             first_quarantined = store.record_inbound_attempt_failure(
-                [1, 2],
+                [(0, 1), (0, 2)],
                 error_stage="stage2",
                 message="boom",
                 attempted_at="2026-04-01T20:00:00+00:00",
@@ -1237,14 +1238,14 @@ class StateStoreTests(unittest.TestCase):
             )
 
             second_quarantined = store.record_inbound_attempt_failure(
-                [1],
+                [(0, 1)],
                 error_stage="validation",
                 message="x" * 2000,
                 attempted_at="2026-04-01T21:00:00+00:00",
                 max_attempts=2,
             )
 
-            self.assertEqual(second_quarantined, [1])
+            self.assertEqual(second_quarantined, [(0, 1)])
             self.assertEqual([item.imap_uid for item in store.list_unconsumed_inbound()], [2])
             self.assertEqual([item.imap_uid for item in store.list_unconsumed_inbound(include_quarantined=True)], [1, 2])
             self.assertEqual([item.imap_uid for item in store.list_quarantined_inbound()], [1])
@@ -1259,7 +1260,7 @@ class StateStoreTests(unittest.TestCase):
 
             self.assertEqual(
                 store.record_inbound_attempt_failure(
-                    [1],
+                    [(0, 1)],
                     error_stage="stage2",
                     message="again",
                     attempted_at="2026-04-01T22:00:00+00:00",
@@ -1288,7 +1289,7 @@ class StateStoreTests(unittest.TestCase):
             store.initialize()
             store.upsert_inbound_message(self._inbound(1, "first"), raw_path=root / "first.eml")
             store.record_inbound_attempt_failure(
-                [1],
+                [(0, 1)],
                 error_stage="stage2",
                 message="boom",
                 attempted_at="2026-04-01T20:00:00+00:00",
@@ -1296,8 +1297,10 @@ class StateStoreTests(unittest.TestCase):
             )
             self.assertEqual(store.list_unconsumed_inbound(), [])
 
-            self.assertTrue(store.requeue_inbound_message(1))
-            self.assertFalse(store.requeue_inbound_message(99))
+            requeued = store.requeue_inbound_message(1)
+            self.assertIsNotNone(requeued)
+            self.assertEqual((requeued.uidvalidity, requeued.imap_uid, requeued.quarantined_at), (0, 1, None))
+            self.assertIsNone(store.requeue_inbound_message(99))
 
             messages = store.list_unconsumed_inbound()
             self.assertEqual([item.imap_uid for item in messages], [1])
@@ -1319,7 +1322,7 @@ class StateStoreTests(unittest.TestCase):
             raw_path.write_text("raw", encoding="utf-8")
             store.upsert_inbound_message(self._inbound(1, "first"), raw_path=raw_path)
             store.record_inbound_attempt_failure(
-                [1],
+                [(0, 1)],
                 error_stage="image",
                 message="boom",
                 attempted_at="2026-04-01T20:00:00+00:00",
@@ -1332,6 +1335,124 @@ class StateStoreTests(unittest.TestCase):
             self.assertFalse(raw_path.exists())
             self.assertEqual(store.count_quarantined_inbound(), 0)
             self.assertEqual(store.list_unconsumed_inbound(include_quarantined=True), [])
+
+    def test_inbound_attempt_failures_are_keyed_by_uidvalidity_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            store.upsert_inbound_message(_inbound("<legacy@example.com>", 1, uidvalidity=0), raw_path=root / "legacy.eml")
+            store.upsert_inbound_message(_inbound("<current@example.com>", 1, uidvalidity=200), raw_path=root / "current.eml")
+
+            quarantined = store.record_inbound_attempt_failure(
+                [(200, 1)],
+                error_stage="stage2",
+                message="boom",
+                attempted_at="2026-04-01T20:00:00+00:00",
+                max_attempts=1,
+            )
+
+            # The row that shares UID 1 in the older epoch is neither counted nor quarantined.
+            self.assertEqual(quarantined, [(200, 1)])
+            self.assertEqual(
+                [
+                    (item.uidvalidity, item.attempt_count, item.last_error, item.quarantined_at)
+                    for item in store.list_unconsumed_inbound(include_quarantined=True)
+                ],
+                [(0, 0, None, None), (200, 1, "stage2: boom", "2026-04-01T20:00:00+00:00")],
+            )
+            self.assertEqual([(item.uidvalidity, item.imap_uid) for item in store.list_unconsumed_inbound()], [(0, 1)])
+
+    def test_requeue_inbound_message_only_touches_quarantined_rows_and_resolves_epochs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            store.upsert_inbound_message(_inbound("<answered@example.com>", 7, uidvalidity=200), raw_path=root / "a.eml")
+            store.mark_inbound_consumed([(200, 7)], batch_id="batch-answered")
+            store.upsert_inbound_message(_inbound("<queued@example.com>", 8, uidvalidity=200), raw_path=root / "b.eml")
+            store.record_inbound_attempt_failure(
+                [(200, 8)],
+                error_stage="stage2",
+                message="boom",
+                attempted_at="2026-04-01T20:00:00+00:00",
+                max_attempts=3,
+            )
+            store.upsert_inbound_message(_inbound("<legacy-quarantined@example.com>", 7, uidvalidity=0), raw_path=root / "c.eml")
+            store.record_inbound_attempt_failure(
+                [(0, 7)],
+                error_stage="validation",
+                message="bad",
+                attempted_at="2026-04-01T21:00:00+00:00",
+                max_attempts=1,
+            )
+            store.set_imap_uidvalidity(200)
+
+            # Not quarantined: an answered row and a row still waiting in the queue are left untouched.
+            self.assertIsNone(store.requeue_inbound_message(8))
+            self.assertEqual(store.get_inbound_message(8).attempt_count, 1)
+            self.assertIsNone(store.requeue_inbound_message(7, uidvalidity=200))
+            # Plain lookups prefer the current epoch when a UID exists in several.
+            self.assertEqual(store.get_inbound_message(7).consumed_batch_id, "batch-answered")
+
+            # UID 7 is quarantined only in the legacy epoch, so that is the row requeued.
+            requeued = store.requeue_inbound_message(7)
+            self.assertEqual(
+                (requeued.uidvalidity, requeued.imap_uid, requeued.attempt_count, requeued.last_error, requeued.quarantined_at),
+                (0, 7, 0, None, None),
+            )
+            self.assertEqual(store.get_inbound_message(7, uidvalidity=200).consumed_batch_id, "batch-answered")
+            self.assertIsNone(store.requeue_inbound_message(7))
+            self.assertIsNone(store.get_inbound_message(404))
+
+    def test_delete_inbound_message_resolves_uid_across_epochs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            archive = settings.documents.session_archive_dir
+            archive.mkdir(parents=True, exist_ok=True)
+            raw_paths: dict[int, Path] = {}
+            for epoch in (0, 100, 200):
+                raw_paths[epoch] = archive / f"epoch-{epoch}.eml"
+                raw_paths[epoch].write_text(str(epoch), encoding="utf-8")
+                store.upsert_inbound_message(_inbound(f"<epoch-{epoch}@example.com>", 7, uidvalidity=epoch), raw_path=raw_paths[epoch])
+            store.set_imap_uidvalidity(200)
+
+            # Current epoch first, then the newest remaining epoch, then the legacy row.
+            self.assertTrue(store.delete_inbound_message(7))
+            self.assertFalse(raw_paths[200].exists())
+            self.assertTrue(store.delete_inbound_message(7))
+            self.assertFalse(raw_paths[100].exists())
+            self.assertTrue(raw_paths[0].exists())
+            self.assertTrue(store.delete_inbound_message(7))
+            self.assertFalse(raw_paths[0].exists())
+            self.assertFalse(store.delete_inbound_message(7))
+
+    def test_legacy_inbound_row_is_deletable_by_uid_after_uidvalidity_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            store = StateStore(settings)
+            store.initialize()
+            raw_path = settings.documents.session_archive_dir / "legacy.eml"
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_path.write_text("legacy", encoding="utf-8")
+            # Stored before the UIDVALIDITY migration: the row keeps epoch 0.
+            store.upsert_inbound_message(_inbound("<legacy@example.com>", 77), raw_path=raw_path)
+            store.set_imap_uidvalidity(1700000000)
+
+            self.assertEqual(store.get_inbound_message(77).uidvalidity, 0)
+            self.assertTrue(store.delete_inbound_message(77))
+            self.assertFalse(raw_path.exists())
+            self.assertIsNone(store.get_inbound_message(77))
 
     def test_finish_run_stores_error_message_and_latest_run_lookups(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1423,6 +1544,9 @@ class StateStoreTests(unittest.TestCase):
             self.assertEqual(store.get_runs_today(date(2026, 4, 6)), 0)
             self.assertEqual(store.increment_runs_today(date(2026, 4, 6)), 1)
             self.assertEqual(store.get_runs_today(today), 0)
+            self.assertEqual(store.decrement_runs_today(date(2026, 4, 6)), 0)
+            self.assertEqual(store.get_kv(RUNS_TODAY_KEY), "2026-04-06:0")
+            self.assertEqual(store.decrement_runs_today(date(2026, 4, 6)), 0)
             store.set_kv(RUNS_TODAY_KEY, "garbage")
             self.assertEqual(store.get_runs_today(today), 0)
 
