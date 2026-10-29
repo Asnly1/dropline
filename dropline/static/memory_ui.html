@@ -1,0 +1,880 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="dropline-token" content="__DROPLINE_TOKEN__">
+<title>dropline · 记忆管理 / Memory manager</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f3f4f6;
+    --panel: #ffffff;
+    --card: #ffffff;
+    --text: #1c2128;
+    --muted: #5f6b7a;
+    --border: #d8dee6;
+    --accent: #2458d6;
+    --accent-text: #ffffff;
+    --danger: #b3261e;
+    --danger-bg: #fdecea;
+    --ok: #1a7f37;
+    --ok-bg: #e6f4ea;
+    --warn: #8a5300;
+    --warn-bg: #fff3dc;
+    --chip: #eef1f5;
+    --well: #f0f2f5;
+    --shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1419;
+      --panel: #161c23;
+      --card: #1b222b;
+      --text: #e6e9ef;
+      --muted: #98a3b3;
+      --border: #2b3542;
+      --accent: #7aa2ff;
+      --accent-text: #0f1419;
+      --danger: #ff8a80;
+      --danger-bg: #3a1f1d;
+      --ok: #7ddc9a;
+      --ok-bg: #16301f;
+      --warn: #f5c16c;
+      --warn-bg: #3a2c12;
+      --chip: #242d38;
+      --well: #121820;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB",
+      "Microsoft YaHei", "Noto Sans CJK SC", "Helvetica Neue", Arial, sans-serif;
+    overflow-wrap: anywhere;
+  }
+  button, input, textarea { font: inherit; color: inherit; }
+  .topbar { position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--border); }
+  .topbar-inner {
+    max-width: 900px; margin: 0 auto; padding: 12px 16px;
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+  .title-block { min-width: 0; }
+  h1 { font-size: 20px; margin: 0; }
+  .subtitle { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  .topbar-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .status { max-width: 900px; margin: 0 auto; padding: 8px 16px 10px; font-size: 14px; }
+  .status.ok { color: var(--ok); }
+  .status.error { color: var(--danger); }
+  main { max-width: 900px; margin: 0 auto; padding: 16px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px; margin-bottom: 16px; box-shadow: var(--shadow);
+  }
+  .section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .section-head > div { min-width: 0; }
+  h2 { font-size: 17px; margin: 0; display: inline; }
+  .count { color: var(--muted); font-weight: normal; font-size: 14px; margin-left: 6px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 4px 0 0; }
+  .section-body { margin-top: 12px; }
+  .cards { display: grid; gap: 12px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+  .card.superseded { opacity: 0.7; }
+  .card.busy { opacity: 0.6; pointer-events: none; }
+  .card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+  .badge { font-size: 12px; line-height: 1.6; padding: 0 8px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+  .badge.active { color: var(--ok); background: var(--ok-bg); }
+  .badge.warn { color: var(--warn); background: var(--warn-bg); }
+  .badge.tomb { color: var(--danger); background: var(--danger-bg); }
+  .content { margin: 0 0 8px; font-size: 16px; white-space: pre-wrap; }
+  .field { display: flex; gap: 8px; font-size: 14px; margin: 4px 0; flex-wrap: wrap; }
+  .label { color: var(--muted); flex: 0 0 auto; }
+  .field > .label { min-width: 68px; }
+  .field > .value { flex: 1 1 200px; min-width: 0; }
+  .list { margin: 0; padding-left: 18px; }
+  .chips { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+  .chip { background: var(--chip); border-radius: 6px; padding: 0 6px; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--muted); }
+  details { font-size: 13px; color: var(--muted); margin: 6px 0 0; }
+  summary { cursor: pointer; }
+  details .field { font-size: 13px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .btn {
+    font-size: 14px; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--card); color: var(--text); cursor: pointer;
+  }
+  .btn:hover { border-color: var(--muted); }
+  .btn.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  .btn.danger { color: var(--danger); border-color: var(--danger); }
+  .btn:disabled { opacity: 0.5; cursor: default; }
+  form.card label { display: block; margin-bottom: 10px; }
+  form.card .label { display: block; margin-bottom: 4px; font-size: 13px; }
+  textarea, input[type="text"] {
+    width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text);
+  }
+  textarea { min-height: 76px; resize: vertical; }
+  .error { color: var(--danger); font-size: 14px; margin: 8px 0 0; }
+  .empty { color: var(--muted); font-size: 14px; margin: 0; }
+  .muted { color: var(--muted); }
+  .versus { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); margin: 4px 0 8px; }
+  .version { background: var(--well); border-radius: 8px; padding: 8px 10px; }
+  .version .content { font-size: 15px; margin: 2px 0 0; }
+  .columns { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  h3 { font-size: 14px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+  .footer { max-width: 900px; margin: 0 auto; padding: 0 16px 32px; color: var(--muted); font-size: 13px; }
+  @media (max-width: 640px) {
+    .versus, .columns { grid-template-columns: minmax(0, 1fr); }
+    .field > .label { min-width: 0; flex-basis: 100%; }
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="title-block">
+      <h1 id="title">记忆管理 / Memory manager</h1>
+      <p id="subtitle" class="subtitle"></p>
+    </div>
+    <div class="topbar-actions">
+      <button id="refresh-button" type="button" class="btn">刷新 / Refresh</button>
+      <button id="lang-button" type="button" class="btn">EN</button>
+    </div>
+  </div>
+  <div id="status" class="status" role="status" aria-live="polite" hidden></div>
+</header>
+<main>
+  <noscript><p class="error">This page needs JavaScript. / 这个页面需要启用 JavaScript。</p></noscript>
+  <p id="loading" class="muted">加载中… / Loading…</p>
+  <div id="sections" hidden>
+    <section class="panel" id="section-user_profile"></section>
+    <section class="panel" id="section-relationship_memory"></section>
+    <section class="panel" id="section-active_arc"></section>
+    <section class="panel" id="section-conflicts"></section>
+    <section class="panel" id="section-suppressed"></section>
+    <section class="panel" id="section-episodes"></section>
+  </div>
+</main>
+<footer id="footer" class="footer"></footer>
+<script>
+(function () {
+  "use strict";
+
+  var TOKEN = document.querySelector('meta[name="dropline-token"]').getAttribute("content");
+  var MEMORY_SECTIONS = ["user_profile", "relationship_memory", "active_arc"];
+
+  var STRINGS = {
+    zh: {
+      title: "记忆管理",
+      refresh: "刷新",
+      lang_switch: "EN",
+      load_failed: "加载失败",
+      retry: "重试",
+      network_error: "无法连接到服务（它是否已经停止？）",
+      generated_at: "数据读取于 {time}（{timezone}）",
+      section_user_profile: "用户画像",
+      hint_user_profile: "关于你的稳定事实：长期目标、核心偏好。门槛最高，生效中的条目都会进入提示词。",
+      section_relationship_memory: "关系记忆",
+      hint_relationship_memory: "你们之间的约定：称呼、共同梗、关系定义。",
+      section_active_arc: "进行中主线",
+      hint_active_arc: "最近反复出现、还没解决的事，最多 2 条。",
+      section_conflicts: "待确认的冲突",
+      hint_conflicts: "来信里与旧记忆相反的说法会先停在这里。「保留旧值」丢弃新说法；「采用新值」写入新说法，旧条目标记为已被替代。",
+      section_suppressed: "已删除的记忆（墓碑）",
+      hint_suppressed: "你删除过的记忆。只要墓碑还在，模型再提出同样的内容也不会写回。「恢复」只移除墓碑，不会把记忆加回来；需要的话再手动新增。",
+      section_episodes: "最近 {days} 天 episode",
+      hint_episodes: "pipeline 每次运行写下的短期记录，只读。",
+      episodes_user: "用户侧",
+      episodes_character: "角色侧",
+      add: "新增",
+      add_submit: "添加",
+      edit: "编辑",
+      delete: "删除",
+      save: "保存",
+      cancel: "取消",
+      keep_existing: "保留旧值",
+      take_new: "采用新值",
+      restore: "恢复",
+      content_label: "记忆内容",
+      why_label: "为什么重要（可选）",
+      why: "为什么重要",
+      evidence: "依据",
+      source_dates: "来源日期",
+      details: "详情",
+      key: "键",
+      confidence: "置信度",
+      durability: "持久度",
+      created_at: "创建于",
+      updated_at: "更新于",
+      superseded_by: "被替代为",
+      source_message_ids: "来源邮件",
+      status_active: "生效中",
+      status_superseded: "已被替代",
+      tombstone: "墓碑",
+      existing_value: "旧值",
+      new_value: "新值",
+      reason: "原因",
+      occurrence_dates: "出现日期",
+      deleted_at: "删除于",
+      deleted_from: "删除自{type}",
+      empty_memory: "还没有条目。",
+      empty_conflicts: "没有待确认的冲突。",
+      empty_suppressed: "没有已删除的记忆。",
+      empty_episodes: "最近 {days} 天没有 episode。",
+      confirm_delete: "确定删除这条记忆吗？\n\n删除后会写入一条墓碑，模型之后再提出同样的内容也不会写回；可以在「已删除的记忆」里恢复。",
+      msg_added: "已新增。",
+      msg_exists: "已有同样的记忆，没有重复添加。",
+      msg_saved: "已保存。",
+      msg_deleted: "已删除，并写入墓碑。",
+      msg_restored: "已移除墓碑。",
+      msg_resolved_keep: "已保留旧值。",
+      msg_resolved_take: "已采用新值。",
+      msg_failed: "操作失败：{error}",
+      durability_stable: "稳定",
+      durability_short: "短期",
+      durability_transient: "临时",
+      evidence_manual_entry: "手动添加",
+      evidence_manual_edit: "手动修改",
+      evidence_resolved_by_user: "由你裁决",
+      evidence_stage2_active_arc_suggestion: "Stage 2 主线建议",
+      ep_main_event: "主要事件",
+      ep_state: "状态",
+      ep_possible_needs: "可能的需要",
+      ep_summary: "摘要",
+      ep_continuity_value: "延续价值",
+      ep_observations: "Stage 1 提出的候选记忆",
+      ep_open_loops: "未了结的话题",
+      type_user_profile: "用户画像",
+      type_relationship_memory: "关系记忆",
+      type_active_arc: "进行中主线",
+      footer: "这些记忆是 profiles/characters/{character_slug}/sessions/{relationship_slug}/memory/ 下的 JSON 文件，也可以直接编辑。删除会写入 memory/suppressed.json 的墓碑。"
+    },
+    en: {
+      title: "Memory manager",
+      refresh: "Refresh",
+      lang_switch: "中文",
+      load_failed: "Failed to load",
+      retry: "Retry",
+      network_error: "Could not reach the server (has it stopped?)",
+      generated_at: "Read at {time} ({timezone})",
+      section_user_profile: "User profile",
+      hint_user_profile: "Stable facts about you: long-term goals, core preferences. Highest bar; every active entry goes into the prompts.",
+      section_relationship_memory: "Relationship memory",
+      hint_relationship_memory: "Conventions between you two: nicknames, shared in-jokes, the relationship definition.",
+      section_active_arc: "Active arc",
+      hint_active_arc: "Recurring, unresolved themes from recent letters. At most 2 entries.",
+      section_conflicts: "Pending conflicts",
+      hint_conflicts: "A letter that contradicts an existing memory is parked here. “Keep existing” drops the new statement; “Take new” writes it and marks the old entry as superseded.",
+      section_suppressed: "Deleted memories (tombstones)",
+      hint_suppressed: "Memories you deleted. While the tombstone exists, the model cannot write the same content back. “Restore” only removes the tombstone; add the memory again by hand if you want it back.",
+      section_episodes: "Episodes from the last {days} days",
+      hint_episodes: "Short-term notes the pipeline writes on each run. Read-only.",
+      episodes_user: "User side",
+      episodes_character: "Character side",
+      add: "Add",
+      add_submit: "Add entry",
+      edit: "Edit",
+      delete: "Delete",
+      save: "Save",
+      cancel: "Cancel",
+      keep_existing: "Keep existing",
+      take_new: "Take new",
+      restore: "Restore",
+      content_label: "Memory content",
+      why_label: "Why it matters (optional)",
+      why: "Why it matters",
+      evidence: "Evidence",
+      source_dates: "Source dates",
+      details: "Details",
+      key: "Key",
+      confidence: "Confidence",
+      durability: "Durability",
+      created_at: "Created",
+      updated_at: "Updated",
+      superseded_by: "Superseded by",
+      source_message_ids: "Source mail",
+      status_active: "active",
+      status_superseded: "superseded",
+      tombstone: "tombstone",
+      existing_value: "Existing",
+      new_value: "New",
+      reason: "Reason",
+      occurrence_dates: "Seen on",
+      deleted_at: "Deleted",
+      deleted_from: "deleted from {type}",
+      empty_memory: "No entries yet.",
+      empty_conflicts: "No pending conflicts.",
+      empty_suppressed: "No deleted memories.",
+      empty_episodes: "No episodes in the last {days} days.",
+      confirm_delete: "Delete this memory?\n\nA tombstone will be written so the model cannot write the same content back. You can restore it under “Deleted memories”.",
+      msg_added: "Added.",
+      msg_exists: "The same memory already exists; nothing was added.",
+      msg_saved: "Saved.",
+      msg_deleted: "Deleted; a tombstone was written.",
+      msg_restored: "Tombstone removed.",
+      msg_resolved_keep: "Kept the existing value.",
+      msg_resolved_take: "Took the new value.",
+      msg_failed: "Request failed: {error}",
+      durability_stable: "stable",
+      durability_short: "short",
+      durability_transient: "transient",
+      evidence_manual_entry: "manual entry",
+      evidence_manual_edit: "manual edit",
+      evidence_resolved_by_user: "resolved by you",
+      evidence_stage2_active_arc_suggestion: "Stage 2 active arc suggestion",
+      ep_main_event: "Main event",
+      ep_state: "State",
+      ep_possible_needs: "Possible needs",
+      ep_summary: "Summary",
+      ep_continuity_value: "Continuity value",
+      ep_observations: "Candidate memories proposed by Stage 1",
+      ep_open_loops: "Open loops",
+      type_user_profile: "user profile",
+      type_relationship_memory: "relationship memory",
+      type_active_arc: "active arc",
+      footer: "These memories are the JSON files under profiles/characters/{character_slug}/sessions/{relationship_slug}/memory/ and can also be edited directly. Deleting writes a tombstone to memory/suppressed.json."
+    }
+  };
+
+  var EVIDENCE_KEYS = {
+    "manual entry": "evidence_manual_entry",
+    "manual edit": "evidence_manual_edit",
+    "resolved by user": "evidence_resolved_by_user",
+    "stage2 active arc suggestion": "evidence_stage2_active_arc_suggestion"
+  };
+
+  var lang = "zh";
+  var overview = null;
+  var openAddForms = {};
+  var statusTimer = null;
+
+  function t(key, vars) {
+    var table = STRINGS[lang] || STRINGS.en;
+    var text = Object.prototype.hasOwnProperty.call(table, key) ? table[key] : STRINGS.en[key];
+    if (text === undefined) { text = key; }
+    if (vars) {
+      Object.keys(vars).forEach(function (name) {
+        text = text.split("{" + name + "}").join(String(vars[name]));
+      });
+    }
+    return text;
+  }
+
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (name) {
+        var value = attrs[name];
+        if (value === undefined || value === null || value === false) { return; }
+        if (name === "class") { node.className = value; }
+        else if (name === "text") { node.textContent = value; }
+        else if (name.indexOf("on") === 0) { node.addEventListener(name.slice(2), value); }
+        else if (value === true) { node.setAttribute(name, ""); }
+        else { node.setAttribute(name, value); }
+      });
+    }
+    appendAll(node, children);
+    return node;
+  }
+
+  function appendAll(node, children) {
+    if (children === undefined || children === null) { return node; }
+    var items = Array.isArray(children) ? children : [children];
+    items.forEach(function (child) {
+      if (child === undefined || child === null || child === false) { return; }
+      node.appendChild(typeof child === "string" ? document.createTextNode(child) : child);
+    });
+    return node;
+  }
+
+  function setChildren(node, children) {
+    while (node.firstChild) { node.removeChild(node.firstChild); }
+    return appendAll(node, children);
+  }
+
+  function api(method, path, body) {
+    var headers = { "Accept": "application/json" };
+    var options = { method: method, headers: headers, cache: "no-store", credentials: "omit" };
+    if (method !== "GET") {
+      headers["X-Dropline-Token"] = TOKEN;
+      headers["Content-Type"] = "application/json";
+      options.body = JSON.stringify(body === undefined ? {} : body);
+    }
+    return fetch(path, options).then(function (response) {
+      return response.json().catch(function () { return null; }).then(function (payload) {
+        if (!response.ok) {
+          throw new Error((payload && payload.error) || (response.status + " " + response.statusText));
+        }
+        return payload;
+      });
+    }, function () {
+      throw new Error(t("network_error"));
+    });
+  }
+
+  function showStatus(text, kind) {
+    var box = document.getElementById("status");
+    box.textContent = text;
+    box.className = "status " + kind;
+    box.hidden = false;
+    clearTimeout(statusTimer);
+    if (kind === "ok") {
+      statusTimer = setTimeout(function () { box.hidden = true; }, 4000);
+    }
+  }
+
+  function showError(node, message) {
+    node.textContent = message;
+    node.hidden = false;
+  }
+
+  function setBusy(card, busy) {
+    card.classList.toggle("busy", busy);
+    Array.prototype.forEach.call(card.querySelectorAll("button"), function (button) { button.disabled = busy; });
+  }
+
+  function isActive(entry) {
+    return !entry.status || entry.status === "active";
+  }
+
+  function shortTime(value) {
+    if (!value) { return ""; }
+    return String(value).slice(0, 16).replace("T", " ");
+  }
+
+  function typeLabel(memoryType) {
+    var key = "type_" + memoryType;
+    return STRINGS.en[key] ? t(key) : memoryType;
+  }
+
+  function evidenceLabel(item) {
+    var key = EVIDENCE_KEYS[item];
+    return key ? t(key) : item;
+  }
+
+  function durabilityLabel(value) {
+    var key = "durability_" + value;
+    return STRINGS.en[key] ? t(key) : value;
+  }
+
+  function field(label, valueNode) {
+    return el("div", { "class": "field" }, [
+      el("span", { "class": "label", text: label }),
+      el("span", { "class": "value" }, valueNode)
+    ]);
+  }
+
+  function chips(values) {
+    return el("span", { "class": "chips" }, (values || []).filter(Boolean).map(function (value) {
+      return el("span", { "class": "chip", text: String(value) });
+    }));
+  }
+
+  function textList(values) {
+    return el("ul", { "class": "list" }, (values || []).map(function (value) {
+      return el("li", { text: typeof value === "string" ? value : JSON.stringify(value) });
+    }));
+  }
+
+  function sectionHeader(title, hint, count, action) {
+    return el("div", { "class": "section-head" }, [
+      el("div", {}, [
+        el("h2", { text: title }),
+        count === undefined ? null : el("span", { "class": "count", text: String(count) }),
+        hint ? el("p", { "class": "hint", text: hint }) : null
+      ]),
+      action || null
+    ]);
+  }
+
+  function emptyNote(text) {
+    return el("p", { "class": "empty", text: text });
+  }
+
+  // ------------------------------------------------------------------ memory sections
+
+  function renderMemorySection(fileKey) {
+    var section = document.getElementById("section-" + fileKey);
+    var entries = (overview.memory[fileKey] || []).slice();
+    entries.sort(function (left, right) { return (isActive(left) ? 0 : 1) - (isActive(right) ? 0 : 1); });
+    var activeCount = entries.filter(isActive).length;
+    var addButton = el("button", {
+      type: "button", "class": "btn primary", text: "+ " + t("add"),
+      onclick: function () {
+        openAddForms[fileKey] = !openAddForms[fileKey];
+        renderMemorySection(fileKey);
+      }
+    });
+    setChildren(section, [
+      sectionHeader(t("section_" + fileKey), t("hint_" + fileKey), activeCount, addButton),
+      el("div", { "class": "section-body" }, [
+        openAddForms[fileKey] ? addForm(fileKey) : null,
+        entries.length
+          ? el("div", { "class": "cards" }, entries.map(function (entry) { return entryCard(fileKey, entry); }))
+          : emptyNote(t("empty_memory"))
+      ])
+    ]);
+  }
+
+  function entryCard(fileKey, entry) {
+    var status = isActive(entry) ? "active" : "superseded";
+    var card = el("article", { "class": "card" + (status === "superseded" ? " superseded" : "") });
+    var error = el("p", { "class": "error", hidden: true });
+    appendAll(card, [
+      el("div", { "class": "card-head" }, [
+        el("span", { "class": "badge " + status, text: t("status_" + status) }),
+        el("span", { "class": "mono", text: entry.key })
+      ]),
+      el("p", { "class": "content", text: entry.content }),
+      entry.why_it_matters ? field(t("why"), entry.why_it_matters) : null,
+      entry.evidence && entry.evidence.length ? field(t("evidence"), textList(entry.evidence.map(evidenceLabel))) : null,
+      entry.source_dates && entry.source_dates.length ? field(t("source_dates"), chips(entry.source_dates)) : null,
+      entryDetails(entry),
+      el("div", { "class": "actions" }, [
+        el("button", {
+          type: "button", "class": "btn", text: t("edit"),
+          onclick: function () { card.replaceWith(editForm(fileKey, entry)); }
+        }),
+        el("button", {
+          type: "button", "class": "btn danger", text: t("delete"),
+          onclick: function () { deleteEntry(fileKey, entry, card, error); }
+        })
+      ]),
+      error
+    ]);
+    return card;
+  }
+
+  function entryDetails(entry) {
+    var rows = [
+      field(t("confidence"), String(entry.confidence)),
+      field(t("durability"), durabilityLabel(entry.durability)),
+      field(t("created_at"), shortTime(entry.created_at)),
+      field(t("updated_at"), shortTime(entry.updated_at))
+    ];
+    if (entry.superseded_by) { rows.push(field(t("superseded_by"), el("span", { "class": "mono", text: entry.superseded_by }))); }
+    if (entry.source_message_ids && entry.source_message_ids.length) {
+      rows.push(field(t("source_message_ids"), textList(entry.source_message_ids)));
+    }
+    return el("details", {}, [el("summary", { text: t("details") })].concat(rows));
+  }
+
+  function memoryForm(fileKey, entry) {
+    var isEdit = Boolean(entry);
+    var form = el("form", { "class": "card" });
+    var contentInput = el("textarea", { required: true, rows: "3" });
+    var whyInput = el("input", { type: "text" });
+    var error = el("p", { "class": "error", hidden: true });
+    contentInput.value = isEdit ? entry.content : "";
+    whyInput.value = isEdit && entry.why_it_matters ? entry.why_it_matters : "";
+    appendAll(form, [
+      el("label", {}, [el("span", { "class": "label", text: t("content_label") }), contentInput]),
+      el("label", {}, [el("span", { "class": "label", text: t("why_label") }), whyInput]),
+      el("div", { "class": "actions" }, [
+        el("button", { type: "submit", "class": "btn primary", text: isEdit ? t("save") : t("add_submit") }),
+        el("button", {
+          type: "button", "class": "btn", text: t("cancel"),
+          onclick: function () {
+            if (isEdit) { form.replaceWith(entryCard(fileKey, entry)); }
+            else { openAddForms[fileKey] = false; renderMemorySection(fileKey); }
+          }
+        })
+      ]),
+      error
+    ]);
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      error.hidden = true;
+      var body = {};
+      if (isEdit) {
+        if (contentInput.value.trim() !== entry.content) { body.content = contentInput.value; }
+        if (whyInput.value.trim() !== (entry.why_it_matters || "")) { body.why_it_matters = whyInput.value; }
+        if (!Object.keys(body).length) { form.replaceWith(entryCard(fileKey, entry)); return; }
+      } else {
+        body.content = contentInput.value;
+        body.why_it_matters = whyInput.value;
+      }
+      setBusy(form, true);
+      var request = isEdit
+        ? api("PUT", "/api/memory/" + encodeURIComponent(fileKey) + "/" + encodeURIComponent(entry.key), body)
+        : api("POST", "/api/memory/" + encodeURIComponent(fileKey), body);
+      request.then(function (result) {
+        if (isEdit) { showStatus(t("msg_saved"), "ok"); }
+        else { showStatus(t(result && result.created === false ? "msg_exists" : "msg_added"), "ok"); openAddForms[fileKey] = false; }
+        return refresh(isEdit ? [fileKey] : [fileKey, "suppressed"]);
+      }).catch(function (err) {
+        showError(error, t("msg_failed", { error: err.message }));
+        setBusy(form, false);
+      });
+    });
+    if (!isEdit) { setTimeout(function () { contentInput.focus(); }, 0); }
+    return form;
+  }
+
+  function addForm(fileKey) { return memoryForm(fileKey, null); }
+  function editForm(fileKey, entry) { return memoryForm(fileKey, entry); }
+
+  function deleteEntry(fileKey, entry, card, error) {
+    if (!window.confirm(t("confirm_delete"))) { return; }
+    error.hidden = true;
+    setBusy(card, true);
+    api("DELETE", "/api/memory/" + encodeURIComponent(fileKey) + "/" + encodeURIComponent(entry.key)).then(function () {
+      showStatus(t("msg_deleted"), "ok");
+      return refresh([fileKey, "suppressed"]);
+    }).catch(function (err) {
+      showError(error, t("msg_failed", { error: err.message }));
+      setBusy(card, false);
+    });
+  }
+
+  // ------------------------------------------------------------------ conflicts
+
+  function renderConflicts() {
+    var section = document.getElementById("section-conflicts");
+    var conflicts = overview.conflicts || [];
+    setChildren(section, [
+      sectionHeader(t("section_conflicts"), t("hint_conflicts"), conflicts.length),
+      el("div", { "class": "section-body" }, [
+        conflicts.length ? el("div", { "class": "cards" }, conflicts.map(conflictCard)) : emptyNote(t("empty_conflicts"))
+      ])
+    ]);
+  }
+
+  function conflictCard(note) {
+    var card = el("article", { "class": "card" });
+    var error = el("p", { "class": "error", hidden: true });
+    var dates = note.occurrence_dates && note.occurrence_dates.length ? note.occurrence_dates : [note.source_date];
+    appendAll(card, [
+      el("div", { "class": "card-head" }, [
+        el("span", { "class": "badge warn", text: typeLabel(note.memory_type) }),
+        el("span", { "class": "mono", text: note.key })
+      ]),
+      el("div", { "class": "versus" }, [
+        el("div", { "class": "version" }, [
+          el("span", { "class": "label", text: t("existing_value") }),
+          el("p", { "class": "content", text: note.existing_content })
+        ]),
+        el("div", { "class": "version" }, [
+          el("span", { "class": "label", text: t("new_value") }),
+          el("p", { "class": "content", text: note.new_content })
+        ])
+      ]),
+      note.reason ? field(t("reason"), note.reason) : null,
+      field(t("occurrence_dates"), chips(dates)),
+      note.source_message_ids && note.source_message_ids.length
+        ? el("details", {}, [el("summary", { text: t("source_message_ids") }), textList(note.source_message_ids)])
+        : null,
+      el("div", { "class": "actions" }, [
+        el("button", {
+          type: "button", "class": "btn", text: t("keep_existing"),
+          onclick: function () { resolveConflict(note, "keep_existing", card, error); }
+        }),
+        el("button", {
+          type: "button", "class": "btn primary", text: t("take_new"),
+          onclick: function () { resolveConflict(note, "take_new", card, error); }
+        })
+      ]),
+      error
+    ]);
+    return card;
+  }
+
+  function resolveConflict(note, choice, card, error) {
+    error.hidden = true;
+    setBusy(card, true);
+    api("POST", "/api/conflicts/" + encodeURIComponent(note.key), { choice: choice }).then(function () {
+      showStatus(t(choice === "take_new" ? "msg_resolved_take" : "msg_resolved_keep"), "ok");
+      var sections = ["conflicts"];
+      if (MEMORY_SECTIONS.indexOf(note.memory_type) >= 0) { sections.push(note.memory_type); }
+      return refresh(sections);
+    }).catch(function (err) {
+      showError(error, t("msg_failed", { error: err.message }));
+      setBusy(card, false);
+    });
+  }
+
+  // ------------------------------------------------------------------ tombstones
+
+  function renderSuppressed() {
+    var section = document.getElementById("section-suppressed");
+    var items = overview.suppressed || [];
+    setChildren(section, [
+      sectionHeader(t("section_suppressed"), t("hint_suppressed"), items.length),
+      el("div", { "class": "section-body" }, [
+        items.length ? el("div", { "class": "cards" }, items.map(suppressedCard)) : emptyNote(t("empty_suppressed"))
+      ])
+    ]);
+  }
+
+  function reasonLabel(reason) {
+    var match = /^deleted from (\w+)$/.exec(reason || "");
+    return match ? t("deleted_from", { type: typeLabel(match[1]) }) : reason;
+  }
+
+  function suppressedCard(item) {
+    var card = el("article", { "class": "card" });
+    var error = el("p", { "class": "error", hidden: true });
+    appendAll(card, [
+      el("div", { "class": "card-head" }, [
+        el("span", { "class": "badge tomb", text: t("tombstone") }),
+        el("span", { "class": "mono", text: item.key })
+      ]),
+      el("p", { "class": "content", text: item.content }),
+      item.reason ? field(t("reason"), reasonLabel(item.reason)) : null,
+      item.created_at ? field(t("deleted_at"), shortTime(item.created_at)) : null,
+      el("div", { "class": "actions" }, [
+        el("button", {
+          type: "button", "class": "btn", text: t("restore"),
+          onclick: function () { restoreEntry(item, card, error); }
+        })
+      ]),
+      error
+    ]);
+    return card;
+  }
+
+  function restoreEntry(item, card, error) {
+    error.hidden = true;
+    setBusy(card, true);
+    api("DELETE", "/api/suppressed/" + encodeURIComponent(item.key)).then(function () {
+      showStatus(t("msg_restored"), "ok");
+      return refresh(["suppressed"]);
+    }).catch(function (err) {
+      showError(error, t("msg_failed", { error: err.message }));
+      setBusy(card, false);
+    });
+  }
+
+  // ------------------------------------------------------------------ episodes (read-only)
+
+  function renderEpisodes() {
+    var section = document.getElementById("section-episodes");
+    var days = overview.episode_days || 7;
+    setChildren(section, [
+      sectionHeader(t("section_episodes", { days: days }), t("hint_episodes")),
+      el("div", { "class": "section-body columns" }, [
+        episodeColumn(t("episodes_user"), overview.recent_user_episodes || [], days),
+        episodeColumn(t("episodes_character"), overview.recent_character_episodes || [], days)
+      ])
+    ]);
+  }
+
+  function episodeColumn(title, records, days) {
+    return el("div", {}, [
+      el("h3", { text: title }),
+      records.length ? el("div", { "class": "cards" }, records.map(episodeCard)) : emptyNote(t("empty_episodes", { days: days }))
+    ]);
+  }
+
+  function episodeLabel(key) {
+    var stringKey = "ep_" + key;
+    return STRINGS.en[stringKey] ? t(stringKey) : key;
+  }
+
+  function episodeValue(value) {
+    if (Array.isArray(value)) { return value.length ? textList(value) : el("span", { "class": "muted", text: "—" }); }
+    if (value && typeof value === "object") { return el("pre", { "class": "content", text: JSON.stringify(value, null, 2) }); }
+    return String(value);
+  }
+
+  function episodeCard(record) {
+    var card = el("article", { "class": "card" });
+    var episode = record.episode || {};
+    appendAll(card, [
+      el("div", { "class": "card-head" }, [
+        el("span", { "class": "badge", text: record.date }),
+        record.source_dates && record.source_dates.length
+          ? el("span", { "class": "mono", text: t("source_dates") + ": " + record.source_dates.join(", ") })
+          : null
+      ])
+    ]);
+    Object.keys(episode).forEach(function (key) {
+      card.appendChild(field(episodeLabel(key), episodeValue(episode[key])));
+    });
+    if (record.memory_observations && record.memory_observations.length) {
+      card.appendChild(field(t("ep_observations"), textList(record.memory_observations.map(function (item) {
+        if (!item || typeof item !== "object") { return String(item); }
+        return (item.type ? "[" + typeLabel(item.type) + "] " : "") + (item.content || "");
+      }))));
+    }
+    if (record.open_loops && record.open_loops.length) {
+      card.appendChild(field(t("ep_open_loops"), textList(record.open_loops)));
+    }
+    return card;
+  }
+
+  // ------------------------------------------------------------------ page
+
+  function renderHeader() {
+    var session = overview.session;
+    document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+    document.title = session.character_name + " · " + session.relationship_name + " · " + t("title");
+    document.getElementById("title").textContent = t("title");
+    document.getElementById("subtitle").textContent =
+      session.character_name + " · " + session.relationship_name +
+      " (" + session.character_slug + " / " + session.relationship_slug + ") · " +
+      t("generated_at", { time: shortTime(overview.generated_at), timezone: overview.timezone || "" });
+    document.getElementById("refresh-button").textContent = t("refresh");
+    document.getElementById("lang-button").textContent = t("lang_switch");
+    document.getElementById("footer").textContent = t("footer", {
+      character_slug: session.character_slug,
+      relationship_slug: session.relationship_slug
+    });
+  }
+
+  var RENDERERS = {
+    header: renderHeader,
+    user_profile: function () { renderMemorySection("user_profile"); },
+    relationship_memory: function () { renderMemorySection("relationship_memory"); },
+    active_arc: function () { renderMemorySection("active_arc"); },
+    conflicts: renderConflicts,
+    suppressed: renderSuppressed,
+    episodes: renderEpisodes
+  };
+
+  function renderAll() {
+    Object.keys(RENDERERS).forEach(function (name) { RENDERERS[name](); });
+  }
+
+  function refresh(sections) {
+    return api("GET", "/api/overview").then(function (payload) {
+      overview = payload;
+      if (!sections) { renderAll(); return; }
+      renderHeader();
+      sections.forEach(function (name) { if (RENDERERS[name]) { RENDERERS[name](); } });
+    }, function (err) {
+      showStatus(t("load_failed") + ": " + err.message, "error");
+    });
+  }
+
+  function init() {
+    var loading = document.getElementById("loading");
+    document.getElementById("refresh-button").addEventListener("click", function () { refresh(); });
+    document.getElementById("lang-button").addEventListener("click", function () {
+      lang = lang === "zh" ? "en" : "zh";
+      if (overview) { renderAll(); }
+    });
+    api("GET", "/api/overview").then(function (payload) {
+      overview = payload;
+      lang = overview.language === "简体中文" ? "zh" : "en";
+      loading.hidden = true;
+      document.getElementById("sections").hidden = false;
+      renderAll();
+    }, function (err) {
+      setChildren(loading, [
+        el("span", { "class": "error", text: "加载失败 / Failed to load: " + err.message + " " }),
+        el("button", { type: "button", "class": "btn", text: "重试 / Retry", onclick: init })
+      ]);
+    });
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>

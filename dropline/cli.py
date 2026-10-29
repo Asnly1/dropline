@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence, TextIO
 
-from . import init_state, install_scheduler, profiles, reset_dev_state, run_once, scheduler_tick, stale_runs, uninstall_scheduler
+from . import init_state, install_scheduler, memory_ui, profiles, reset_dev_state, run_once, scheduler_tick, stale_runs, uninstall_scheduler
 from .config import load_settings, resolve_repo_root_from_config
 from .scheduler_support import DEFAULT_SCHEDULER_TASK_NAME
 from .profile_manager import (
@@ -265,6 +265,15 @@ def _handle_mark_stale_runs_failed(args: argparse.Namespace) -> int:
     )
 
 
+def _handle_memory_ui(args: argparse.Namespace) -> int:
+    return memory_ui.memory_ui_command(
+        args.config,
+        host=args.host,
+        port=int(args.port),
+        open_browser=not args.no_browser,
+    )
+
+
 def _validate_delete_inbound_args(args: argparse.Namespace) -> None:
     has_uid = not _is_blank(getattr(args, "uid", None))
     has_all = bool(getattr(args, "all", False))
@@ -305,6 +314,18 @@ def _validate_positive_limit_args(args: argparse.Namespace) -> None:
     if parsed <= 0:
         raise CLIArgumentError("--limit must be a positive integer")
     args.limit = str(parsed)
+
+
+def _validate_memory_ui_args(args: argparse.Namespace) -> None:
+    if _is_blank(args.host):
+        raise CLIArgumentError("--host must not be empty")
+    try:
+        parsed = int(str(args.port))
+    except ValueError as exc:
+        raise CLIArgumentError("--port must be an integer between 0 and 65535") from exc
+    if parsed < 0 or parsed > 65535:
+        raise CLIArgumentError("--port must be an integer between 0 and 65535")
+    args.port = str(parsed)
 
 
 YES_OPTION = OptionSpec(("--yes",), "yes", "Skip interactive confirmation", default=False, action="store_true")
@@ -659,6 +680,30 @@ COMMAND_SPECS = (
             YES_OPTION,
         ),
         confirm_message="Reset local runtime state?",
+    ),
+    CommandSpec(
+        name="memory-ui",
+        help="Open a local web page to view and edit the active session's memory.",
+        handler=_handle_memory_ui,
+        options=(
+            OptionSpec(("--config",), "config", "Path to config.yaml", default="config.yaml", metavar="PATH"),
+            OptionSpec(("--host",), "host", "Address to listen on", default=memory_ui.DEFAULT_HOST, metavar="HOST"),
+            OptionSpec(
+                ("--port",),
+                "port",
+                "Port to listen on (0 picks a free port)",
+                default=memory_ui.DEFAULT_PORT,
+                metavar="PORT",
+            ),
+            OptionSpec(
+                ("--no-browser",),
+                "no_browser",
+                "Do not open the page in a browser",
+                default=False,
+                action="store_true",
+            ),
+        ),
+        validator=_validate_memory_ui_args,
     ),
 )
 
