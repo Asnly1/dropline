@@ -234,6 +234,32 @@ def _collect_translatable_fields(
     return []
 
 
+def _restore_verbatim_fields(original: dict[str, Any], repaired: dict[str, Any]) -> dict[str, Any]:
+    """Copy the verbatim fields of each candidate memory back after a language repair pass.
+
+    The repair prompt is told to leave `evidence` alone, but a model may still translate it;
+    a translated quote would later fail the grounding check against the inbound mail.
+    """
+    source = original.get("candidate_memories")
+    target = repaired.get("candidate_memories")
+    if not isinstance(source, list) or not isinstance(target, list):
+        return repaired
+    if len(source) != len(target):
+        LOGGER.warning(
+            "Language repair changed the number of candidate memories (%s -> %s); verbatim fields were not restored.",
+            len(source),
+            len(target),
+        )
+        return repaired
+    for original_item, repaired_item in zip(source, target):
+        if not isinstance(original_item, dict) or not isinstance(repaired_item, dict):
+            continue
+        for key in VERBATIM_FIELD_NAMES:
+            if key in original_item:
+                repaired_item[key] = original_item[key]
+    return repaired
+
+
 def _english_field_violates_requirement(value: str) -> bool:
     stripped = value.strip()
     if not stripped:
@@ -497,7 +523,7 @@ class StructuredJSONClient(TextOnlyBackedClient):
                 f"Structured output for schema '{task.schema_name}' could not be repaired to target language "
                 f"'{self.settings.llm.language}'. Sample mismatches: {sample}"
             )
-        return repaired
+        return _restore_verbatim_fields(output, repaired)
 
     def _complete_json(
         self,

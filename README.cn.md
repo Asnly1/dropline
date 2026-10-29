@@ -264,12 +264,12 @@ session 的记忆分 6 类,Stage 1 只负责**提议**,代码负责**裁决**是
 
 这些记忆文件和 episode 都是纯 JSON 数组,UTF-8 纯文本,可直接打开手工编辑;pipeline 每次运行后会重写它们。
 
-晋升门槛由代码执行,不信任模型的自评分数:
+晋升门槛由代码执行,模型自报的 confidence / durability 只是必要条件,不是充分条件:
 
-- 候选记忆的 `evidence` 必须能在来信正文里逐字找到;找不到的候选只留在 episode,不进长期记忆。
-- 用户在信里明确说"记住"、"别忘了"、"以后叫我……"的内容当封即可写入;其余内容必须在至少 2 个不同的来信日期出现过(按邮件 Date 头算,同一天多封不算)。
-- 每封信最多新增 2 条 user_profile、1 条 relationship_memory、1 条 active_arc;content 带"今天、这周"之类措辞的不进 user_profile。
-- 与旧记忆相反的说法先进 conflict_notes。用户在信里明确更正("我说错了"、"其实……")会立即覆盖;否则要在第 2 个不同日期再次出现才覆盖。被覆盖的旧条目保留在文件里并标记 `status: superseded`,不再进入提示词。
+- 候选记忆的 `evidence` 必须能在来信正文里找到:归一化后原样包含,或与某一句近乎逐字(字符 3-gram 覆盖率 ≥ 0.8 且否定状态一致,所以漏掉"不"的改写不算);少于 4 个汉字或 2 个英文单词的引用不算。找不到的候选只留在 episode,不进长期记忆。
+- 用户在信里明确要求("记住……"、"别忘了……"、"以后叫我……"、"remember …")且该句引用了这条内容,当封即可写入;"不要记住"、"我记得小时候"这类不算。其余内容必须在至少 2 个不同的来信日期被提到(按证据所在那封信的 Date 头算,同一天多封不算,一批里混了多天的信也只算证据所在的那封)。
+- transient 的候选永远不写;user_profile 还要求 confidence ≥ 0.85 且 durability 为 stable,relationship_memory 要求 confidence ≥ 0.8;除非用户明确要求,content 带"今天、这周"之类措辞的不进 user_profile。每封信最多新增 2 条 user_profile、1 条 relationship_memory、1 条 active_arc。
+- 与旧记忆相反的说法先进 conflict_notes(否定词映射覆盖 喜欢/不喜欢、是/不是、有/没有、希望/不希望、会/不会、不再、从不 以及英文 not / never / no longer / doesn't 等)。用户在信里明确更正("我说错了"、"更正一下"、"不是……而是……";"其实"只在同句带否定或回指"之前/上次"时算)会立即覆盖;否则要在第 2 个不同日期再次出现才覆盖。被覆盖的旧条目保留在文件里并标记 `status: superseded`,不再进入提示词。
 - 你手动删除的记忆会记入 `memory/suppressed.json`,模型之后再提出同样内容也不会写回。
 
 完整规则见 [docs/memory_promotion_rules.md](docs/memory_promotion_rules.md)。

@@ -46,7 +46,7 @@ Only when at least one of the following is true:
 - Similar information appears independently on at least 2 different dates.
 - It clearly affects future letter style or advice.
 - The user explicitly asks the system to remember it.
-- Current implementation: the code accepts only two kinds of evidence: an explicit request in the user's own words ("remember", "don't forget", "call me …"), or the same content mentioned on at least 2 distinct mail dates (by the mail Date header). The `evidence` must be found verbatim in the mail body, otherwise nothing is written; content phrased about "today" or "this week" is not written.
+- Current implementation: the code accepts only two kinds of evidence: an explicit request ("remember", "don't forget", "call me …") in a sentence of the user's own words that quotes this content ("don't remember" and "I remember when …" do not count), or the same content mentioned on at least 2 distinct mail dates (by the Date header of the letter the evidence was found in). The `evidence` must be found in the mail body (contained as-is, or near-verbatim within one sentence with the same negation state; quotes shorter than 4 CJK characters or 2 words never count), otherwise nothing is written; transient candidates are not written; unless the user explicitly asked, content phrased about "today" or "this week" is not written; neither is a candidate with confidence < 0.85 or a durability other than stable.
 
 ### 4.2 Write to `relationship.md`
 
@@ -97,7 +97,7 @@ Examples:
   - The user explicitly corrects it.
   - The new information appears repeatedly on at least 2 different dates.
   - The new information is clearly more specific, and the old value has not been reconfirmed for a long time.
-- Current implementation: two override paths are automated: an explicit correction in the user's own words ("I misspoke", "actually", "correction") that conflicts with an existing memory replaces it at once; otherwise the same `conflict_note` must accumulate 2 distinct mail dates. The replaced entry is kept and marked `status: superseded`, and the conflict note is cleared. The "more specific" path is not automated. Conflict detection relies on a negation map (like/dislike, is/is not, has/has no, no longer, never, and the English not / never / no longer forms).
+- Current implementation: two override paths are automated: an explicit correction in the user's own words ("I misspoke", "correction", "not … but …"; "actually" only together with a negation or a reference to an earlier letter) in a sentence that quotes the new content, when the new content itself passes the gates, replaces the conflicting memory at once; otherwise the same `conflict_note` must accumulate 2 distinct mail dates. The replaced entry is kept and marked `status: superseded`, and the conflict note is cleared. The "more specific" path is not automated. Conflict detection relies on a negation map (like/dislike, is/is not, has/has no, hope/do not hope, can/cannot, no longer, never, and the English not / never / no longer / doesn't forms, with likes/like word forms folded); transient or low-confidence candidates can never trigger an override.
 
 ## 7. Quantity Limits
 

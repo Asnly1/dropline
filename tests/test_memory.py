@@ -1028,5 +1028,172 @@ class MemoryManagerTests(unittest.TestCase):
             self.assertEqual(retired["superseded_by"], revived["key"])
 
 
+    def test_transient_or_low_confidence_candidate_cannot_override_stable_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+
+            self._write(manager, self._stage1_with(self._candidate("用户喜欢吃辣的东西", "我喜欢吃辣的东西")), batch_id="batch-1", date="2026-03-31", texts=["记住，我喜欢吃辣的东西。"])
+            weak = self._candidate("用户不喜欢吃辣的东西", "我今天不想吃辣的东西", confidence=0.3, durability="transient", source_date="2026-04-01")
+            self._write(manager, self._stage1_with(weak), batch_id="batch-2", date="2026-04-01", texts=["其实我今天不想吃辣的东西。"])
+
+            entries = load_entries(settings.documents.user_profile)
+            self.assertEqual(_active_contents(entries), ["用户喜欢吃辣的东西"])
+            self.assertEqual([item["status"] for item in entries], ["active"])
+            self.assertEqual(load_entries(settings.documents.conflict_notes), [])
+
+    def test_batch_spanning_several_dates_counts_only_the_letter_holding_the_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            stage1 = self._stage1_with(self._candidate("用户容易疲劳", "我容易疲劳"))
+
+            manager.write_user_side(
+                stage1_result=stage1,
+                batch_id="batch-1",
+                now=datetime(2026, 4, 1, 22, 0, tzinfo=ZoneInfo("America/Los_Angeles")),
+                source_message_ids=["<a@example.com>", "<b@example.com>"],
+                source_dates=["2026-03-31", "2026-04-01"],
+                inbound_texts=["我容易疲劳。", "今天天气不错。"],
+            )
+
+            self.assertEqual(load_entries(settings.documents.user_profile), [])
+
+    def test_english_request_detection_splits_sentences_on_periods(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            stage1 = self._stage1_with(
+                self._candidate("The user is allergic to peanuts", "I'm allergic to peanuts"),
+                self._candidate("The user lives in Boston", "I moved to Boston last year", confidence=0.9),
+            )
+
+            self._write(manager, stage1, batch_id="batch-1", date="2026-03-31", texts=["Remember that I'm allergic to peanuts. By the way, I moved to Boston last year."])
+
+            self.assertEqual(_active_contents(load_entries(settings.documents.user_profile)), ["The user is allergic to peanuts"])
+
+    def test_paraphrase_that_drops_a_negation_is_not_grounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+
+            self._write(manager, self._stage1_with(self._candidate("用户喜欢猫和狗还有兔子", "我喜欢猫和狗还有兔子")), batch_id="batch-1", date="2026-03-31", texts=["记住，我不喜欢猫和狗还有兔子。"])
+            self._write(manager, self._stage1_with(self._candidate("The user likes cats", "I like cats")), batch_id="batch-2", date="2026-03-31", texts=["Remember, I don't like cats."])
+
+            self.assertEqual(load_entries(settings.documents.user_profile), [])
+
+    def test_negated_or_narrative_remember_is_not_an_explicit_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+
+            self._write(manager, self._stage1_with(self._candidate("用户是左撇子", "我是左撇子")), batch_id="batch-1", date="2026-03-31", texts=["不要记住我是左撇子这件事。"])
+            self._write(manager, self._stage1_with(self._candidate("用户住在上海", "我现在住在上海")), batch_id="batch-2", date="2026-03-31", texts=["我记得小时候我们常去河边玩，我现在住在上海。"])
+            self._write(manager, self._stage1_with(self._candidate("The user works at a bank", "I work at a bank")), batch_id="batch-3", date="2026-03-31", texts=["I don't remember if I told you, but I work at a bank."])
+            self._write(manager, self._stage1_with(self._candidate("The user got promoted to manager", "I just got promoted to manager")), batch_id="batch-4", date="2026-03-31", texts=["Call me when you are free, I just got promoted to manager!"])
+
+            self.assertEqual(load_entries(settings.documents.user_profile), [])
+
+    def test_very_short_evidence_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+
+            self._write(manager, self._stage1_with(self._candidate("用户是亿万富翁", "猫")), batch_id="batch-1", date="2026-03-31", texts=["记住，我家的猫叫团子。"])
+
+            self.assertEqual(load_entries(settings.documents.user_profile), [])
+
+    def test_english_do_support_negation_is_a_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+
+            self._write(manager, self._stage1_with(self._candidate("The user likes cats", "I like cats")), batch_id="batch-1", date="2026-03-31", texts=["Remember, I like cats."])
+            self._write(manager, self._stage1_with(self._candidate("The user doesn't like cats", "I don't like cats", source_date="2026-04-01")), batch_id="batch-2", date="2026-04-01", texts=["Remember, I don't like cats."])
+
+            self.assertEqual(_active_contents(load_entries(settings.documents.user_profile)), ["The user likes cats"])
+            self.assertEqual(len(load_entries(settings.documents.conflict_notes)), 1)
+
+    def test_chinese_hope_negation_is_a_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            wanted = self._candidate("用户希望被称呼为小鱼", "以后就叫我小鱼吧", memory_type="relationship_memory", confidence=0.9)
+            unwanted = self._candidate("用户不希望被称呼为小鱼", "以后别叫我小鱼了", memory_type="relationship_memory", confidence=0.9, source_date="2026-04-01")
+
+            self._write(manager, self._stage1_with(wanted), batch_id="batch-1", date="2026-03-31", texts=["以后就叫我小鱼吧。"])
+            self._write(manager, self._stage1_with(unwanted), batch_id="batch-2", date="2026-04-01", texts=["以后别叫我小鱼了。"])
+
+            self.assertEqual(_active_contents(load_entries(settings.documents.relationship_memory)), ["用户希望被称呼为小鱼"])
+            self.assertEqual(len(load_entries(settings.documents.conflict_notes)), 1)
+
+    def test_superseded_active_arc_entries_neither_block_nor_absorb_new_arcs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            now = datetime(2026, 4, 1, 12, 0, tzinfo=ZoneInfo("UTC"))
+
+            manager.add_manual_entry("active_arc", content="用户每天去健身房打卡", now=now)
+            manager.add_manual_entry("active_arc", content="用户不再每天去健身房打卡", now=now)
+            self.assertEqual(_active_contents(load_entries(settings.documents.active_arc)), ["用户不再每天去健身房打卡"])
+
+            exam = self._stage1_with(self._candidate("用户最近在准备研究生考试", "我最近在准备研究生考试", memory_type="active_arc", durability="short"))
+            self._write(manager, exam, batch_id="batch-1", date="2026-04-01", texts=["我最近在准备研究生考试。"])
+            self._write(manager, exam, batch_id="batch-2", date="2026-04-02", texts=["我最近在准备研究生考试。"])
+
+            entries = load_entries(settings.documents.active_arc)
+            self.assertEqual(_active_contents(entries), ["用户不再每天去健身房打卡", "用户最近在准备研究生考试"])
+            self.assertEqual(len(entries), 3)
+
+            manager.write_character_side(
+                stage2_result=self._stage2_with_arc_suggestion(action="update", content="用户开始筹备毕业旅行"),
+                batch_id="batch-stage2",
+                now=datetime(2026, 4, 3, 12, 0, tzinfo=ZoneInfo("UTC")),
+            )
+            trimmed = load_entries(settings.documents.active_arc)
+            self.assertEqual(len(_active_contents(trimmed)), 2)
+            self.assertIn("用户开始筹备毕业旅行", _active_contents(trimmed))
+            self.assertEqual([item["content"] for item in trimmed if item["status"] == "superseded"], ["用户每天去健身房打卡"])
+
+    def test_relearned_statement_revives_the_retired_entry_instead_of_duplicating_its_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            now = datetime(2026, 4, 2, 12, 0, tzinfo=ZoneInfo("UTC"))
+
+            self._write(manager, self._stage1_with(self._candidate("用户喜欢猫", "我喜欢猫")), batch_id="batch-1", date="2026-03-31", texts=["记住，我喜欢猫。"])
+            self._write(manager, self._stage1_with(self._candidate("用户不喜欢猫", "其实我不喜欢猫", source_date="2026-04-01")), batch_id="batch-2", date="2026-04-01", texts=["我说错了，其实我不喜欢猫。"])
+            active_key = next(item["key"] for item in load_entries(settings.documents.user_profile) if item["status"] == "active")
+            manager.delete_entry("user_profile", active_key, now=now)
+
+            self._write(manager, self._stage1_with(self._candidate("用户喜欢猫", "我喜欢猫")), batch_id="batch-3", date="2026-04-03", texts=["记住，我喜欢猫。"])
+
+            entries = load_entries(settings.documents.user_profile)
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["status"], "active")
+            self.assertEqual(entries[0]["content"], "用户喜欢猫")
+            self.assertEqual(entries[0]["superseded_by"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

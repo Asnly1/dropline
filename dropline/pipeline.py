@@ -235,7 +235,7 @@ class PipelineService:
                 batch_id=context.batch_id,
                 now=context.now,
                 source_message_ids=[item.message_id for item in context.inbound_messages],
-                source_dates=[item.received_at[:10] for item in context.inbound_messages if item.received_at],
+                source_dates=[item.received_at[:10] if item.received_at else "" for item in context.inbound_messages],
                 inbound_texts=[f"{item.subject}\n{item.body_text}" for item in context.inbound_messages],
             )
         return stage1_result

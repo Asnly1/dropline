@@ -266,12 +266,12 @@ A session's memory is split into six kinds. Stage 1 only **proposes**; code **de
 
 All memory files and the episodes are plain JSON arrays of entries — UTF-8 text you can open and hand-edit. The pipeline rewrites them after each run.
 
-Promotion is enforced by code and does not trust the model's self-reported scores:
+Promotion is enforced by code; the model's self-reported confidence and durability are necessary, never sufficient:
 
-- A candidate's `evidence` must be found verbatim in the inbound mail body; candidates that fail this stay in the episode and never reach long-term memory.
-- Something the user explicitly asks to be remembered ("remember", "don't forget", "call me …") is written from that letter; everything else must have appeared on at least 2 distinct mail dates (by the mail `Date` header; several letters on one day count once).
-- Each letter adds at most 2 user_profile, 1 relationship_memory and 1 active_arc entries; content phrased about "today" or "this week" never becomes user_profile.
-- A statement that contradicts an existing memory goes to conflict_notes first. An explicit correction in the letter ("I misspoke", "actually …") replaces the old value at once; otherwise it must recur on a second distinct date. The replaced entry stays in the file marked `status: superseded` and is left out of the prompts.
+- A candidate's `evidence` must be found in the inbound mail body: contained as-is after normalization, or near-verbatim within one sentence (character 3-gram coverage ≥ 0.8 with the same negation state, so a paraphrase that drops a "not" does not count); quotes shorter than 4 CJK characters or 2 words never count. Candidates that fail this stay in the episode and never reach long-term memory.
+- Something the user explicitly asks to be remembered ("remember …", "don't forget …", "call me …", "记住……") in a sentence that quotes the candidate is written from that letter; "don't remember", "I remember when …" do not count. Everything else must have been mentioned on at least 2 distinct mail dates (by the `Date` header of the letter the evidence was found in; several letters on one day count once, and a batch mixing several days only counts the letter that holds the evidence).
+- Transient candidates are never written; user_profile also needs confidence ≥ 0.85 and durability stable, relationship_memory needs confidence ≥ 0.8; unless the user explicitly asked, content phrased about "today" or "this week" never becomes user_profile. Each letter adds at most 2 user_profile, 1 relationship_memory and 1 active_arc entries.
+- A statement that contradicts an existing memory goes to conflict_notes first (the negation map covers like/dislike, is/is not, has/has no, hope/do not hope, can/cannot, no longer, never, and the English not / never / no longer / doesn't forms). An explicit correction in the letter ("I misspoke", "correction", "not … but …"; "actually" only together with a negation or a reference to an earlier letter) replaces the old value at once; otherwise it must recur on a second distinct date. The replaced entry stays in the file marked `status: superseded` and is left out of the prompts.
 - Memories you delete by hand are recorded in `memory/suppressed.json`, and the model cannot write the same content back.
 
 Full rules: [docs/memory_promotion_rules.en.md](docs/memory_promotion_rules.en.md).

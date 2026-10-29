@@ -30,19 +30,34 @@ ACTIVE_ARC_LIMIT = 2
 
 USER_PROFILE_OBSERVATION_DAYS = 90
 ACTIVE_ARC_OBSERVATION_DAYS = 7
+USER_PROFILE_MIN_CONFIDENCE = 0.85
+RELATIONSHIP_MIN_CONFIDENCE = 0.8
+ACTIVE_ARC_MIN_CONFIDENCE = 0.75
 # docs/memory_promotion_rules.md §7: how many entries one inbound batch may add per type.
 PER_BATCH_PROMOTION_LIMITS = {"user_profile": 2, "relationship_memory": 1, "active_arc": 1}
 
-# The user asking, in their own words, to have something remembered.
+# The user asking, in their own words, to have something remembered. Negated forms
+# ("不要记住", "I don't remember") and plain recollection ("我记得小时候", "Do you remember")
+# are excluded; only imperative uses count.
 EXPLICIT_REQUEST_PATTERN = re.compile(
-    r"记住|记得|别忘了|别忘记|以后(?:都|就)?叫我|以后(?:都|就)?称呼我"
-    r"|remember|don'?t forget|do not forget|keep in mind|call me",
+    r"(?<!不要)(?<!别)(?<!別)(?<!不)(?:记住|記住)"
+    r"|(?:请|請|要|一定要)(?:记得|記得)|(?:记得|記得)(?:我|以后|以後)"
+    r"|(?:别|別)忘(?:了|记|記)"
+    r"|以[后後](?:都|就)?(?:叫|称呼|稱呼)我"
+    r"|(?<!i )(?<!you )(?<!don't )(?<!do not )(?<!can't )(?<!cannot )(?<!not )remember\b"
+    r"|don'?t forget|do not forget|keep in mind"
+    r"|call me (?!when\b|if\b|back\b|later\b|at\b|on\b|after\b|once\b|whenever\b|tomorrow\b|tonight\b|now\b)\S",
     re.IGNORECASE,
 )
-# The user correcting something they (or the character) said earlier.
+# The user correcting something they (or the character) said earlier. Strong markers count on
+# their own; weak ones ("其实", "actually") only together with a negation or a back-reference.
 CORRECTION_PATTERN = re.compile(
-    r"我说错了|说错了|更正|纠正|其实(?:我|是|不)|不是.{0,12}而是"
-    r"|actually|correction|to be clear|i meant|i misspoke",
+    r"我说错了|说错了|我說錯了|更正|纠正|糾正|不是.{0,12}而是|i misspoke|correction|to be clear|i meant",
+    re.IGNORECASE,
+)
+WEAK_CORRECTION_PATTERN = re.compile(r"其实|其實|actually", re.IGNORECASE)
+BACK_REFERENCE_PATTERN = re.compile(
+    r"之前|上次|刚才|剛才|以前|上封信|上一封|earlier|before|last time|previously|last letter",
     re.IGNORECASE,
 )
 # Wording that marks a statement as about right now rather than a stable fact.
@@ -51,11 +66,16 @@ TRANSIENT_PATTERN = re.compile(
     r"|today|tonight|this morning|just now|this week|these days|exhausted",
     re.IGNORECASE,
 )
-SENTENCE_SPLIT_PATTERN = re.compile(r"[。！？!?；;\n\r]+")
+# Sentence boundaries: CJK and ASCII terminators, plus an ASCII period that is not inside a number.
+SENTENCE_SPLIT_PATTERN = re.compile(r"[。！？!?；;\n\r]+|(?<!\d)\.(?!\d)")
 SOURCE_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+LATIN_WORD_PATTERN = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
+CJK_CHAR_PATTERN = re.compile(r"[㐀-鿿]")
 GROUNDING_NGRAM = 3
 GROUNDING_COVERAGE_THRESHOLD = 0.8
 REQUEST_OVERLAP_THRESHOLD = 0.5
+MIN_EVIDENCE_CJK_CHARS = 4
+MIN_EVIDENCE_LATIN_WORDS = 2
 SAME_MEMORY_MIN_CONTAINMENT_LENGTH = 8
 
 # Negated phrasing -> affirmative phrasing. Longer tokens come first so that "不喜欢" is
@@ -66,6 +86,9 @@ NEGATION_MAP: tuple[tuple[str, str], ...] = (
     ("不喜欢", "喜欢"),
     ("不需要", "需要"),
     ("不愿意", "愿意"),
+    ("不希望", "希望"),
+    ("不打算", "打算"),
+    ("不习惯", "习惯"),
     ("不想", "想"),
     ("不是", "是"),
     ("没有", "有"),
@@ -73,6 +96,11 @@ NEGATION_MAP: tuple[tuple[str, str], ...] = (
     ("并非", ""),
     ("从不", ""),
     ("从未", ""),
+    ("不爱", "爱"),
+    ("不会", "会"),
+    ("不能", "能"),
+    ("不吃", "吃"),
+    ("不敢", "敢"),
     ("没", ""),
     ("no longer ", ""),
     ("does not ", ""),
@@ -86,6 +114,9 @@ NEGATION_MAP: tuple[tuple[str, str], ...] = (
     ("not ", ""),
 )
 NEGATION_TOKENS = tuple(token for token, _ in NEGATION_MAP)
+# "watches" -> "watch", then "likes" -> "like" / "cats" -> "cat"; stems shorter than 3 letters are left alone.
+LATIN_ES_PATTERN = re.compile(r"\b([a-z]+(?:s|x|z|ch|sh))es\b")
+LATIN_S_PATTERN = re.compile(r"\b([a-z]{3,})s\b")
 
 
 def bootstrap_session_memory(settings: Settings) -> None:
@@ -105,31 +136,31 @@ def suppressed_memory_path(settings: Settings) -> Path:
 def evidence_is_grounded(evidence: str, texts: Sequence[str]) -> bool:
     """Return True when the quoted evidence can be found in the user's own text.
 
-    Exact containment after normalization counts, and so does a near-verbatim quote whose
-    character 3-grams are almost all present (tolerates a dropped particle or punctuation).
+    Exact containment after normalization counts anywhere in the text. A near-verbatim quote is
+    accepted only against a single sentence whose negation state matches the quote, so a
+    paraphrase that drops a "不" or a "don't" is rejected. Very short quotes never count.
     """
-    needle = _normalize_for_grounding(evidence)
-    if not needle:
+    if not _evidence_long_enough(evidence):
         return False
+    needle = _normalize_for_grounding(evidence)
     for text in texts:
         haystack = _normalize_for_grounding(text)
-        if not haystack:
-            continue
-        if needle in haystack:
+        if needle and needle in haystack:
             return True
-        if len(needle) >= GROUNDING_NGRAM and _ngram_coverage(needle, haystack) >= GROUNDING_COVERAGE_THRESHOLD:
-            return True
+        for sentence in _sentences(text):
+            if _fuzzy_sentence_match(evidence, sentence):
+                return True
     return False
 
 
 def user_explicitly_requested(candidate: CandidateMemory, texts: Sequence[str]) -> bool:
-    """True when a sentence the user wrote asks to remember this and overlaps the candidate."""
-    return _candidate_matches_marked_sentence(candidate, texts, EXPLICIT_REQUEST_PATTERN)
+    """True when a sentence the user wrote asks to remember this and quotes the candidate's evidence."""
+    return any(_marked_sentence_matches(candidate, sentence) for sentence in _request_sentences(texts))
 
 
 def user_corrected(candidate: CandidateMemory, texts: Sequence[str]) -> bool:
-    """True when a sentence the user wrote corrects something and overlaps the candidate."""
-    return _candidate_matches_marked_sentence(candidate, texts, CORRECTION_PATTERN)
+    """True when a sentence the user wrote corrects something and quotes the candidate's evidence."""
+    return any(_marked_sentence_matches(candidate, sentence) for sentence in _correction_sentences(texts))
 
 
 class MemoryManager:
@@ -162,7 +193,14 @@ class MemoryManager:
         source_dates: list[str],
         inbound_texts: Sequence[str],
     ) -> None:
+        """Record the user's letters as an episode and promote qualifying candidates.
+
+        ``source_dates`` and ``inbound_texts`` are aligned per letter (an unknown date may be
+        an empty string); the dates stored on entries drop the empty ones.
+        """
         self.bootstrap()
+        letters = _letters(source_dates, inbound_texts, now)
+        known_dates = [date for date in source_dates if date]
         self._append_episode(
             directory=self.settings.documents.user_episode_dir,
             batch_id=batch_id,
@@ -179,7 +217,7 @@ class MemoryManager:
                 "open_loops": list(stage1_result.open_loops),
             },
             source_message_ids=source_message_ids,
-            source_dates=source_dates,
+            source_dates=known_dates,
         )
         promotable = [
             candidate for candidate in stage1_result.candidate_memories if candidate.type in PER_BATCH_PROMOTION_LIMITS
@@ -200,8 +238,7 @@ class MemoryManager:
                 candidate,
                 batch_id=batch_id,
                 source_message_ids=source_message_ids,
-                source_dates=source_dates,
-                inbound_texts=inbound_texts,
+                letters=letters,
                 now=now,
             ):
                 written[candidate.type] = written.get(candidate.type, 0) + 1
@@ -226,7 +263,7 @@ class MemoryManager:
 
     def list_entries(self, file_key: str) -> list[dict]:
         path = self.memory_path(file_key)
-        return [dict(item) for item in load_entries(path)] if path.exists() else []
+        return [dict(item) for item in load_entries(path) if isinstance(item, dict)] if path.exists() else []
 
     def add_manual_entry(self, file_key: str, *, content: str, why_it_matters: str = "", now: datetime) -> dict:
         path = self.memory_path(file_key)
@@ -241,39 +278,24 @@ class MemoryManager:
         if file_key == "active_arc" and sum(1 for item in entries if item.status == MEMORY_STATUS_ACTIVE) >= ACTIVE_ARC_LIMIT:
             raise ValueError(f"active_arc holds at most {ACTIVE_ARC_LIMIT} entries; archive one first.")
         self._remove_suppression_for(content)
-        revived = next(
-            (
-                entry
-                for entry in entries
-                if entry.status == MEMORY_STATUS_SUPERSEDED and _normalize_memory(entry.content) == _normalize_memory(content)
-            ),
-            None,
+        candidate = CandidateMemory(
+            content=content,
+            type=file_key,
+            confidence=1.0,
+            durability="stable" if file_key != "active_arc" else "short",
+            evidence="manual entry",
+            why_it_matters=why_it_matters.strip(),
+            source_date=now.date().isoformat(),
         )
-        if revived is not None:
-            # The same statement was retired earlier; bring it back rather than duplicating its key.
-            revived.status = MEMORY_STATUS_ACTIVE
-            revived.superseded_by = ""
-            revived.evidence = _merged_unique(revived.evidence, ["manual entry"])
-            revived.source_dates = _merged_unique(revived.source_dates, [now.date().isoformat()])
-            revived.updated_at = now.isoformat()
-            if why_it_matters.strip():
-                revived.why_it_matters = why_it_matters.strip()
-            entry = revived
-        else:
-            entry = ManagedMemoryEntry(
-                key=hash_text(f"{file_key}:{content}", prefix=f"{file_key}-"),
-                content=content,
-                memory_type=file_key,
-                confidence=1.0,
-                durability="stable" if file_key != "active_arc" else "short",
-                evidence=["manual entry"],
-                source_dates=[now.date().isoformat()],
-                source_message_ids=["manual"],
-                created_at=now.isoformat(),
-                updated_at=now.isoformat(),
-                why_it_matters=why_it_matters.strip(),
-            )
-            entries.append(entry)
+        entry = self._append_or_revive(
+            entries,
+            candidate,
+            source_message_ids=["manual"],
+            source_dates=[now.date().isoformat()],
+            now=now,
+        )
+        if why_it_matters.strip():
+            entry.why_it_matters = why_it_matters.strip()
         # A statement the user adds by hand wins over any active memory that contradicts it.
         for other in entries:
             if other is entry or other.status != MEMORY_STATUS_ACTIVE:
@@ -313,7 +335,11 @@ class MemoryManager:
         return None
 
     def delete_entry(self, file_key: str, key: str, *, suppress: bool = True, now: datetime) -> bool:
-        """Remove an entry; by default also leave a tombstone so Stage 1 cannot write it back."""
+        """Remove an entry; by default also leave a tombstone so Stage 1 cannot write it back.
+
+        Clearing out an already superseded entry never leaves a tombstone: the statement is not
+        something the user rejected, only history they no longer want to see.
+        """
         path = self.memory_path(file_key)
         entries = self._load_memory_entries(path)
         remaining = [entry for entry in entries if entry.key != key]
@@ -321,13 +347,13 @@ class MemoryManager:
             return False
         removed = next(entry for entry in entries if entry.key == key)
         write_json_file(path, [item.to_dict() for item in remaining])
-        if suppress:
+        if suppress and removed.status == MEMORY_STATUS_ACTIVE:
             self.suppress(removed.content, reason=f"deleted from {file_key}", now=now)
         return True
 
     def suppress(self, content: str, *, reason: str, now: datetime) -> dict:
         path = suppressed_memory_path(self.settings)
-        entries = load_entries(path) if path.exists() else []
+        entries = self.list_suppressed()
         normalized = _normalize_memory(content)
         for item in entries:
             if str(item.get("normalized", "")) == normalized:
@@ -345,11 +371,11 @@ class MemoryManager:
 
     def list_suppressed(self) -> list[dict]:
         path = suppressed_memory_path(self.settings)
-        return [dict(item) for item in load_entries(path)] if path.exists() else []
+        return [dict(item) for item in load_entries(path) if isinstance(item, dict)] if path.exists() else []
 
     def unsuppress(self, key: str) -> bool:
         path = suppressed_memory_path(self.settings)
-        entries = load_entries(path) if path.exists() else []
+        entries = self.list_suppressed()
         remaining = [item for item in entries if str(item.get("key", "")) != key]
         if len(remaining) == len(entries):
             return False
@@ -364,14 +390,14 @@ class MemoryManager:
 
     def list_conflicts(self) -> list[dict]:
         path = self.settings.documents.conflict_notes
-        return [dict(item) for item in load_entries(path)] if path.exists() else []
+        return [dict(item) for item in load_entries(path) if isinstance(item, dict)] if path.exists() else []
 
     def resolve_conflict(self, key: str, *, choice: str, now: datetime) -> bool:
         """Settle a conflict note by hand: keep the existing memory or take the new one."""
         if choice not in {"keep_existing", "take_new"}:
             raise ValueError("choice must be 'keep_existing' or 'take_new'")
         notes_path = self.settings.documents.conflict_notes
-        notes = [ConflictNote.from_dict(item) for item in load_entries(notes_path)] if notes_path.exists() else []
+        notes = [ConflictNote.from_dict(item) for item in self.list_conflicts()]
         note = next((item for item in notes if item.key == key), None)
         if note is None:
             return False
@@ -405,7 +431,13 @@ class MemoryManager:
                     now=now,
                 )
             else:
-                entries.append(self._new_entry(candidate, source_message_ids=note.source_message_ids, source_dates=[now.date().isoformat()], now=now))
+                self._append_or_revive(
+                    entries,
+                    candidate,
+                    source_message_ids=note.source_message_ids,
+                    source_dates=[now.date().isoformat()],
+                    now=now,
+                )
             write_json_file(path, [item.to_dict() for item in entries])
         write_json_file(notes_path, [item.to_dict() for item in notes if item.key != key])
         return True
@@ -423,12 +455,12 @@ class MemoryManager:
         *,
         batch_id: str,
         source_message_ids: list[str],
-        source_dates: list[str],
-        inbound_texts: Sequence[str],
+        letters: Sequence[tuple[str, str]],
         now: datetime,
     ) -> bool:
         """Decide whether one Stage 1 candidate reaches long-term memory. Returns True on a write."""
-        if not evidence_is_grounded(candidate.evidence, inbound_texts):
+        grounded = [(date, text) for date, text in letters if evidence_is_grounded(candidate.evidence, [text])]
+        if not grounded:
             LOGGER.info(
                 "Rejecting %s candidate whose evidence is not found in the inbound mail: %s",
                 candidate.type,
@@ -438,12 +470,18 @@ class MemoryManager:
         if self.is_suppressed(candidate.content):
             LOGGER.info("Rejecting %s candidate the user chose to forget: %s", candidate.type, candidate.content)
             return False
-        explicit = user_explicitly_requested(candidate, inbound_texts)
-        corrected = user_corrected(candidate, inbound_texts)
+        grounded_texts = [text for _, text in grounded]
+        grounded_dates = sorted({date for date, _ in grounded})
         if candidate.type == "active_arc":
-            if not self._qualifies_active_arc(candidate, now=now, batch_id=batch_id, source_dates=source_dates):
+            if not self._qualifies_active_arc(candidate, now=now, batch_id=batch_id, current_dates=grounded_dates):
                 return False
-            return self._upsert_active_arc(candidate, source_message_ids=source_message_ids, source_dates=source_dates, now=now)
+            return self._upsert_active_arc(
+                candidate, source_message_ids=source_message_ids, source_dates=grounded_dates, now=now
+            )
+        explicit = user_explicitly_requested(candidate, grounded_texts)
+        corrected = user_corrected(candidate, grounded_texts)
+        if not self._passes_hard_gate(candidate, explicit=explicit, corrected=corrected):
+            return False
         path = self._path_for_memory_type(candidate.type)
         entries = self._load_memory_entries(path)
         active = [entry for entry in entries if entry.status == MEMORY_STATUS_ACTIVE]
@@ -453,7 +491,7 @@ class MemoryManager:
                 entry=conflicting,
                 candidate=candidate,
                 source_message_ids=source_message_ids,
-                occurrence_date=_occurrence_date(candidate, source_dates, now),
+                occurrence_date=grounded_dates[0],
                 now=now,
                 force=corrected,
             )
@@ -464,7 +502,7 @@ class MemoryManager:
                 conflicting,
                 candidate,
                 source_message_ids=source_message_ids,
-                source_dates=source_dates,
+                source_dates=grounded_dates,
                 now=now,
             )
             write_json_file(path, [item.to_dict() for item in entries])
@@ -472,72 +510,42 @@ class MemoryManager:
         same = next((entry for entry in active if self._same_memory(entry.content, candidate.content)), None)
         if same is not None:
             same.source_message_ids = _merged_unique(same.source_message_ids, source_message_ids)
-            same.source_dates = _merged_unique(same.source_dates, source_dates)
+            same.source_dates = _merged_unique(same.source_dates, grounded_dates)
             same.evidence = _merged_unique(same.evidence, [candidate.evidence])
             same.updated_at = now.isoformat()
             write_json_file(path, [item.to_dict() for item in entries])
             return False
-        if candidate.type == "user_profile":
-            qualifies = self._qualifies_user_profile(
-                candidate, now=now, batch_id=batch_id, source_dates=source_dates, explicit=explicit
+        if not (explicit or corrected):
+            observed_dates = self._distinct_observation_dates(
+                candidate,
+                days=USER_PROFILE_OBSERVATION_DAYS,
+                now=now,
+                batch_id=batch_id,
+                current_dates=grounded_dates,
             )
-        else:
-            qualifies = self._qualifies_relationship_memory(
-                candidate, now=now, batch_id=batch_id, source_dates=source_dates, explicit=explicit
-            )
-        if not qualifies:
-            return False
-        entries.append(self._new_entry(candidate, source_message_ids=source_message_ids, source_dates=source_dates, now=now))
+            if observed_dates < 2:
+                return False
+        self._append_or_revive(
+            entries, candidate, source_message_ids=source_message_ids, source_dates=grounded_dates, now=now
+        )
         write_json_file(path, [item.to_dict() for item in entries])
         return True
 
-    def _qualifies_user_profile(
-        self,
-        candidate: CandidateMemory,
-        *,
-        now: datetime,
-        batch_id: str,
-        source_dates: list[str],
-        explicit: bool,
-    ) -> bool:
-        if candidate.durability == "transient":
-            return False
-        if explicit:
-            return True
-        if candidate.confidence < 0.85 or candidate.durability != "stable":
-            return False
-        if TRANSIENT_PATTERN.search(candidate.content):
-            return False
-        return self._distinct_observation_dates(
-            candidate,
-            days=USER_PROFILE_OBSERVATION_DAYS,
-            now=now,
-            batch_id=batch_id,
-            source_dates=source_dates,
-        ) >= 2
+    def _passes_hard_gate(self, candidate: CandidateMemory, *, explicit: bool, corrected: bool) -> bool:
+        """Model-reported fields are necessary, never sufficient.
 
-    def _qualifies_relationship_memory(
-        self,
-        candidate: CandidateMemory,
-        *,
-        now: datetime,
-        batch_id: str,
-        source_dates: list[str],
-        explicit: bool,
-    ) -> bool:
+        A transient or low-confidence candidate cannot enter long-term memory, and cannot
+        override an existing entry either, whatever the letter says around it.
+        """
         if candidate.durability == "transient":
             return False
-        if explicit:
+        if explicit or corrected:
             return True
-        if candidate.confidence < 0.8:
-            return False
-        return self._distinct_observation_dates(
-            candidate,
-            days=USER_PROFILE_OBSERVATION_DAYS,
-            now=now,
-            batch_id=batch_id,
-            source_dates=source_dates,
-        ) >= 2
+        if candidate.type == "user_profile":
+            if candidate.confidence < USER_PROFILE_MIN_CONFIDENCE or candidate.durability != "stable":
+                return False
+            return not TRANSIENT_PATTERN.search(candidate.content)
+        return candidate.confidence >= RELATIONSHIP_MIN_CONFIDENCE
 
     def _qualifies_active_arc(
         self,
@@ -545,20 +553,25 @@ class MemoryManager:
         *,
         now: datetime,
         batch_id: str,
-        source_dates: list[str],
+        current_dates: Sequence[str],
     ) -> bool:
-        if candidate.confidence < 0.75 or candidate.durability == "transient":
+        if candidate.confidence < ACTIVE_ARC_MIN_CONFIDENCE or candidate.durability == "transient":
             return False
-        entries = self._load_memory_entries(self.settings.documents.active_arc)
-        if any(self._same_memory(entry.content, candidate.content) for entry in entries):
+        active = [
+            entry
+            for entry in self._load_memory_entries(self.settings.documents.active_arc)
+            if entry.status == MEMORY_STATUS_ACTIVE
+        ]
+        if any(self._same_memory(entry.content, candidate.content) for entry in active):
             return True
-        return self._distinct_observation_dates(
+        observed_dates = self._distinct_observation_dates(
             candidate,
             days=ACTIVE_ARC_OBSERVATION_DAYS,
             now=now,
             batch_id=batch_id,
-            source_dates=source_dates,
-        ) >= 2
+            current_dates=current_dates,
+        )
+        return observed_dates >= 2
 
     def _distinct_observation_dates(
         self,
@@ -567,22 +580,30 @@ class MemoryManager:
         days: int,
         now: datetime,
         batch_id: str,
-        source_dates: list[str],
+        current_dates: Iterable[str],
     ) -> int:
-        """Count the distinct mail dates on which the user has stated this, including today's batch."""
-        dates: set[str] = {date for date in source_dates if date} or {now.date().isoformat()}
+        """Count the distinct mail dates on which the user has stated this.
+
+        ``current_dates`` are the dates of the letters in this batch where the evidence was
+        actually found; earlier batches contribute the dates recorded on their episodes.
+        """
+        dates: set[str] = {date for date in current_dates if date} or {now.date().isoformat()}
         for entry in self._recent_episode_entries(self.settings.documents.user_episode_dir, days=days, now=now):
             if str(entry.get("batch_id", "")) == batch_id:
+                continue
+            observations = entry.get("memory_observations", [])
+            if not isinstance(observations, list):
                 continue
             observed_here = any(
                 str(observed.get("type", "")) == candidate.type
                 and self._same_memory(str(observed.get("content", "")), candidate.content)
-                for observed in entry.get("memory_observations", [])
+                for observed in observations
                 if isinstance(observed, dict)
             )
             if not observed_here:
                 continue
-            entry_dates = [str(date) for date in entry.get("source_dates", []) if date]
+            raw_dates = entry.get("source_dates", [])
+            entry_dates = [str(date) for date in raw_dates if date] if isinstance(raw_dates, list) else []
             if not entry_dates:
                 entry_dates = [str(entry.get("_file_date", ""))]
             dates.update(date for date in entry_dates if date)
@@ -603,7 +624,7 @@ class MemoryManager:
         entries = load_json_file(path, default=[])
         if not isinstance(entries, list):
             raise ValueError(f"Episode file must contain a JSON array: {path}")
-        if any(entry.get("batch_id") == batch_id for entry in entries):
+        if any(isinstance(entry, dict) and entry.get("batch_id") == batch_id for entry in entries):
             return
         entry = {
             "entry_id": f"episode:{batch_id}",
@@ -633,12 +654,36 @@ class MemoryManager:
             confidence=candidate.confidence,
             durability=candidate.durability,
             evidence=[candidate.evidence],
-            source_dates=source_dates,
+            source_dates=[date for date in source_dates if date],
             source_message_ids=source_message_ids,
             created_at=now.isoformat(),
             updated_at=now.isoformat(),
             why_it_matters=candidate.why_it_matters,
         )
+
+    def _append_or_revive(
+        self,
+        entries: list[ManagedMemoryEntry],
+        candidate: CandidateMemory,
+        *,
+        source_message_ids: list[str],
+        source_dates: list[str],
+        now: datetime,
+    ) -> ManagedMemoryEntry:
+        """Add the candidate, reviving a retired entry with the same key instead of duplicating it."""
+        key = hash_text(f"{candidate.type}:{candidate.content}", prefix=f"{candidate.type}-")
+        existing = next((entry for entry in entries if entry.key == key), None)
+        if existing is None:
+            entry = self._new_entry(candidate, source_message_ids=source_message_ids, source_dates=source_dates, now=now)
+            entries.append(entry)
+            return entry
+        existing.status = MEMORY_STATUS_ACTIVE
+        existing.superseded_by = ""
+        existing.source_message_ids = _merged_unique(existing.source_message_ids, source_message_ids)
+        existing.source_dates = _merged_unique(existing.source_dates, source_dates)
+        existing.evidence = _merged_unique(existing.evidence, [candidate.evidence])
+        existing.updated_at = now.isoformat()
+        return existing
 
     def _supersede(
         self,
@@ -651,19 +696,11 @@ class MemoryManager:
         now: datetime,
     ) -> ManagedMemoryEntry:
         """Retire `old` in favour of the candidate, keeping the old entry for audit."""
-        new_key = hash_text(f"{candidate.type}:{candidate.content}", prefix=f"{candidate.type}-")
-        revived = next((entry for entry in entries if entry.key == new_key and entry is not old), None)
-        if revived is not None:
-            revived.status = MEMORY_STATUS_ACTIVE
-            revived.superseded_by = ""
-            revived.source_message_ids = _merged_unique(revived.source_message_ids, source_message_ids)
-            revived.source_dates = _merged_unique(revived.source_dates, source_dates)
-            revived.evidence = _merged_unique(revived.evidence, [candidate.evidence])
-            revived.updated_at = now.isoformat()
-            new_entry = revived
-        else:
-            new_entry = self._new_entry(candidate, source_message_ids=source_message_ids, source_dates=source_dates, now=now)
-            entries.append(new_entry)
+        new_entry = self._append_or_revive(
+            entries, candidate, source_message_ids=source_message_ids, source_dates=source_dates, now=now
+        )
+        if new_entry is old:
+            return old
         old.status = MEMORY_STATUS_SUPERSEDED
         old.superseded_by = new_entry.key
         old.updated_at = now.isoformat()
@@ -677,19 +714,19 @@ class MemoryManager:
         source_dates: list[str],
         now: datetime,
     ) -> bool:
-        raw_entries = load_entries(self.settings.documents.active_arc)
-        entries = [ManagedMemoryEntry.from_dict(item) for item in raw_entries]
-        for entry in entries:
+        entries = self._load_memory_entries(self.settings.documents.active_arc)
+        active = [entry for entry in entries if entry.status == MEMORY_STATUS_ACTIVE]
+        for entry in active:
             if self._same_memory(entry.content, candidate.content):
                 entry.source_message_ids = _merged_unique(entry.source_message_ids, source_message_ids)
                 entry.source_dates = _merged_unique(entry.source_dates, source_dates)
                 entry.updated_at = now.isoformat()
                 write_json_file(self.settings.documents.active_arc, [item.to_dict() for item in entries])
                 return False
-        if len(entries) >= ACTIVE_ARC_LIMIT:
+        if len(active) >= ACTIVE_ARC_LIMIT:
             LOGGER.info("active_arc is full; not adding: %s", candidate.content)
             return False
-        entries.append(self._new_entry(candidate, source_message_ids=source_message_ids, source_dates=source_dates, now=now))
+        self._append_or_revive(entries, candidate, source_message_ids=source_message_ids, source_dates=source_dates, now=now)
         write_json_file(self.settings.documents.active_arc, [item.to_dict() for item in entries])
         return True
 
@@ -698,24 +735,25 @@ class MemoryManager:
         if suggestion.action == "none":
             return
         content = suggestion.content.strip()
-        raw_entries = load_entries(self.settings.documents.active_arc)
-        entries = [ManagedMemoryEntry.from_dict(item) for item in raw_entries]
+        entries = self._load_memory_entries(self.settings.documents.active_arc)
+        active = [entry for entry in entries if entry.status == MEMORY_STATUS_ACTIVE]
+        retired = [entry for entry in entries if entry.status != MEMORY_STATUS_ACTIVE]
         matching_index = next(
-            (index for index, item in enumerate(entries) if content and self._same_memory(item.content, content)),
+            (index for index, item in enumerate(active) if content and self._same_memory(item.content, content)),
             None,
         )
         if suggestion.action == "archive":
             if matching_index is not None:
-                entries.pop(matching_index)
-                write_json_file(self.settings.documents.active_arc, [item.to_dict() for item in entries])
+                active.pop(matching_index)
+                write_json_file(self.settings.documents.active_arc, [item.to_dict() for item in active + retired])
             return
         if suggestion.action == "keep":
             if matching_index is not None:
-                entry = entries[matching_index]
+                entry = active[matching_index]
                 entry.source_message_ids = _merged_unique(entry.source_message_ids, [batch_id])
                 entry.source_dates = _merged_unique(entry.source_dates, [now.date().isoformat()])
                 entry.updated_at = now.isoformat()
-                write_json_file(self.settings.documents.active_arc, [item.to_dict() for item in entries])
+                write_json_file(self.settings.documents.active_arc, [item.to_dict() for item in active + retired])
             return
 
         if suggestion.action != "update" or not content:
@@ -725,14 +763,14 @@ class MemoryManager:
             return
 
         if matching_index is not None:
-            entry = entries[matching_index]
+            entry = active[matching_index]
             entry.content = content
             entry.source_message_ids = _merged_unique(entry.source_message_ids, [batch_id])
             entry.source_dates = _merged_unique(entry.source_dates, [now.date().isoformat()])
             entry.evidence = _merged_unique(entry.evidence, ["stage2 active arc suggestion"])
             entry.updated_at = now.isoformat()
         else:
-            entries.append(
+            active.append(
                 ManagedMemoryEntry(
                     key=hash_text(f"active_arc:{content}", prefix="active-"),
                     content=content,
@@ -747,8 +785,8 @@ class MemoryManager:
                     why_it_matters="Stage 2 continuity suggestion.",
                 )
             )
-        entries = sorted(entries, key=lambda item: datetime.fromisoformat(item.updated_at), reverse=True)[:ACTIVE_ARC_LIMIT]
-        write_json_file(self.settings.documents.active_arc, [item.to_dict() for item in entries])
+        active = sorted(active, key=lambda item: datetime.fromisoformat(item.updated_at), reverse=True)[:ACTIVE_ARC_LIMIT]
+        write_json_file(self.settings.documents.active_arc, [item.to_dict() for item in active + retired])
 
     def _append_conflict(
         self,
@@ -765,8 +803,7 @@ class MemoryManager:
         Replacement happens when the user explicitly corrected themselves (`force`) or when
         the same conflict has been observed on two distinct mail dates.
         """
-        raw_entries = load_entries(self.settings.documents.conflict_notes)
-        notes = [ConflictNote.from_dict(item) for item in raw_entries]
+        notes = [ConflictNote.from_dict(item) for item in self.list_conflicts()]
         key = hash_text(f"{entry.content}:{candidate.content}", prefix="conflict-")
         existing_note = next((note for note in notes if note.key == key), None)
         if force:
@@ -851,14 +888,14 @@ class MemoryManager:
         path = suppressed_memory_path(self.settings)
         if not path.exists():
             return
-        entries = load_entries(path)
+        entries = self.list_suppressed()
         remaining = [item for item in entries if not self._same_memory(str(item.get("content", "")), content)]
         if len(remaining) != len(entries):
             write_json_file(path, remaining)
 
     def _load_memory_entries(self, path: Path) -> list[ManagedMemoryEntry]:
         raw_entries = load_entries(path) if path.exists() else []
-        return [ManagedMemoryEntry.from_dict(item) for item in raw_entries]
+        return [ManagedMemoryEntry.from_dict(item) for item in raw_entries if isinstance(item, dict)]
 
     def _same_memory(self, left: str, right: str) -> bool:
         normalized_left = _normalize_memory(left)
@@ -874,8 +911,8 @@ class MemoryManager:
     def _is_conflict(self, existing_content: str, new_content: str) -> bool:
         if _has_negation(existing_content) == _has_negation(new_content):
             return False
-        existing_norm = _normalize_memory(_strip_negation(existing_content))
-        new_norm = _normalize_memory(_strip_negation(new_content))
+        existing_norm = _conflict_form(existing_content)
+        new_norm = _conflict_form(new_content)
         if not existing_norm or not new_norm:
             return False
         if existing_norm == new_norm:
@@ -888,22 +925,44 @@ def _entry_status(item: dict) -> str:
     return str(item.get("status", MEMORY_STATUS_ACTIVE)) or MEMORY_STATUS_ACTIVE
 
 
-def _occurrence_date(candidate: CandidateMemory, source_dates: list[str], now: datetime) -> str:
-    for date in source_dates:
-        if date and SOURCE_DATE_PATTERN.match(date):
-            return date
-    if SOURCE_DATE_PATTERN.match(candidate.source_date or ""):
-        return candidate.source_date
-    return now.date().isoformat()
+def _letters(source_dates: Sequence[str], inbound_texts: Sequence[str], now: datetime) -> list[tuple[str, str]]:
+    """Pair each letter's text with its mail date; unknown dates fall back to the run date."""
+    today = now.date().isoformat()
+    texts = list(inbound_texts)
+    dates = list(source_dates)
+    if len(dates) != len(texts):
+        fallback = next((date for date in dates if date), today)
+        return [(fallback, text) for text in texts]
+    return [(date or today, text) for date, text in zip(dates, texts)]
 
 
 def _normalize_memory(value: str) -> str:
     return "".join(value.lower().split())
 
 
+def _conflict_form(value: str) -> str:
+    """Normalize a statement for conflict comparison: drop negation, fold plurals, drop spaces."""
+    return _normalize_memory(_stem_latin(_strip_negation(value)))
+
+
 def _normalize_for_grounding(value: str) -> str:
     folded = unicodedata.normalize("NFKC", value).lower()
     return "".join(char for char in folded if char.isalnum())
+
+
+def _latin_words(value: str) -> list[str]:
+    folded = unicodedata.normalize("NFKC", value).lower()
+    return LATIN_WORD_PATTERN.findall(folded)
+
+
+def _cjk_chars(value: str) -> str:
+    return "".join(CJK_CHAR_PATTERN.findall(unicodedata.normalize("NFKC", value)))
+
+
+def _evidence_long_enough(evidence: str) -> bool:
+    if len(_latin_words(evidence)) >= MIN_EVIDENCE_LATIN_WORDS:
+        return True
+    return len(_cjk_chars(evidence)) >= MIN_EVIDENCE_CJK_CHARS
 
 
 def _ngrams(value: str, size: int) -> set[str]:
@@ -922,30 +981,63 @@ def _ngram_coverage(needle: str, haystack: str) -> float:
     return sum(1 for gram in needle_grams if gram in haystack_grams) / len(needle_grams)
 
 
+def _fuzzy_sentence_match(evidence: str, sentence: str) -> bool:
+    """Near-verbatim match of a quote against one sentence, with matching negation state."""
+    if _has_negation(evidence) != _has_negation(sentence):
+        return False
+    evidence_words = _latin_words(evidence)
+    matched_something = False
+    if len(evidence_words) >= MIN_EVIDENCE_LATIN_WORDS:
+        sentence_words = set(_latin_words(sentence))
+        covered = sum(1 for word in evidence_words if word in sentence_words) / len(evidence_words)
+        if covered < GROUNDING_COVERAGE_THRESHOLD:
+            return False
+        matched_something = True
+    evidence_cjk = _cjk_chars(evidence)
+    if evidence_cjk:
+        sentence_cjk = _cjk_chars(sentence)
+        if len(evidence_cjk) < GROUNDING_NGRAM:
+            if evidence_cjk not in sentence_cjk:
+                return False
+        elif _ngram_coverage(evidence_cjk, sentence_cjk) < GROUNDING_COVERAGE_THRESHOLD:
+            return False
+        matched_something = True
+    return matched_something
+
+
 def _sentences(text: str) -> list[str]:
     return [segment.strip() for segment in SENTENCE_SPLIT_PATTERN.split(text) if segment.strip()]
 
 
-def _candidate_matches_marked_sentence(candidate: CandidateMemory, texts: Sequence[str], pattern: re.Pattern[str]) -> bool:
-    probes = [_normalize_for_grounding(candidate.evidence), _normalize_for_grounding(candidate.content)]
+def _request_sentences(texts: Sequence[str]) -> list[str]:
+    return [sentence for text in texts for sentence in _sentences(text) if EXPLICIT_REQUEST_PATTERN.search(sentence)]
+
+
+def _correction_sentences(texts: Sequence[str]) -> list[str]:
+    sentences: list[str] = []
     for text in texts:
         for sentence in _sentences(text):
-            if not pattern.search(sentence):
-                continue
-            normalized_sentence = _normalize_for_grounding(sentence)
-            if not normalized_sentence:
-                continue
-            for probe in probes:
-                if not probe:
-                    continue
-                if probe in normalized_sentence or normalized_sentence in probe:
-                    return True
-                if (
-                    _ngram_coverage(probe, normalized_sentence) >= REQUEST_OVERLAP_THRESHOLD
-                    or _ngram_coverage(normalized_sentence, probe) >= REQUEST_OVERLAP_THRESHOLD
-                ):
-                    return True
-    return False
+            if CORRECTION_PATTERN.search(sentence):
+                sentences.append(sentence)
+            elif WEAK_CORRECTION_PATTERN.search(sentence) and (
+                BACK_REFERENCE_PATTERN.search(sentence) or _has_negation(sentence)
+            ):
+                sentences.append(sentence)
+    return sentences
+
+
+def _marked_sentence_matches(candidate: CandidateMemory, sentence: str) -> bool:
+    """The marked sentence must carry the candidate's quoted evidence, not just any topic."""
+    probe = _normalize_for_grounding(candidate.evidence)
+    normalized_sentence = _normalize_for_grounding(sentence)
+    if not probe or not normalized_sentence:
+        return False
+    if probe in normalized_sentence or normalized_sentence in probe:
+        return True
+    return (
+        _ngram_coverage(probe, normalized_sentence) >= REQUEST_OVERLAP_THRESHOLD
+        or _ngram_coverage(normalized_sentence, probe) >= REQUEST_OVERLAP_THRESHOLD
+    )
 
 
 def _has_negation(value: str) -> bool:
@@ -958,6 +1050,11 @@ def _strip_negation(value: str) -> str:
     for token, replacement in NEGATION_MAP:
         stripped = stripped.replace(token, replacement)
     return stripped
+
+
+def _stem_latin(value: str) -> str:
+    """Fold simple plurals and third-person -s so "likes cats" and "like cats" compare equal."""
+    return LATIN_S_PATTERN.sub(r"\1", LATIN_ES_PATTERN.sub(r"\1", value))
 
 
 def _merged_unique(existing: Iterable[str], new_values: Iterable[str]) -> list[str]:

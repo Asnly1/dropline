@@ -1275,5 +1275,27 @@ class LLMTests(unittest.TestCase):
             self.assertEqual(doubao_client.images.generate.call_count, 1)
 
 
+class RestoreVerbatimFieldsTests(unittest.TestCase):
+    def test_evidence_and_source_date_are_copied_back_after_repair(self) -> None:
+        from dropline.llm import _restore_verbatim_fields
+
+        original = {"candidate_memories": [{"content": "用户喜欢猫", "evidence": "我喜欢猫", "source_date": "2026-03-31"}]}
+        repaired = {"candidate_memories": [{"content": "The user likes cats", "evidence": "I like cats", "source_date": "2026/03/31"}]}
+
+        result = _restore_verbatim_fields(original, repaired)
+
+        self.assertEqual(result["candidate_memories"][0]["content"], "The user likes cats")
+        self.assertEqual(result["candidate_memories"][0]["evidence"], "我喜欢猫")
+        self.assertEqual(result["candidate_memories"][0]["source_date"], "2026-03-31")
+
+    def test_mismatched_candidate_counts_leave_the_repaired_output_alone(self) -> None:
+        from dropline.llm import _restore_verbatim_fields
+
+        original = {"candidate_memories": [{"evidence": "a"}, {"evidence": "b"}]}
+        repaired = {"candidate_memories": [{"evidence": "x"}]}
+
+        self.assertEqual(_restore_verbatim_fields(original, repaired)["candidate_memories"][0]["evidence"], "x")
+
+
 if __name__ == "__main__":
     unittest.main()
