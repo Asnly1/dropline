@@ -997,5 +997,32 @@ class MemoryManagerTests(unittest.TestCase):
             self.assertFalse(manager.resolve_conflict(key, choice="keep_existing", now=now))
 
 
+    def test_manual_add_revives_a_superseded_entry_instead_of_duplicating_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            create_test_repo(root)
+            settings = load_test_settings(root)
+            manager = MemoryManager(settings)
+            now = datetime(2026, 4, 3, 12, 0, tzinfo=ZoneInfo("UTC"))
+
+            self._write(manager, self._stage1_with(self._candidate("用户喜欢猫", "我喜欢猫")), batch_id="batch-1", date="2026-03-31", texts=["记住，我喜欢猫。"])
+            self._write(
+                manager,
+                self._stage1_with(self._candidate("用户不喜欢猫", "其实我不喜欢猫", source_date="2026-04-01")),
+                batch_id="batch-2",
+                date="2026-04-01",
+                texts=["我说错了，其实我不喜欢猫。"],
+            )
+            revived = manager.add_manual_entry("user_profile", content="用户喜欢猫", now=now)
+
+            entries = load_entries(settings.documents.user_profile)
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(len({item["key"] for item in entries}), 2)
+            self.assertEqual(revived["status"], "active")
+            self.assertEqual(revived["superseded_by"], "")
+            self.assertIn("manual entry", revived["evidence"])
+            self.assertEqual(_active_contents(entries), ["用户不喜欢猫", "用户喜欢猫"])
+
+
 if __name__ == "__main__":
     unittest.main()

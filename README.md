@@ -278,6 +278,34 @@ Full rules: [docs/memory_promotion_rules.en.md](docs/memory_promotion_rules.en.m
 
 ---
 
+## 🗂️ Memory manager UI
+
+To see what the character actually remembers about you, or to fix something it got wrong, open the local web page:
+
+```bash
+python3 -m dropline memory-ui
+# optional: --host 127.0.0.1  --port 8765 (0 picks a free port)  --no-browser (do not open a browser)
+```
+
+The command starts a small server bound to `127.0.0.1` only, prints the address and opens your browser; Ctrl+C stops it. It exits with an error when no profile is active. The page is a single HTML file with no external resources, so it works offline, fits a phone screen and follows the system dark mode; its labels follow `llm.language` (简体中文 / English).
+
+The page is split into sections for the active session:
+
+| Section                                         | Shows                                                                                                | Actions                                                                                                  |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| User profile / Relationship memory / Active arc | Each entry's content, why it matters, evidence, source dates and a status badge (active / superseded) | Add, edit, delete                                                                                        |
+| Pending conflicts                               | Statements from letters that contradict an existing memory and still await a second confirmation     | "Keep existing" drops the new statement; "Take new" writes it and marks the old entry `status: superseded` |
+| Deleted memories (tombstones)                   | Everything you deleted                                                                               | "Restore" removes the tombstone                                                                          |
+| Episodes from the last 7 days                   | User-side and character-side short-term notes                                                        | Read-only                                                                                                |
+
+Entries you add by hand get `confidence` 1.0 and `evidence` `manual entry`, bypassing the promotion rules; hand edits append `manual edit` to `evidence`.
+
+**What delete means**: deleting an entry on the page removes it from the memory file and writes a tombstone to `memory/suppressed.json`; from then on the model cannot write the same content back. "Restore" only removes the tombstone — the memory itself does not come back; add it again by hand if you want it (adding content that matches a tombstone removes that tombstone).
+
+**Security**: the server binds to `127.0.0.1` by default; every modifying request must carry the random token generated at start-up and injected into the page, and its `Origin` / `Host` headers must point at this server, so another web page cannot use your browser to change memories; every response is sent with `Cache-Control: no-store`. If you bind to another address with `--host`, open the page through that exact address.
+
+---
+
 ## ⏰ Scheduling
 
 Recommended pattern: **fire `scheduler-tick` on a cron-like interval**, let it decide whether it's actually time to run — no long-lived process.
@@ -457,6 +485,7 @@ python3 -m dropline
 | `status`                                    | Show recent runs, failure counters, inbox / outbox state and today's schedule for the session       |
 | `install-scheduler` / `uninstall-scheduler` | Install / uninstall the OS-level timer                                                              |
 | `reset-dev-state`                           | Wipe all sessions / logs / DB, then recreate an empty session for the active profile; `--yes` skips confirmation |
+| `memory-ui`                                 | Open a local web page to view, add, edit and delete memories, settle conflicts and restore deleted ones; deleting writes a tombstone |
 
 </details>
 

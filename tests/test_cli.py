@@ -763,6 +763,50 @@ class InteractiveCLITests(unittest.TestCase):
             self.assertNotIn("subject=fourth attempts=1 QUARANTINED", rendered)
             self.assertIn("subject=fifth\n", rendered)
 
+    def test_root_help_lists_memory_ui(self) -> None:
+        output = io.StringIO()
+        exit_code = cli.main(["help"], output=output)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("  memory-ui", output.getvalue())
+
+    def test_memory_ui_help_is_available(self) -> None:
+        output = io.StringIO()
+        exit_code = cli.main(["memory-ui", "--help"], output=output)
+
+        self.assertEqual(exit_code, 0)
+        rendered = output.getvalue()
+        self.assertIn("view and edit the active session's memory", rendered)
+        self.assertIn("--host", rendered)
+        self.assertIn("--port", rendered)
+        self.assertIn("--no-browser", rendered)
+
+    def test_memory_ui_dispatches_to_module(self) -> None:
+        output = io.StringIO()
+        with patch("dropline.cli.memory_ui.memory_ui_command", return_value=0) as memory_ui_command:
+            exit_code = cli.main(["memory-ui", "--port", "0", "--no-browser"], output=output)
+
+        self.assertEqual(exit_code, 0)
+        memory_ui_command.assert_called_once_with("config.yaml", host="127.0.0.1", port=0, open_browser=False)
+
+    def test_memory_ui_defaults_open_the_browser_on_port_8765(self) -> None:
+        with patch("dropline.cli.memory_ui.memory_ui_command", return_value=0) as memory_ui_command:
+            exit_code = cli.main(["memory-ui"], output=io.StringIO())
+
+        self.assertEqual(exit_code, 0)
+        memory_ui_command.assert_called_once_with("config.yaml", host="127.0.0.1", port=8765, open_browser=True)
+
+    def test_memory_ui_rejects_invalid_ports(self) -> None:
+        for port in ("-1", "65536", "eighty"):
+            with self.subTest(port=port):
+                output = io.StringIO()
+                with patch("dropline.cli.memory_ui.memory_ui_command", return_value=0) as memory_ui_command:
+                    exit_code = cli.main(["memory-ui", "--port", port], output=output)
+
+                self.assertEqual(exit_code, 1)
+                memory_ui_command.assert_not_called()
+                self.assertIn("--port must be an integer between 0 and 65535", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

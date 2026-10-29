@@ -49,3 +49,6 @@ dev = [
 
 [tool.setuptools]
 packages = ["dropline"]
+
+[tool.setuptools.package-data]
+dropline = ["static/*.html"]
