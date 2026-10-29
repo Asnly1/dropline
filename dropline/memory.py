@@ -241,32 +241,47 @@ class MemoryManager:
         if file_key == "active_arc" and sum(1 for item in entries if item.status == MEMORY_STATUS_ACTIVE) >= ACTIVE_ARC_LIMIT:
             raise ValueError(f"active_arc holds at most {ACTIVE_ARC_LIMIT} entries; archive one first.")
         self._remove_suppression_for(content)
-        for entry in entries:
-            if entry.status == MEMORY_STATUS_SUPERSEDED and _normalize_memory(entry.content) == _normalize_memory(content):
-                # The same statement was retired earlier; bring it back rather than duplicating its key.
-                entry.status = MEMORY_STATUS_ACTIVE
-                entry.superseded_by = ""
-                entry.evidence = _merged_unique(entry.evidence, ["manual entry"])
-                entry.source_dates = _merged_unique(entry.source_dates, [now.date().isoformat()])
-                entry.updated_at = now.isoformat()
-                if why_it_matters.strip():
-                    entry.why_it_matters = why_it_matters.strip()
-                write_json_file(path, [item.to_dict() for item in entries])
-                return entry.to_dict()
-        entry = ManagedMemoryEntry(
-            key=hash_text(f"{file_key}:{content}", prefix=f"{file_key}-"),
-            content=content,
-            memory_type=file_key,
-            confidence=1.0,
-            durability="stable" if file_key != "active_arc" else "short",
-            evidence=["manual entry"],
-            source_dates=[now.date().isoformat()],
-            source_message_ids=["manual"],
-            created_at=now.isoformat(),
-            updated_at=now.isoformat(),
-            why_it_matters=why_it_matters.strip(),
+        revived = next(
+            (
+                entry
+                for entry in entries
+                if entry.status == MEMORY_STATUS_SUPERSEDED and _normalize_memory(entry.content) == _normalize_memory(content)
+            ),
+            None,
         )
-        entries.append(entry)
+        if revived is not None:
+            # The same statement was retired earlier; bring it back rather than duplicating its key.
+            revived.status = MEMORY_STATUS_ACTIVE
+            revived.superseded_by = ""
+            revived.evidence = _merged_unique(revived.evidence, ["manual entry"])
+            revived.source_dates = _merged_unique(revived.source_dates, [now.date().isoformat()])
+            revived.updated_at = now.isoformat()
+            if why_it_matters.strip():
+                revived.why_it_matters = why_it_matters.strip()
+            entry = revived
+        else:
+            entry = ManagedMemoryEntry(
+                key=hash_text(f"{file_key}:{content}", prefix=f"{file_key}-"),
+                content=content,
+                memory_type=file_key,
+                confidence=1.0,
+                durability="stable" if file_key != "active_arc" else "short",
+                evidence=["manual entry"],
+                source_dates=[now.date().isoformat()],
+                source_message_ids=["manual"],
+                created_at=now.isoformat(),
+                updated_at=now.isoformat(),
+                why_it_matters=why_it_matters.strip(),
+            )
+            entries.append(entry)
+        # A statement the user adds by hand wins over any active memory that contradicts it.
+        for other in entries:
+            if other is entry or other.status != MEMORY_STATUS_ACTIVE:
+                continue
+            if self._is_conflict(other.content, entry.content):
+                other.status = MEMORY_STATUS_SUPERSEDED
+                other.superseded_by = entry.key
+                other.updated_at = now.isoformat()
         write_json_file(path, [item.to_dict() for item in entries])
         return entry.to_dict()
 

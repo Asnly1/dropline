@@ -1021,7 +1021,11 @@ class MemoryManagerTests(unittest.TestCase):
             self.assertEqual(revived["status"], "active")
             self.assertEqual(revived["superseded_by"], "")
             self.assertIn("manual entry", revived["evidence"])
-            self.assertEqual(_active_contents(entries), ["用户不喜欢猫", "用户喜欢猫"])
+            # The hand-written statement wins: the contradicting entry is retired, not kept alongside.
+            self.assertEqual(_active_contents(entries), ["用户喜欢猫"])
+            retired = next(item for item in entries if item["content"] == "用户不喜欢猫")
+            self.assertEqual(retired["status"], "superseded")
+            self.assertEqual(retired["superseded_by"], revived["key"])
 
 
 if __name__ == "__main__":
